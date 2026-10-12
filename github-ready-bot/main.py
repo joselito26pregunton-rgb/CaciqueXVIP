@@ -36,6 +36,7 @@ WEBHOOK_SECRET = hashlib.sha256(
 CANAL_ID = '-1003914257220'      # Canal VIP (suscripciones)
 CanaL_ID = '-1003561176552'
 ADMIN_ID = '7827130679'
+GROUP_ADMIN_CONTACT_URL = "https://t.me/Ja2610X"
 # Los perfiles adicionales solo autorizan el saludo automático; no reciben acceso admin.
 BUSINESS_PROFILE_OWNER_IDS = {str(ADMIN_ID)}
 for _owner_id in os.environ.get("BUSINESS_PROFILE_OWNER_IDS", "").split(","):
@@ -1255,40 +1256,10 @@ def enviar_ficha_destino(
 
 GROUP_CONFIG_CATEGORIES = [
     ("reglamento", "📜 Reglamento"),
-    ("antispam", "📨 Antispam"),
-    ("bienvenida", "💬 Bienvenida"),
-    ("antiflood", "🌊 Anti-flood"),
-    ("despedida", "👋 Despedida"),
-    ("alfabetos", "🔤 Alfabetos"),
-    ("captcha", "🧩 CAPTCHA"),
-    ("filtros", "🔦 Filtros"),
-    ("reportes", "🆘 Reportes"),
-    ("bloqueos", "🔒 Bloqueos"),
-    ("multimedia", "🖼️ Multimedia"),
-    ("antiporno", "🚫 Antiporno"),
-    ("advertencias", "⚠️ Advertencias"),
-    ("modo_nocturno", "🌙 Modo nocturno"),
-    ("etiqueta", "🏷️ Etiqueta"),
-    ("enlace", "🔗 Enlace del grupo"),
-    ("guardian", "🛡️ Bot Guardián"),
-    ("aprobacion", "📩 Modo de aprobación"),
-    ("eliminacion", "🗑️ Eliminación de mensajes"),
-    ("topics", "🧵 Temas / Topics"),
-    ("palabras", "🔠 Palabras prohibidas"),
-    ("miembros", "👥 Gestión de miembros"),
-    ("enmascarados", "🕵️ Usuarios enmascarados"),
-    ("discusion", "📣 Grupo de discusión"),
-    ("comandos", "📱 Comandos personales"),
-    ("stickers_gif", "🎭 Stickers y GIFs"),
-    ("longitud", "📏 Longitud de mensajes"),
-    ("canales", "📡 Gestión de canales"),
-    ("permisos", "🖊️ Permisos"),
-    ("registro", "🔍 Canal de registro"),
-    ("lang", "🇪🇸 Idioma"),
-    ("atajos", "⌨️ Atajos rápidos"),
+    ("atajos", "⌨️ Botones rápidos del grupo"),
 ]
 
-GROUP_CONFIG_PAGE_SIZE = 10
+GROUP_CONFIG_PAGE_SIZE = 2
 GROUP_FEATURE_TITLES_EN = {
     "reglamento": "📜 Rules",
     "antispam": "📨 Anti-spam",
@@ -1321,7 +1292,7 @@ GROUP_FEATURE_TITLES_EN = {
     "permisos": "🖊️ Permissions",
     "registro": "🔍 Log channel",
     "lang": "🌐 Language",
-    "atajos": "⌨️ Quick-access buttons",
+    "atajos": "⌨️ Group shortcuts",
 }
 GROUP_FEATURE_DESCRIPTIONS_EN = {
     "reglamento": "Save the rules and show them in the group with /rules.",
@@ -1355,7 +1326,7 @@ GROUP_FEATURE_DESCRIPTIONS_EN = {
     "permisos": "When enabled, only administrators can write; member posts are deleted.",
     "registro": "Choose where moderation notifications are sent.",
     "lang": "Choose Spanish or English for the settings menu.",
-    "atajos": "Configure member buttons, including the default video-chat guide.",
+    "atajos": "Choose and publish the member toolbar: /start, /menu, /reglas, /compartir, /admin, and /vchat.",
 }
 GROUP_FEATURE_TEXT_PROMPTS_EN = {
     "reglamento": ("Rules", "Write the rules that /rules will show."),
@@ -1485,23 +1456,35 @@ def actualizar_ajustes_grupo(canal_key, actualizar):
 
 
 def etiqueta_boton_videochat(ajustes):
-    etiqueta = str(
-        (ajustes or {}).get("videochat_button_label") or "📹 Iniciar videochat"
-    ).strip()
-    return etiqueta[:32] or "📹 Iniciar videochat"
+    etiqueta = str((ajustes or {}).get("videochat_button_label") or "").strip()
+    if not etiqueta or etiqueta == "📹 Iniciar videochat":
+        etiqueta = "🔥 /vchat"
+    return etiqueta[:32] or "🔥 /vchat"
+
+
+GROUP_MEMBER_SHORTCUTS = (
+    ("start", "🏠 /start", "__group_start__"),
+    ("menu", "🏹 /menu", "__group_menu__"),
+    ("rules", "📜 /reglas", "/rules"),
+    ("share", "🚀 /compartir", "__group_share__"),
+    ("admin", "👤 /admin", "__group_admin__"),
+    ("vchat", "🔥 /vchat", "__videochat_guide__"),
+)
 
 
 def atajos_fijos_grupo(ajustes):
-    return [
-        {"label": "🏠 Inicio", "action": "__group_start__"},
-        {"label": "📋 Menú", "action": "__group_menu__"},
-        {"label": "📜 Reglas", "action": "/rules"},
-        {"label": "🔗 Compartir", "action": "__group_share__"},
-        {
-            "label": etiqueta_boton_videochat(ajustes),
-            "action": "__videochat_guide__",
-        },
-    ]
+    ajustes = ajustes or {}
+    if str(ajustes.get("type", "")).lower() == "canal":
+        return []
+    enabled = ajustes.get("quick_commands_enabled", {})
+    result = []
+    for key, label, action in GROUP_MEMBER_SHORTCUTS:
+        if not enabled.get(key, True):
+            continue
+        if key == "vchat":
+            label = etiqueta_boton_videochat(ajustes)
+        result.append({"key": key, "label": label, "action": action})
+    return result
 
 
 def es_atajo_admin(item):
@@ -1594,9 +1577,7 @@ def funcion_grupo_activada(canal_key, ajustes, feature):
     if feature == "comandos":
         return bool(ajustes.get("custom_commands"))
     if feature == "atajos":
-        return bool(ajustes.get("quick_buttons")) or (
-            str(ajustes.get("type", "")).lower() != "canal"
-        )
+        return bool(atajos_fijos_grupo(ajustes) or ajustes.get("quick_buttons"))
     if feature == "longitud":
         return int(ajustes.get("max_length", 0) or 0) > 0
     if feature == "eliminacion":
@@ -2592,16 +2573,16 @@ def mostrar_configuracion_grupo(chat_id_admin, canal_key, pagina=0, message=None
         f"<b>{titulo}</b>\nID: <code>{html.escape(str(ajustes['chat_id']))}</code>\n\n"
         + (
             f"Page {pagina_visible} of {total_paginas} · "
-            f"{len(GROUP_CONFIG_CATEGORIES)} group settings.\n"
-            "Each button opens that feature's controls. Changes apply only to this destination; "
-            "use «More» to see the rest. Navigation stays in this message. "
-            "Recurring messages are managed separately."
+            f"{len(GROUP_CONFIG_CATEGORIES)} available sections.\n"
+            "Choose Rules to edit this group's rules or Group shortcuts to control the member toolbar. "
+            "Changes apply only to this destination. Navigation stays in this message; "
+            "recurring messages are managed separately."
             if ingles else
             f"Página {pagina_visible} de {total_paginas} · "
-            f"{len(GROUP_CONFIG_CATEGORIES)} ajustes para grupos.\n"
-            "Cada botón abre los controles de esa función. Los cambios se guardan solo para este "
-            "destino; usa «Más» para ver el resto. La navegación se mantiene en este mismo mensaje. "
-            "Los mensajes recurrentes se administran en su sección independiente."
+            f"{len(GROUP_CONFIG_CATEGORIES)} secciones disponibles.\n"
+            "Entra en Reglamento para editar las reglas de este grupo o en Botones rápidos del grupo "
+            "para controlar la barra de los miembros. Los cambios son solo para este destino. "
+            "La navegación queda en este mensaje y los mensajes recurrentes siguen en su sección independiente."
         )
     )
     editar_o_enviar_panel(
@@ -2918,6 +2899,19 @@ def mostrar_menu_atajos_grupo(
     etiqueta_videochat = etiqueta_boton_videochat(ajustes)
     markup = types.InlineKeyboardMarkup(row_width=1)
     if es_grupo:
+        enabled = ajustes.get("quick_commands_enabled", {})
+        for start in range(0, len(GROUP_MEMBER_SHORTCUTS), 2):
+            row = []
+            for key, label, _action in GROUP_MEMBER_SHORTCUTS[start:start + 2]:
+                if key == "vchat":
+                    label = etiqueta_videochat
+                activo = enabled.get(key, True)
+                marca = "✅" if activo else "⚪"
+                row.append(types.InlineKeyboardButton(
+                    f"{marca} {label}",
+                    callback_data=f"grupo_atajo_toggle|{canal_key}|{key}|{pagina}",
+                ))
+            markup.row(*row)
         markup.add(types.InlineKeyboardButton(
             f"✏️ Nombre del botón de videochat: {etiqueta_videochat}",
             callback_data=f"grupo_atajos_video_label|{canal_key}|{pagina}",
@@ -2952,14 +2946,25 @@ def mostrar_menu_atajos_grupo(
         for item in botones[:20]
     ) or "Todavía no hay botones configurados."
     if es_grupo:
-        lineas = (
-            "• <b>🏠 Inicio</b> → abre el bot en privado\n"
-            "• <b>📋 Menú</b> → muestra las acciones rápidas\n"
-            "• <b>📜 Reglas</b> → muestra el reglamento configurado\n"
-            "• <b>🔗 Compartir</b> → comparte el enlace del grupo\n"
-            f"• <b>{html.escape(etiqueta_videochat)}</b> → abre el enlace del videochat\n"
-            + lineas
+        enabled = ajustes.get("quick_commands_enabled", {})
+        acciones = {
+            "start": "abre el menú privado del bot",
+            "menu": "muestra las acciones rápidas del grupo",
+            "rules": "muestra el reglamento de este grupo",
+            "share": "comparte el enlace de invitación del grupo",
+            "admin": "muestra un enlace para contactar a @Ja2610X",
+            "vchat": "muestra la guía/enlace disponible; el bot no inicia la llamada",
+        }
+        etiquetas_actuales = {
+            key: etiqueta_videochat if key == "vchat" else label
+            for key, label, _action in GROUP_MEMBER_SHORTCUTS
+        }
+        fijos = "\n".join(
+            f"{'✅' if enabled.get(key, True) else '⚪'} "
+            f"<b>{html.escape(etiquetas_actuales[key])}</b> → {acciones[key]}"
+            for key, _label, _action in GROUP_MEMBER_SHORTCUTS
         )
+        lineas = f"{fijos}\n\n<b>Botones personalizados</b>\n{lineas}"
     tipo = (ajustes.get("type") or "grupo").lower()
     limitacion = (
         "En grupos, los botones aparecen junto a la barra para escribir después de publicar el teclado. "
@@ -2972,13 +2977,18 @@ def mostrar_menu_atajos_grupo(
     texto = (
         f"⌨️ <b>Atajos para {html.escape(ajustes.get('title', 'este chat'))}</b>\n\n"
         f"{lineas}\n\n"
-        "Para agregar uno, escribe etiqueta=acción. También puedes usar "
+        + (
+            "Pulsa cada botón de arriba para activarlo o desactivarlo para los miembros. "
+            "El teclado queda activo hasta que lo quites o publiques otro.\n\n"
+            if es_grupo else ""
+        )
+        + "Para agregar uno, escribe etiqueta=acción. También puedes usar "
         "<code>Nombre del botón - rules</code>. Ejemplos: "
         "<code>📜 Reglamento=/rules</code> o "
         "<code>🌐 Sitio=https://ejemplo.com</code>.\n"
         + (
-            "Los atajos fijos del grupo no incluyen /admin. El botón de videochat "
-            "abre el enlace del grupo si hay una llamada disponible; el bot no puede iniciarla.\n"
+            "El atajo /admin abre un enlace al perfil de @Ja2610X. "
+            "El botón de videochat ofrece la guía/enlace del grupo; el bot no puede iniciar la llamada.\n"
             if es_grupo else ""
         )
         + f"{html.escape(limitacion)}"
@@ -6306,6 +6316,16 @@ def responder_atajo_publico_grupo(chat_id, action, ajustes, usuario_id, message=
             "Telegram solo lo abrirá si hay una llamada disponible; el bot no puede iniciarla.",
             reply_markup=markup,
         )
+    if action == "admin":
+        markup.add(types.InlineKeyboardButton(
+            "👤 Contactar a @Ja2610X",
+            url=GROUP_ADMIN_CONTACT_URL,
+        ))
+        return bot.send_message(
+            chat_id,
+            "👤 Para contactar al administrador, pulsa el botón:",
+            reply_markup=markup,
+        )
     return None
 
 
@@ -6388,11 +6408,15 @@ def moderar_mensaje_grupo(message, ajustes):
             "/start": "__group_start__",
             "/menu": "__group_menu__",
             "/compartir": "__group_share__",
+            "/reglas": "/rules",
+            "/vchat": "__videochat_guide__",
+            "/admin": "__group_admin__",
         }.get(comando)
     acciones_grupo = {
         "__group_start__": "start",
         "__group_menu__": "menu",
         "__group_share__": "share",
+        "__group_admin__": "admin",
         "__videochat_guide__": "videochat",
     }
     if accion_atajo in acciones_grupo:
@@ -7370,17 +7394,6 @@ def publicar_teclado_atajos_grupo(canal_key, texto="⌨️ Atajos disponibles pa
         raise ValueError("El destino no es un grupo disponible.")
 
     previous_message_id = ajustes.get("quick_buttons_message_id")
-    if (
-        previous_message_id
-        and str(ajustes.get("quick_buttons_chat_id")) == str(chat_id)
-    ):
-        try:
-            bot.delete_message(int(chat_id), previous_message_id)
-        except Exception:
-            app.logger.info(
-                "No se pudo retirar el teclado anterior del grupo antes de actualizarlo."
-            )
-
     botones = botones_atajos_publicables_grupo(ajustes)
     teclado = types.ReplyKeyboardMarkup(
         resize_keyboard=True,
@@ -7403,6 +7416,17 @@ def publicar_teclado_atajos_grupo(canal_key, texto="⌨️ Atajos disponibles pa
             "quick_buttons_chat_id": str(chat_id),
         }),
     )
+    if (
+        previous_message_id
+        and str(ajustes.get("quick_buttons_chat_id")) == str(chat_id)
+        and str(previous_message_id) != str(mensaje.message_id)
+    ):
+        try:
+            bot.delete_message(int(chat_id), previous_message_id)
+        except Exception:
+            app.logger.info(
+                "El nuevo teclado se publicó, pero no se pudo borrar el mensaje anterior."
+            )
     return mensaje
 
 
@@ -7418,6 +7442,57 @@ def actualizar_teclado_atajos_si_publicado(canal_key, texto):
     except Exception:
         app.logger.exception("No se pudo actualizar el teclado de atajos del grupo.")
         return False
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("grupo_atajo_toggle|")
+)
+def callback_toggle_atajo_grupo(call):
+    if str(call.from_user.id) != str(ADMIN_ID):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    partes = call.data.split("|")
+    claves_validas = {item[0] for item in GROUP_MEMBER_SHORTCUTS}
+    if len(partes) != 4 or partes[1] not in CANALES or partes[2] not in claves_validas:
+        bot.answer_callback_query(call.id, "No encontré ese atajo.")
+        return
+    _, canal_key, shortcut_key, pagina_txt = partes
+    ajustes = obtener_ajustes_grupo(canal_key) or {}
+    if str(ajustes.get("type", "")).lower() == "canal":
+        bot.answer_callback_query(call.id, "Los atajos de la barra solo funcionan en grupos.")
+        return
+    try:
+        pagina = max(0, int(pagina_txt))
+    except ValueError:
+        pagina = 0
+
+    estado_nuevo = {}
+    def alternar(ajustes_actuales):
+        configurados = ajustes_actuales.setdefault("quick_commands_enabled", {})
+        nuevo_valor = not bool(configurados.get(shortcut_key, True))
+        configurados[shortcut_key] = nuevo_valor
+        estado_nuevo["activo"] = nuevo_valor
+
+    actualizar_ajustes_grupo(canal_key, alternar)
+    if ajustes.get("quick_buttons_message_id"):
+        publicado = actualizar_teclado_atajos_si_publicado(
+            canal_key, "⌨️ Se actualizaron los atajos disponibles para los miembros."
+        )
+        aviso = (
+            "Atajo actualizado y teclado publicado."
+            if publicado else
+            "Ajuste guardado. No se pudo actualizar el teclado; pulsa «Publicar botones en el chat»."
+        )
+    else:
+        aviso = (
+            "Atajo activado. Pulsa «Publicar botones en el chat» para mostrarlo."
+            if estado_nuevo.get("activo") else
+            "Atajo desactivado. Pulsa «Publicar botones en el chat» para aplicar la selección."
+        )
+    bot.answer_callback_query(call.id, "Activado." if estado_nuevo.get("activo") else "Desactivado.")
+    mostrar_menu_atajos_grupo(
+        call.message.chat.id, canal_key, pagina, message=call.message, aviso=aviso
+    )
 
 
 @bot.callback_query_handler(

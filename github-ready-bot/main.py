@@ -15,14 +15,16 @@ import telebot
 from telebot import apihelper
 from telebot import types
 from tinydb import TinyDB, Query
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from flask import Flask, redirect, request
+from flask import Flask, jsonify, redirect, request
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
+    if os.environ.get("BOT_MODE", "webhook").strip().lower() == "polling":
+        return "Telegram bot alive (polling).", 200
     return redirect("https://caciquex.netlify.app", code=302)
 
 # --- CONFIGURACIÓN ---
@@ -32,7 +34,11 @@ WEBHOOK_PATH = "/telegram-webhook"
 WEBHOOK_SECRET = hashlib.sha256(
     f"telegram-webhook:{TOKEN}".encode("utf-8")
 ).hexdigest()
-
+WEBHOOK_ACTIVITY_LOCK = threading.Lock()
+WEBHOOK_STATUS_LOCK = threading.Lock()
+LAST_WEBHOOK_UPDATE_AT = None
+WEBHOOK_STATUS_CACHE_TTL = 10
+WEBHOOK_STATUS_CACHE = {"checked_at": 0.0, "payload": None, "http_status": 503}
 CANAL_ID = '-1003914257220'      # Canal VIP (suscripciones)
 CanaL_ID = '-1003561176552'
 ADMIN_ID = '7827130679'
@@ -97,6 +103,89 @@ def bloquear_callback_admin_fuera_de_privado(call):
     )
 
 
+def _webhook_status_snapshot():
+    global WEBHOOK_STATUS_CACHE
+    ahora_monotonic = time.monotonic()
+    with WEBHOOK_STATUS_LOCK:
+        cache = WEBHOOK_STATUS_CACHE
+        if cache["payload"] is not None and ahora_monotonic - cache["checked_at"] < WEBHOOK_STATUS_CACHE_TTL:
+            return dict(cache["payload"]), cache["http_status"]
+
+    with WEBHOOK_ACTIVITY_LOCK:
+        ultimo_update = LAST_WEBHOOK_UPDATE_AT
+    modo = os.environ.get("BOT_MODE", "webhook").strip().lower()
+    base = {
+        "process_alive": True,
+        "telegram_api_reachable": False,
+        "mode": modo if modo in {"webhook", "polling"} else "unknown",
+        "webhook_configured": None,
+        "pending_updates": None,
+        "last_webhook_update_at": ultimo_update,
+        "last_telegram_error_at": None,
+    }
+    try:
+        info = bot.get_webhook_info()
+    except Exception:
+        app.logger.warning("No se pudo consultar el estado del webhook de Telegram.")
+        payload, http_status = {**base, "status": "telegram_api_unreachable"}, 503
+    else:
+        webhook_url = str(getattr(info, "url", "") or "")
+        try:
+            pending = max(0, int(getattr(info, "pending_update_count", 0) or 0))
+        except (TypeError, ValueError):
+            pending = None
+        last_error_at = None
+        if getattr(info, "last_error_date", None):
+            try:
+                last_error_at = datetime.fromtimestamp(
+                    int(info.last_error_date), tz=timezone.utc
+                ).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        configured = bool(webhook_url)
+        status = (
+            "polling_mode" if modo == "polling" else
+            "webhook_not_configured" if not configured else
+            "pending_updates" if pending else
+            "telegram_reports_delivery_error" if last_error_at else
+            "webhook_ready"
+        )
+        payload = {
+            **base,
+            "telegram_api_reachable": True,
+            "webhook_configured": configured,
+            "pending_updates": pending,
+            "last_telegram_error_at": last_error_at,
+            "status": status,
+        }
+        http_status = 200 if modo == "polling" or (
+            configured and pending == 0 and last_error_at is None
+        ) else 503
+
+    with WEBHOOK_STATUS_LOCK:
+        WEBHOOK_STATUS_CACHE = {
+            "checked_at": time.monotonic(),
+            "payload": dict(payload),
+            "http_status": http_status,
+        }
+    return payload, http_status
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    response = jsonify({"status": "ok", "process_alive": True})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 200
+
+
+@app.route("/telegram-health", methods=["GET"])
+def telegram_health():
+    payload, http_status = _webhook_status_snapshot()
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, http_status
+
+
 _SEND_MESSAGE_ORIGINAL = bot.send_message
 db = TinyDB('usuarios.json')
 PANELES_PRIVADOS = db.table("paneles_privados")
@@ -129,6 +218,8 @@ def _log_business_diagnostic(key, message, *args):
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
+    global LAST_WEBHOOK_UPDATE_AT
+
     received_secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token", ""
     )
@@ -149,6 +240,10 @@ def telegram_webhook():
             "Telegram webhook recibió una actualización business_message.",
         )
     bot.process_new_updates([update])
+    with WEBHOOK_ACTIVITY_LOCK:
+        LAST_WEBHOOK_UPDATE_AT = datetime.now(timezone.utc).isoformat()
+    with WEBHOOK_STATUS_LOCK:
+        WEBHOOK_STATUS_CACHE["checked_at"] = 0.0
     return "OK", 200
 
 solicitudes_pendientes = {}
@@ -1215,6 +1310,659 @@ def obtener_o_crear_destino_compartido(chat_id, title, tipo):
     )
 
 
+GROUP_CONFIG_CATEGORIES = [
+    ("reglamento", "📜 Reglamento"),
+    ("atajos", "⌨️ Botones rápidos del grupo"),
+]
+GROUP_CONFIG_PAGE_SIZE = 2
+GROUP_FEATURE_TITLES = dict(GROUP_CONFIG_CATEGORIES)
+GROUP_FEATURE_TITLES_EN = {
+    "reglamento": "📜 Rules",
+    "atajos": "⌨️ Group shortcuts",
+}
+GROUP_FEATURE_DESCRIPTIONS_EN = {
+    "reglamento": "Save the rules and show them in the group with /rules.",
+    "atajos": "Choose and publish the member toolbar: /start, /menu, /reglas, /compartir, /admin, and /vchat.",
+}
+GROUP_FEATURE_TEXT_PROMPTS = {
+    "reglamento": ("Reglamento", "Escribe el reglamento que quieres mostrar con /rules."),
+}
+GROUP_FEATURE_TEXT_PROMPTS_EN = {
+    "reglamento": ("Rules", "Write the rules that /rules will show."),
+}
+GROUP_MEMBER_SHORTCUTS = (
+    ("start", "🏠 /start", "__group_start__"),
+    ("menu", "🏹 /menu", "__group_menu__"),
+    ("rules", "📜 /reglas", "/rules"),
+    ("share", "🚀 /compartir", "__group_share__"),
+    ("admin", "👤 /admin", "__group_admin__"),
+    ("vchat", "🔥 /vchat", "__videochat_guide__"),
+)
+GROUP_MODERATION_ACTIONS = (
+    ("❌ Off", "off"),
+    ("⚠️ Warn", "warn"),
+    ("❗ Kick", "kick"),
+    ("🔇 Silenciar", "mute"),
+    ("🚫 Ban", "ban"),
+)
+GROUP_MODERATION_SOURCES = (
+    ("channel", "📢 Canales"),
+    ("group", "👥 Grupos"),
+    ("user", "👤 Usuarios"),
+    ("bot", "🤖 Bots"),
+)
+GROUP_MODERATION_SOURCE_LABELS = dict(GROUP_MODERATION_SOURCES)
+GROUP_MODERATION_POLICY_LABELS = {
+    "telegram_links": "🔗 Enlaces de Telegram",
+    "internet_links": "🌐 Enlaces de internet",
+    "forward_channel": "📢 Reenvíos de canales",
+    "forward_group": "👥 Reenvíos de grupos",
+    "forward_user": "👤 Reenvíos de usuarios",
+    "forward_bot": "🤖 Reenvíos de bots",
+    "quote_channel": "📢 Citas de canales",
+    "quote_group": "👥 Citas de grupos",
+    "quote_user": "👤 Citas de usuarios",
+    "quote_bot": "🤖 Citas de bots",
+}
+GROUP_MEDIA_PAGES = (
+    (("story", "📱 Historias"), ("photo", "🖼️ Fotos"), ("video", "🎥 Vídeos")),
+    (("album", "🗂️ Álbumes"), ("live_photo", "📸 Live Photo"), ("animation", "🎞️ GIF")),
+    (("sticker", "🎟️ Stickers"), ("animated_sticker", "✨ Stickers animados"), ("document", "📎 Archivos")),
+)
+
+
+def _nuevos_ajustes_grupo(chat_id, title, tipo):
+    return {
+        "chat_id": str(chat_id),
+        "title": title or "Grupo o canal",
+        "type": tipo or "grupo/canal",
+        "enabled": {},
+        "moderation_policies": {},
+        "media_policies": {},
+        "flood_limit": 5,
+        "flood_window_seconds": 3,
+        "flood_action": "off",
+        "flood_delete_messages": False,
+        "welcome_mode": "always",
+        "welcome_send_private": False,
+        "welcome_delete_previous": False,
+        "welcome_seen_users": [],
+        "goodbye_send_private": False,
+        "goodbye_delete_previous": False,
+        "captcha_mode": "button",
+        "captcha_timeout_seconds": 90,
+        "captcha_action": "ban",
+        "captcha_delete_service_message": False,
+        "captcha_theme": "classic",
+        "night_mode_action": "delete",
+        "night_mode_mute": False,
+        "warning_limit": 3,
+        "warning_action": "mute",
+        "warning_duration_seconds": 3600,
+        "rules": "",
+        "rules_media_before": None,
+        "rules_media_after": None,
+        "rules_keyboard": [],
+        "rules_access": "all",
+        "captcha_text": "",
+        "welcome_text": "¡Bienvenido/a, {name}!",
+        "goodbye_text": "👋 {name} salió del grupo.",
+        "blocked_words": [],
+        "blocked_user_ids": [],
+        "masked_exceptions": [],
+        "filters": {},
+        "custom_commands": {},
+        "quick_buttons": [],
+        "quick_commands_enabled": {},
+        "videochat_button_label": "🔥 /vchat",
+        "max_length": 0,
+        "warnings": {},
+    }
+
+
+def obtener_ajustes_grupo(canal_key):
+    chat_id = obtener_canal_id(canal_key)
+    if not chat_id:
+        return None
+    cfg = cargar_config()
+    destino = cfg.get("destinos", {}).get(canal_key, {})
+    defaults = _nuevos_ajustes_grupo(
+        chat_id,
+        destino.get("nombre", CANALES.get(canal_key, {}).get("nombre", "Grupo")),
+        destino.get("tipo", "grupo/canal"),
+    )
+    existente = cfg.get("group_settings", {}).get(str(chat_id))
+    if not isinstance(existente, dict):
+        existente = defaults
+        cambio = True
+    else:
+        cambio = False
+        for key, value in defaults.items():
+            if key not in existente:
+                existente[key] = value
+                cambio = True
+        existente["chat_id"] = str(chat_id)
+        if destino.get("nombre") and existente.get("title") != destino["nombre"]:
+            existente["title"] = destino["nombre"]
+            cambio = True
+        if destino.get("tipo") and existente.get("type") != destino["tipo"]:
+            existente["type"] = destino["tipo"]
+            cambio = True
+    if cambio:
+        def guardar(config):
+            config.setdefault("group_settings", {})[str(chat_id)] = existente
+        actualizar_config(guardar)
+    return existente
+
+
+def actualizar_ajustes_grupo(canal_key, actualizar):
+    chat_id = obtener_canal_id(canal_key)
+    if not chat_id:
+        return None
+
+    def modificar(config):
+        destino = config.get("destinos", {}).get(canal_key, {})
+        ajustes = config.setdefault("group_settings", {}).setdefault(
+            str(chat_id),
+            _nuevos_ajustes_grupo(
+                chat_id,
+                destino.get("nombre", CANALES.get(canal_key, {}).get("nombre", "Grupo")),
+                destino.get("tipo", "grupo/canal"),
+            ),
+        )
+        actualizar(ajustes)
+    actualizar_config(modificar)
+    return obtener_ajustes_grupo(canal_key)
+
+
+def etiqueta_boton_videochat(ajustes):
+    etiqueta = str((ajustes or {}).get("videochat_button_label") or "").strip()
+    return (etiqueta or "🔥 /vchat")[:32]
+
+
+def atajos_fijos_grupo(ajustes):
+    ajustes = ajustes or {}
+    if str(ajustes.get("type", "")).lower() == "canal":
+        return []
+    enabled = ajustes.get("quick_commands_enabled", {})
+    result = []
+    for key, label, action in GROUP_MEMBER_SHORTCUTS:
+        if enabled.get(key, True):
+            if key == "vchat":
+                label = etiqueta_boton_videochat(ajustes)
+            result.append({"key": key, "label": label, "action": action})
+    return result
+
+
+def es_atajo_admin(item):
+    label = str((item or {}).get("label", "")).strip().casefold()
+    action = str((item or {}).get("action", "")).strip()
+    comando = action.split(maxsplit=1)[0].split("@", 1)[0].casefold() if action else ""
+    return label in ("/admin", "admin") or comando == "/admin"
+
+
+def enlace_bot_privado():
+    try:
+        username = getattr(bot.get_me(), "username", None)
+    except Exception:
+        username = None
+    return f"https://t.me/{username}?start=from_group" if username else None
+
+
+def enlace_invitacion_grupo(chat_id, ajustes):
+    invite = str((ajustes or {}).get("group_link") or "").strip()
+    if (ajustes or {}).get("group_link_enabled") and re.fullmatch(
+        r"https?://[^\s<>\"']+", invite, re.IGNORECASE
+    ):
+        return invite
+    try:
+        chat = bot.get_chat(chat_id)
+        username = getattr(chat, "username", None)
+        if username:
+            return f"https://t.me/{username}"
+        invite = str(getattr(chat, "invite_link", "") or "").strip()
+        if re.fullmatch(r"https?://[^\s<>\"']+", invite, re.IGNORECASE):
+            return invite
+    except Exception:
+        app.logger.info("No se pudo obtener un enlace para compartir el grupo.")
+    return None
+
+
+def enlace_videochat_grupo(chat_id):
+    try:
+        chat = bot.get_chat(chat_id)
+    except Exception:
+        app.logger.info("No se pudo consultar el grupo para abrir su videochat.")
+        return None
+    username = getattr(chat, "username", None)
+    return f"https://t.me/{username}?videochat" if username else None
+
+
+def funcion_grupo_activada(canal_key, ajustes, feature):
+    if feature == "reglamento":
+        return bool(str((ajustes or {}).get("rules", "")).strip())
+    if feature == "atajos":
+        return bool(atajos_fijos_grupo(ajustes) or (ajustes or {}).get("quick_buttons"))
+    return False
+
+
+def _politica_ajuste(ajustes, policy_id):
+    if policy_id == "flood":
+        legacy = bool((ajustes or {}).get("enabled", {}).get("antiflood"))
+        return {
+            "action": (ajustes or {}).get("flood_action", "delete" if legacy else "off"),
+            "delete_messages": bool((ajustes or {}).get("flood_delete_messages", legacy)),
+            "exceptions": [],
+            "username_spam": False,
+            "bot_spam": False,
+        }
+    policies = (ajustes or {}).get("moderation_policies", {})
+    policy = policies.get(policy_id, {}) if isinstance(policies, dict) else {}
+    return {
+        "action": str(policy.get("action", "off")),
+        "delete_messages": bool(policy.get("delete_messages", False)),
+        "exceptions": list(policy.get("exceptions", [])),
+        "username_spam": bool(policy.get("username_spam", False)),
+        "bot_spam": bool(policy.get("bot_spam", False)),
+    }
+
+
+def _texto_accion_moderacion(action):
+    return {
+        "off": "Off", "warn": "Warn", "kick": "Kick", "mute": "Silenciar",
+        "ban": "Ban", "delete": "Eliminar",
+    }.get(str(action), "Off")
+
+
+def _estado_politica(ajustes, policy_id):
+    policy = _politica_ajuste(ajustes, policy_id)
+    return (
+        f"Castigo: {_texto_accion_moderacion(policy['action'])}\n"
+        f"Eliminación: {'Sí ✅' if policy['delete_messages'] else 'No ❌'}"
+    )
+
+
+def mostrar_configuracion_grupo(
+    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None
+):
+    if canal_key not in CANALES:
+        return editar_o_enviar_panel(
+            chat_id_admin, "No encontré ese grupo o canal.",
+            message=message, message_id=message_id,
+        )
+    ajustes = obtener_ajustes_grupo(canal_key)
+    if not ajustes:
+        return editar_o_enviar_panel(
+            chat_id_admin, "Este destino todavía no tiene un ID guardado.",
+            message=message, message_id=message_id,
+        )
+    pagina = max(0, int(pagina or 0))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    botones = []
+    for feature, label in GROUP_CONFIG_CATEGORIES:
+        estado = "🟢" if funcion_grupo_activada(canal_key, ajustes, feature) else "⚪"
+        botones.append(types.InlineKeyboardButton(
+            f"{estado} {label}",
+            callback_data=f"grupo_feature|{canal_key}|{feature}|{pagina}",
+        ))
+    markup.row(*botones)
+    markup.add(types.InlineKeyboardButton(
+        "↩️ Volver",
+        callback_data=f"grupo_ficha|{canal_key}",
+    ))
+    texto = (
+        f"⚙️ <b>Configuración de {html.escape(str(ajustes.get('type', 'grupo/canal')))}</b>\n"
+        f"<b>{html.escape(str(ajustes.get('title', CANALES[canal_key]['nombre'])))}</b>\n"
+        f"ID: <code>{html.escape(str(ajustes['chat_id']))}</code>\n\n"
+        "Elige qué quieres configurar. Los cambios se guardan solo para este destino."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id_admin, texto, markup, message=message, message_id=message_id,
+        forzar_texto=True,
+    )
+
+
+RULES_HELP_HTML = (
+    "📚 <b>Todo lo que puedes hacer con las reglas</b>\n\n"
+    "────────────\n"
+    "🔘 <b>BOTONES</b>\n"
+    "Las reglas pueden mostrarse mediante botones personalizados para facilitar su acceso a los miembros del grupo, "
+    "utilizando la siguiente sintaxis al crear el botón:\n\n"
+    "<code>Nombre del botón - rules</code>\n\n"
+    "Al pulsarlo, el usuario verá automáticamente el reglamento configurado para el grupo.\n"
+    "────────────\n"
+    "🧠 <b>CAPTCHA</b>\n"
+    "Puedes utilizar el tag:\n\n"
+    "<code>{RULES}</code>\n\n"
+    "Al hacerlo, el bot reemplazará automáticamente el tag por el texto completo de las reglas configuradas.\n\n"
+    "Esta función resulta especialmente útil para mostrar las normas durante el proceso de verificación de nuevos usuarios.\n"
+    "────────────\n"
+    "🔎 <b>ARGUMENTOS</b>\n"
+    "Los argumentos permiten mostrar únicamente una parte específica del reglamento.\n\n"
+    "Puedes utilizar números, palabras o emojis para acceder directamente a una regla determinada.\n\n"
+    "Ejemplo: <code>/rules 1</code>\n"
+    "                <code>/rules spam</code>\n"
+    "                <code>/rules 🚫</code>\n\n"
+    "El bot mostrará únicamente la línea o párrafo relacionado con el argumento indicado.\n"
+    "────────────\n"
+    "📝 <b>CONTENIDO DEL MENSAJE</b>\n"
+    "Desde el botón ✍🏼 Personalizar mensaje puedes configurar cómo se mostrará el reglamento a los usuarios.\n\n"
+    "Elementos disponibles:\n\n"
+    "📄 <b>Texto</b>\n"
+    "Contenido del reglamento.\n\n"
+    "🖼️ <b>Multimedia</b>\n"
+    "Imágenes o banners que pueden mostrarse encima o debajo del reglamento.\n\n"
+    "🔠 <b>Teclado</b>\n"
+    "Botones personalizados para enlaces, comandos o secciones relacionadas."
+)
+
+
+def mostrar_menu_reglamento(
+    chat_id_admin, canal_key, pagina=0, message=None, message_id=None,
+    mostrar_ayuda=False, aviso=None,
+):
+    ajustes = obtener_ajustes_grupo(canal_key) or {}
+    acceso = ajustes.get("rules_access", "all")
+    texto = (
+        f"📜 <b>Reglamento — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
+        "En esta sección puedes crear y gestionar las normas del grupo.\n\n"
+        "Los miembros podrán consultar el reglamento con <code>/rules</code>, "
+        "un botón personalizado o durante el CAPTCHA.\n\n"
+        f"Acceso al comando: <b>{'Solo administradores' if acceso == 'admins' else 'Todos los miembros'}</b>."
+    )
+    if mostrar_ayuda:
+        texto += "\n\n" + RULES_HELP_HTML
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        "📚 Todo lo que puedes hacer con las reglas" if not mostrar_ayuda else "🔽 Ocultar detalles",
+        callback_data=f"grp_rules|help|{canal_key}|{pagina}|{0 if mostrar_ayuda else 1}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "✍🏼 Personalizar mensaje",
+        callback_data=f"grp_rules|editor|{canal_key}|{pagina}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "📍 Permisos de comandos",
+        callback_data=f"grp_rules|permisos|{canal_key}|{pagina}|{int(mostrar_ayuda)}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "↩️ Volver",
+        callback_data=f"grupo_config|{canal_key}|{pagina}",
+    ))
+    return editar_o_enviar_panel(
+        chat_id_admin, texto, markup, message=message, message_id=message_id,
+        forzar_texto=True,
+    )
+
+
+def mostrar_editor_reglamento(
+    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None
+):
+    ajustes = obtener_ajustes_grupo(canal_key) or {}
+    reglas = str(ajustes.get("rules", "")).strip()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(types.InlineKeyboardButton(
+        "✏️ Editar texto",
+        callback_data=f"grp_rules|edit|{canal_key}|{pagina}",
+    ))
+    markup.row(
+        types.InlineKeyboardButton(
+            "🖼️ Multimedia encima",
+            callback_data=f"grp_rules|media|{canal_key}|{pagina}|before",
+        ),
+        types.InlineKeyboardButton(
+            "🖼️ Multimedia debajo",
+            callback_data=f"grp_rules|media|{canal_key}|{pagina}|after",
+        ),
+    )
+    for posicion in ("before", "after"):
+        if ajustes.get(f"rules_media_{posicion}"):
+            markup.add(types.InlineKeyboardButton(
+                f"🗑️ Quitar multimedia {'encima' if posicion == 'before' else 'debajo'}",
+                callback_data=f"grp_rules|media_clear|{canal_key}|{pagina}|{posicion}",
+            ))
+    markup.add(types.InlineKeyboardButton(
+        "🔠 Configurar teclado",
+        callback_data=f"grp_rules|keyboard|{canal_key}|{pagina}",
+    ))
+    if ajustes.get("rules_keyboard"):
+        markup.add(types.InlineKeyboardButton(
+            "🗑️ Quitar todos los botones",
+            callback_data=f"grp_rules|keyboard_clear|{canal_key}|{pagina}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "↩️ Volver a Reglamento",
+        callback_data=f"grp_rules|home|{canal_key}|{pagina}|0",
+    ))
+    texto = (
+        f"✍🏼 <b>Personalizar mensaje — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
+        f"<b>Texto actual:</b>\n{html.escape(reglas[:1000]) if reglas else '<i>Sin texto configurado.</i>'}\n\n"
+        f"Multimedia encima: {'configurada' if ajustes.get('rules_media_before') else 'no configurada'}\n"
+        f"Multimedia debajo: {'configurada' if ajustes.get('rules_media_after') else 'no configurada'}\n"
+        f"Botones configurados: {len(ajustes.get('rules_keyboard', []))}"
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id_admin, texto, markup, message=message, message_id=message_id,
+        forzar_texto=True,
+    )
+
+
+def mostrar_teclado_reglamento(
+    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None
+):
+    ajustes = obtener_ajustes_grupo(canal_key) or {}
+    botones = ajustes.get("rules_keyboard", [])
+    lineas = "\n".join(
+        f"• <b>{html.escape(str(item.get('label', 'Botón')))}</b> → "
+        f"<code>{html.escape(str(item.get('action', '')))}</code>"
+        for item in botones[:20]
+    ) or "Todavía no hay botones personalizados."
+    texto = (
+        f"🔠 <b>Teclado del Reglamento — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
+        f"{lineas}\n\nAgrega una línea con <code>etiqueta=acción</code> o "
+        "<code>Nombre del botón - rules</code>."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        "➕ Agregar botón",
+        callback_data=f"grp_rules|keyboard_add|{canal_key}|{pagina}",
+    ))
+    for index, item in enumerate(botones[:20]):
+        markup.add(types.InlineKeyboardButton(
+            f"🗑️ Quitar: {str(item.get('label', 'Botón'))[:48]}",
+            callback_data=f"grp_rules|keyboard_del|{canal_key}|{pagina}|{index}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "↩️ Volver a personalizar mensaje",
+        callback_data=f"grp_rules|editor|{canal_key}|{pagina}",
+    ))
+    return editar_o_enviar_panel(
+        chat_id_admin, texto, markup, message=message, message_id=message_id,
+        forzar_texto=True,
+    )
+
+
+def mostrar_permisos_reglamento(
+    chat_id_admin, canal_key, pagina=0, message=None, message_id=None,
+    mostrar_ayuda=False, aviso=None,
+):
+    ajustes = obtener_ajustes_grupo(canal_key) or {}
+    acceso = ajustes.get("rules_access", "all")
+    texto = (
+        f"📍 <b>Permisos de comandos — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
+        "Elige quién puede consultar las reglas con <code>/rules</code>.\n\n"
+        f"Acceso actual: <b>{'Solo administradores' if acceso == 'admins' else 'Todos los miembros'}</b>."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        ("✅ " if acceso == "all" else "") + "👥 Todos los miembros",
+        callback_data=f"grp_rules|access|{canal_key}|{pagina}|all",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        ("✅ " if acceso == "admins" else "") + "🛡️ Solo administradores",
+        callback_data=f"grp_rules|access|{canal_key}|{pagina}|admins",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "↩️ Volver a Reglamento",
+        callback_data=f"grp_rules|home|{canal_key}|{pagina}|{int(mostrar_ayuda)}",
+    ))
+    return editar_o_enviar_panel(
+        chat_id_admin, texto, markup, message=message, message_id=message_id,
+        forzar_texto=True,
+    )
+
+
+def construir_teclado_reglamento(canal_key, ajustes):
+    botones = (ajustes or {}).get("rules_keyboard", [])
+    if not botones or canal_key not in CANALES:
+        return None
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    fila = []
+    for index, item in enumerate(botones[:20]):
+        etiqueta = str(item.get("label", "Botón"))[:64]
+        accion = str(item.get("action", "")).strip()
+        boton = (
+            types.InlineKeyboardButton(etiqueta, url=accion)
+            if accion.startswith(("https://", "http://"))
+            else types.InlineKeyboardButton(
+                etiqueta, callback_data=f"rules_inline|{canal_key}|{index}"
+            )
+        )
+        fila.append(boton)
+        if len(fila) == 2:
+            markup.row(*fila)
+            fila = []
+    if fila:
+        markup.row(*fila)
+    return markup
+
+
+def separar_sintaxis_boton(texto):
+    if "=" in texto:
+        etiqueta, accion = texto.split("=", 1)
+    else:
+        coincidencia = re.fullmatch(r"\s*(.{1,32}?)\s+-\s+(.+?)\s*", texto)
+        if not coincidencia:
+            raise ValueError("Usa etiqueta=acción o «Nombre del botón - rules».")
+        etiqueta, accion = coincidencia.groups()
+    etiqueta, accion = etiqueta.strip(), accion.strip()
+    if accion.casefold() == "rules":
+        accion = "/rules"
+    if not etiqueta or not accion or len(etiqueta) > 64:
+        raise ValueError("La etiqueta debe tener de 1 a 64 caracteres y la acción no puede estar vacía.")
+    if accion.startswith(("https://", "http://")) and not re.fullmatch(
+        r"https?://[^\s<>\"']+", accion, re.IGNORECASE
+    ):
+        raise ValueError("El enlace no parece válido.")
+    return etiqueta, accion
+
+
+def mostrar_menu_atajos_grupo(
+    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None
+):
+    ajustes = obtener_ajustes_grupo(canal_key) or {}
+    botones = ajustes.get("quick_buttons", [])
+    es_grupo = str(ajustes.get("type") or "grupo").lower() != "canal"
+    etiqueta_videochat = etiqueta_boton_videochat(ajustes)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if es_grupo:
+        enabled = ajustes.get("quick_commands_enabled", {})
+        for start in range(0, len(GROUP_MEMBER_SHORTCUTS), 2):
+            fila = []
+            for key, label, _action in GROUP_MEMBER_SHORTCUTS[start:start + 2]:
+                if key == "vchat":
+                    label = etiqueta_videochat
+                mark = "✅" if enabled.get(key, True) else "⚪"
+                fila.append(types.InlineKeyboardButton(
+                    f"{mark} {label}",
+                    callback_data=f"grupo_atajo_toggle|{canal_key}|{key}|{pagina}",
+                ))
+            markup.row(*fila)
+        markup.add(types.InlineKeyboardButton(
+            f"✏️ Nombre del botón de videochat: {etiqueta_videochat}",
+            callback_data=f"grupo_atajos_video_label|{canal_key}|{pagina}",
+        ))
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Agregar botón",
+            callback_data=f"grupo_atajos_add|{canal_key}|{pagina}",
+        ),
+        types.InlineKeyboardButton(
+            "📲 Publicar botones en el chat",
+            callback_data=f"grupo_atajos_apply|{canal_key}|{pagina}",
+        ),
+        types.InlineKeyboardButton(
+            "🧹 Quitar botones del chat",
+            callback_data=f"grupo_atajos_remove|{canal_key}|{pagina}",
+        ),
+    )
+    for index, item in enumerate(botones[:20]):
+        markup.add(types.InlineKeyboardButton(
+            f"🗑️ Quitar: {str(item.get('label', 'Botón'))[:48]}",
+            callback_data=f"grupo_atajos_del|{canal_key}|{index}|{pagina}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "↩️ Volver a ajustes",
+        callback_data=f"grupo_config|{canal_key}|{pagina}",
+    ))
+    resumen_custom = "\n".join(
+        f"• <b>{html.escape(str(item.get('label', 'Botón')))}</b> → "
+        f"<code>{html.escape(str(item.get('action', '')))}</code>"
+        for item in botones[:20]
+    ) or "Todavía no hay botones personalizados."
+    if es_grupo:
+        enabled = ajustes.get("quick_commands_enabled", {})
+        acciones = {
+            "start": "abre el menú privado del bot",
+            "menu": "muestra el menú del grupo",
+            "rules": "muestra el reglamento de este grupo",
+            "share": "comparte el enlace del grupo",
+            "admin": "abre el contacto del administrador",
+            "vchat": "muestra el acceso o guía de videochat",
+        }
+        labels = {
+            key: etiqueta_videochat if key == "vchat" else label
+            for key, label, _action in GROUP_MEMBER_SHORTCUTS
+        }
+        fixed = "\n".join(
+            f"{'✅' if enabled.get(key, True) else '⚪'} "
+            f"<b>{html.escape(labels[key])}</b> → {acciones[key]}"
+            for key, _label, _action in GROUP_MEMBER_SHORTCUTS
+        )
+        resumen_custom = f"{fixed}\n\n<b>Botones personalizados</b>\n{resumen_custom}"
+    tipo = str(ajustes.get("type") or "grupo").lower()
+    detalle = (
+        "En grupos, publica el teclado para dejar los accesos visibles bajo la barra de escritura. "
+        "Telegram requiere un toque adicional en enlaces; una tecla de respuesta no puede abrirlos directamente."
+        if tipo != "canal" else
+        "En canales Telegram no ofrece una barra de respuesta para suscriptores; los botones se publican bajo un mensaje."
+    )
+    texto = (
+        f"⌨️ <b>Botones rápidos — {html.escape(str(ajustes.get('title', 'este chat')))}</b>\n\n"
+        f"{resumen_custom}\n\n"
+        "Los seis accesos fijos se pueden activar o desactivar y el nombre del botón de videochat es editable. "
+        "Para añadir botones usa <code>etiqueta=acción</code>, por ejemplo "
+        "<code>🌐 Sitio=https://ejemplo.com</code> o <code>📜 Reglamento - rules</code>.\n\n"
+        f"{html.escape(detalle)}"
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id_admin, texto, markup, message=message, message_id=message_id,
+        forzar_texto=True,
+    )
+
+
 def enviar_ficha_destino(
     chat_id_admin, canal_key, chat_id, title, tipo, message=None, message_id=None,
     aviso=None,
@@ -1253,1669 +2001,466 @@ def enviar_ficha_destino(
         chat_id_admin, texto, markup, message=message, message_id=message_id
     )
 
+    # --- CONFIGURACIÓN DE IDENTIDAD ---
+    TOKEN = os.environ['TELEGRAM_TOKEN']
+    ADMIN_ID = 7827130679
+    GRUPO_ID = -1003209796081
+    LINK_GRUPO = "https://t.me/+DT-eLLYZ0g8wNmMx"
+    LINK_CANAL_GRATUITO = "https://t.me/+dv7otcdqzmk0NWU5"
+    MY_USER = 'Ja2610X'
+    BOT_USER = "CACIQUEXVIPbot"
+    BOT_PAGO = "@CaciqueXmembot"
 
-GROUP_CONFIG_CATEGORIES = [
-    ("reglamento", "📜 Reglamento"),
-    ("atajos", "⌨️ Botones rápidos del grupo"),
-]
+    bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-GROUP_CONFIG_PAGE_SIZE = 2
-GROUP_FEATURE_TITLES_EN = {
-    "reglamento": "📜 Rules",
-    "antispam": "📨 Anti-spam",
-    "bienvenida": "💬 Welcome",
-    "antiflood": "🌊 Anti-flood",
-    "despedida": "👋 Goodbye",
-    "alfabetos": "🔤 Alphabets",
-    "captcha": "🧩 CAPTCHA",
-    "filtros": "🔦 Filters",
-    "reportes": "🆘 Reports",
-    "bloqueos": "🔒 Blocks",
-    "multimedia": "🖼️ Media",
-    "antiporno": "🚫 Adult content",
-    "advertencias": "⚠️ Warnings",
-    "modo_nocturno": "🌙 Quiet hours",
-    "etiqueta": "🏷️ Group tag",
-    "enlace": "🔗 Group link",
-    "guardian": "🛡️ Guardian",
-    "aprobacion": "📩 Join approval",
-    "eliminacion": "🗑️ Auto-delete",
-    "topics": "🧵 Topics",
-    "palabras": "🔠 Banned words",
-    "miembros": "👥 Member management",
-    "enmascarados": "🕵️ Anonymous senders",
-    "discusion": "📣 Discussion group",
-    "comandos": "📱 Custom commands",
-    "stickers_gif": "🎭 Stickers and GIFs",
-    "longitud": "📏 Message length",
-    "canales": "📡 Channel tools",
-    "permisos": "🖊️ Permissions",
-    "registro": "🔍 Log channel",
-    "lang": "🌐 Language",
-    "atajos": "⌨️ Group shortcuts",
-}
-GROUP_FEATURE_DESCRIPTIONS_EN = {
-    "reglamento": "Save the rules and show them in the group with /rules.",
-    "antispam": "Delete messages when a member exceeds the message-rate limit.",
-    "bienvenida": "Send a custom message when someone joins.",
-    "antiflood": "Delete messages when a member posts too quickly.",
-    "despedida": "Send a custom message when someone leaves.",
-    "alfabetos": "Block messages dominated by non-Latin alphabets.",
-    "captcha": "Ask new members to verify with a button.",
-    "filtros": "Reply to phrases that you configure.",
-    "reportes": "Let members use /report to notify administrators.",
-    "bloqueos": "Manage blocked words and member-moderation commands.",
-    "multimedia": "Block photos, videos, files, audio, and animations.",
-    "antiporno": "Block explicit terms and links; images are not analyzed.",
-    "advertencias": "Enable /warn; three warnings mute a member for one hour.",
-    "modo_nocturno": "Delete member messages during the configured quiet hours.",
-    "etiqueta": "Save text to publish with /tag.",
-    "enlace": "Create an invite link if the bot has permission.",
-    "guardian": "Enable spam, flood, and banned-word protections together.",
-    "aprobacion": "Create invite links that require an administrator's approval.",
-    "eliminacion": "Set automatic message deletion for the group.",
-    "topics": "Create a topic when forum topics are enabled.",
-    "palabras": "Add or remove words that should be deleted from messages.",
-    "miembros": "Use /ban, /unban, /mute, and /warn by replying or entering a user ID.",
-    "enmascarados": "Block posts sent as an anonymous administrator or channel.",
-    "discusion": "Telegram requires linking a discussion group in the channel settings.",
-    "comandos": "Create custom commands in command=reply format.",
-    "stickers_gif": "Block stickers and GIF/animation posts.",
-    "longitud": "Delete text that exceeds the configured character limit.",
-    "canales": "Manage buttons and posts for this destination.",
-    "permisos": "When enabled, only administrators can write; member posts are deleted.",
-    "registro": "Choose where moderation notifications are sent.",
-    "lang": "Choose Spanish or English for the settings menu.",
-    "atajos": "Choose and publish the member toolbar: /start, /menu, /reglas, /compartir, /admin, and /vchat.",
-}
-GROUP_FEATURE_TEXT_PROMPTS_EN = {
-    "reglamento": ("Rules", "Write the rules that /rules will show."),
-    "bienvenida": ("Welcome message", "Use {name} to include the member's name."),
-    "despedida": ("Goodbye message", "Use {name} to include the member's name."),
-    "etiqueta": ("Group tag", "Write the text that /tag should post."),
-    "filtros": ("Filter", "Write phrase=reply. To remove one, enter -phrase."),
-    "palabras": ("Banned word", "Write a word to block. Prefix it with - to remove it."),
-    "comandos": ("Custom command", "Write command=reply, without /. Example: prices=Use /start."),
-    "longitud": ("Maximum length", "Enter a number from 1 to 4096, or 0 to disable."),
-    "modo_nocturno": ("Quiet hours", "Enter start-end in 24-hour format. Example: 22:00-07:00."),
-}
+    # --- BASES DE DATOS (MANTENIDAS ÍNTEGRAS) ---
+    db = TinyDB('database.json')
+    Config = TinyDB('config.json')
+    Blacklist = TinyDB('blacklist.json')
+    UltimaPromo = TinyDB('ultima_promo.json')
+    Warnings = TinyDB('warnings.json')
+    PromosAprobadas = TinyDB('promos_aprobadas.json')
+    RegistroActividad = TinyDB('registro_actividad.json')
+    Suscripciones = TinyDB('suscripciones.json')
+    Estadisticas = TinyDB('stats.json')
+    User = Query()
+    user_data = {}
+    ID_ULTIMA_INVITACION = None
+    ULTIMOS_MSGS = {'reglas': None, 'admin': None, 'menu': None, 'compartir': None, 'start': None, 'reportar': None, 'anon': None}
+    reporte_msgs = {}
 
+    # --- SEGURIDAD: ANTI-FLOOD ---
+    _flood_registro = {}
+    FLOOD_LIMITE = 5
+    FLOOD_VENTANA = 10
 
-def obtener_ajustes_grupo(canal_key):
-    chat_id = obtener_canal_id(canal_key)
-    if not chat_id:
-        return None
-    cfg = cargar_config()
-    ajustes = cfg.get("group_settings", {}).get(str(chat_id))
-    if ajustes:
-        return ajustes
-    destino = cfg.get("destinos", {}).get(canal_key, {})
-    ajustes = {
-        "chat_id": str(chat_id),
-        "title": destino.get("nombre", CANALES.get(canal_key, {}).get("nombre", "Grupo")),
-        "type": destino.get("tipo", "grupo/canal"),
-        "enabled": {},
-        "moderation_policies": {},
-        "media_policies": {},
-        "flood_limit": 5,
-        "flood_window_seconds": 3,
-        "flood_action": "off",
-        "flood_delete_messages": False,
-        "welcome_mode": "always",
-        "welcome_send_private": False,
-        "welcome_delete_previous": False,
-        "welcome_seen_users": [],
-        "goodbye_send_private": False,
-        "goodbye_delete_previous": False,
-        "captcha_mode": "button",
-        "captcha_timeout_seconds": 90,
-        "captcha_action": "ban",
-        "captcha_delete_service_message": False,
-        "captcha_theme": "classic",
-        "night_mode_action": "delete",
-        "night_mode_mute": False,
-        "warning_limit": 3,
-        "warning_action": "mute",
-        "warning_duration_seconds": 3600,
-        "rules": "",
-        "rules_media_before": None,
-        "rules_media_after": None,
-        "rules_keyboard": [],
-        "rules_access": "all",
-        "captcha_text": "",
-        "welcome_text": "¡Bienvenido/a, {name}!",
-        "goodbye_text": "👋 {name} salió del grupo.",
-        "blocked_words": [],
-        "filters": {},
-        "custom_commands": {},
-        "quick_buttons": [],
-        "videochat_button_label": "📹 Iniciar videochat",
-        "max_length": 0,
-        "warnings": {},
-    }
-
-    def inicializar(config):
-        config.setdefault("group_settings", {}).setdefault(str(chat_id), ajustes)
-    actualizar_config(inicializar)
-    return cargar_config().get("group_settings", {}).get(str(chat_id), ajustes)
-
-
-def actualizar_ajustes_grupo(canal_key, actualizar):
-    chat_id = obtener_canal_id(canal_key)
-    if not chat_id:
-        return None
-
-    def modificar(config):
-        todos = config.setdefault("group_settings", {})
-        ajustes = todos.setdefault(str(chat_id), {
-            "chat_id": str(chat_id),
-            "title": CANALES.get(canal_key, {}).get("nombre", "Grupo"),
-            "type": "grupo/canal",
-            "enabled": {},
-            "moderation_policies": {},
-            "media_policies": {},
-            "flood_limit": 5,
-            "flood_window_seconds": 3,
-            "flood_action": "off",
-            "flood_delete_messages": False,
-            "welcome_mode": "always",
-            "welcome_send_private": False,
-            "welcome_delete_previous": False,
-            "welcome_seen_users": [],
-            "goodbye_send_private": False,
-            "goodbye_delete_previous": False,
-            "captcha_mode": "button",
-            "captcha_timeout_seconds": 90,
-            "captcha_action": "ban",
-            "captcha_delete_service_message": False,
-            "captcha_theme": "classic",
-            "night_mode_action": "delete",
-            "night_mode_mute": False,
-            "warning_limit": 3,
-            "warning_action": "mute",
-            "warning_duration_seconds": 3600,
-            "rules": "",
-            "rules_media_before": None,
-            "rules_media_after": None,
-            "rules_keyboard": [],
-            "rules_access": "all",
-            "captcha_text": "",
-            "welcome_text": "¡Bienvenido/a, {name}!",
-            "goodbye_text": "👋 {name} salió del grupo.",
-            "blocked_words": [],
-            "filters": {},
-            "custom_commands": {},
-            "quick_buttons": [],
-        "videochat_button_label": "📹 Iniciar videochat",
-            "max_length": 0,
-            "warnings": {},
-        })
-        actualizar(ajustes)
-    actualizar_config(modificar)
-    return obtener_ajustes_grupo(canal_key)
-
-
-def etiqueta_boton_videochat(ajustes):
-    etiqueta = str((ajustes or {}).get("videochat_button_label") or "").strip()
-    if not etiqueta or etiqueta == "📹 Iniciar videochat":
-        etiqueta = "🔥 /vchat"
-    return etiqueta[:32] or "🔥 /vchat"
-
-
-GROUP_MEMBER_SHORTCUTS = (
-    ("start", "🏠 /start", "__group_start__"),
-    ("menu", "🏹 /menu", "__group_menu__"),
-    ("rules", "📜 /reglas", "/rules"),
-    ("share", "🚀 /compartir", "__group_share__"),
-    ("admin", "👤 /admin", "__group_admin__"),
-    ("vchat", "🔥 /vchat", "__videochat_guide__"),
-)
-
-
-def atajos_fijos_grupo(ajustes):
-    ajustes = ajustes or {}
-    if str(ajustes.get("type", "")).lower() == "canal":
-        return []
-    enabled = ajustes.get("quick_commands_enabled", {})
-    result = []
-    for key, label, action in GROUP_MEMBER_SHORTCUTS:
-        if not enabled.get(key, True):
-            continue
-        if key == "vchat":
-            label = etiqueta_boton_videochat(ajustes)
-        result.append({"key": key, "label": label, "action": action})
-    return result
-
-
-def es_atajo_admin(item):
-    label = str((item or {}).get("label", "")).strip().casefold()
-    action = str((item or {}).get("action", "")).strip()
-    comando = action.split(maxsplit=1)[0].split("@", 1)[0].casefold() if action else ""
-    return label in ("/admin", "admin") or comando == "/admin"
-
-
-def enlace_bot_privado():
-    try:
-        username = getattr(bot.get_me(), "username", None)
-    except Exception:
-        username = None
-    return f"https://t.me/{username}?start=from_group" if username else None
-
-
-def enlace_invitacion_grupo(chat_id, ajustes):
-    invite = str((ajustes or {}).get("group_link") or "").strip()
-    if (
-        (ajustes or {}).get("group_link_enabled")
-        and re.fullmatch(r"https?://[^\s<>\"']+", invite, re.IGNORECASE)
-    ):
-        return invite
-    try:
-        chat = bot.get_chat(chat_id)
-        username = getattr(chat, "username", None)
-        if username:
-            return f"https://t.me/{username}"
-        invite = str(getattr(chat, "invite_link", "") or "").strip()
-        if re.fullmatch(r"https?://[^\s<>\"']+", invite, re.IGNORECASE):
-            return invite
-    except Exception:
-        app.logger.info("No se pudo obtener un enlace para compartir el grupo.")
-    return None
-
-
-def enlace_videochat_grupo(chat_id):
-    try:
-        chat = bot.get_chat(chat_id)
-    except Exception:
-        app.logger.info("No se pudo consultar el grupo para abrir su videochat.")
-        return None
-    username = getattr(chat, "username", None)
-    if not username:
-        return None
-    return f"https://t.me/{username}?videochat"
-
-
-def funcion_grupo_activada(canal_key, ajustes, feature):
-    if feature == "antispam":
-        has_specific_policy = any(
-            _politica_ajuste(ajustes, policy_id).get("action") != "off"
-            or _politica_ajuste(ajustes, policy_id).get("delete_messages")
-            for policy_id in (
-                "telegram_links", "internet_links", "forward_channel",
-                "forward_group", "forward_user", "forward_bot",
-                "quote_channel", "quote_group", "quote_user", "quote_bot",
-            )
-        )
-        if has_specific_policy:
-            return True
-    if feature == "multimedia":
-        if any(
-            action != "off"
-            for action in ajustes.get("media_policies", {}).values()
-        ):
-            return True
-        if ajustes.get(
-            "media_global_block",
-            bool(ajustes.get("enabled", {}).get("multimedia")),
-        ):
-            return True
-    if feature == "antiflood":
-        if (
-            ajustes.get("flood_action", "off") != "off"
-            or ajustes.get("flood_delete_messages", False)
-        ):
-            return True
-    if feature in ajustes.get("enabled", {}):
-        return bool(ajustes["enabled"][feature])
-    if feature == "reglamento":
-        return bool(str(ajustes.get("rules", "")).strip())
-    if feature == "filtros":
-        return bool(ajustes.get("filters"))
-    if feature in ("palabras", "bloqueos"):
-        return bool(ajustes.get("blocked_words"))
-    if feature == "etiqueta":
-        return bool(str(ajustes.get("tag", "")).strip())
-    if feature == "comandos":
-        return bool(ajustes.get("custom_commands"))
-    if feature == "atajos":
-        return bool(atajos_fijos_grupo(ajustes) or ajustes.get("quick_buttons"))
-    if feature == "longitud":
-        return int(ajustes.get("max_length", 0) or 0) > 0
-    if feature == "eliminacion":
-        return int(ajustes.get("auto_delete_seconds", 0) or 0) > 0
-    if feature == "registro":
-        return bool(ajustes.get("log_chat_id"))
-    if feature == "lang":
-        return ajustes.get("language", "es") == "en"
-    if feature == "canales":
-        return bool(cargar_botones_custom(canal_key))
-    return False
-
-
-GROUP_MODERATION_ACTIONS = (
-    ("❌ Off", "off"),
-    ("⚠️ Warn", "warn"),
-    ("❗ Kick", "kick"),
-    ("🔇 Silenciar", "mute"),
-    ("🚫 Ban", "ban"),
-)
-GROUP_MODERATION_SOURCES = (
-    ("channel", "📢 Canales"),
-    ("group", "👥 Grupos"),
-    ("user", "👤 Usuarios"),
-    ("bot", "🤖 Bots"),
-)
-GROUP_MODERATION_SOURCE_LABELS = dict(GROUP_MODERATION_SOURCES)
-GROUP_MODERATION_POLICY_LABELS = {
-    "telegram_links": "🔗 Enlaces de Telegram",
-    "internet_links": "🌐 Enlaces de internet",
-    "forward_channel": "📢 Reenvíos de canales",
-    "forward_group": "👥 Reenvíos de grupos",
-    "forward_user": "👤 Reenvíos de usuarios",
-    "forward_bot": "🤖 Reenvíos de bots",
-    "quote_channel": "📢 Citas de canales",
-    "quote_group": "👥 Citas de grupos",
-    "quote_user": "👤 Citas de usuarios",
-    "quote_bot": "🤖 Citas de bots",
-}
-
-
-def _agregar_botones_en_filas(markup, botones, columnas=3):
-    botones = list(botones)
-    for inicio in range(0, len(botones), columnas):
-        markup.row(*botones[inicio:inicio + columnas])
-
-
-GROUP_MEDIA_PAGES = (
-    (
-        ("story", "📱 Historias"),
-        ("photo", "🖼️ Fotos"),
-        ("video", "🎥 Vídeos"),
-    ),
-    (
-        ("album", "🗂️ Álbumes"),
-        ("live_photo", "📸 Live Photo"),
-        ("animation", "🎞️ GIF"),
-    ),
-    (
-        ("sticker", "🎟️ Stickers"),
-        ("animated_sticker", "✨ Stickers animados"),
-        ("document", "📎 Archivos"),
-    ),
-)
-
-
-def _politica_ajuste(ajustes, policy_id):
-    if policy_id == "flood":
-        legacy_enabled = bool(ajustes.get("enabled", {}).get("antiflood"))
-        return {
-            "action": str(
-                ajustes.get(
-                    "flood_action",
-                    "delete" if legacy_enabled else "off",
-                )
-            ),
-            "delete_messages": bool(
-                ajustes.get("flood_delete_messages", legacy_enabled)
-            ),
-            "exceptions": [],
-            "username_spam": False,
-            "bot_spam": False,
-        }
-    policies = ajustes.get("moderation_policies", {})
-    policy = policies.get(policy_id, {}) if isinstance(policies, dict) else {}
-    if policy_id == "blocked_words" and policy_id not in policies:
-        legacy_enabled = bool(
-            ajustes.get("enabled", {}).get("palabras")
-            or ajustes.get("enabled", {}).get("guardian")
-        )
-        return {
-            "action": "off",
-            "delete_messages": legacy_enabled,
-            "exceptions": [],
-            "username_spam": False,
-            "bot_spam": False,
-        }
-    return {
-        "action": str(policy.get("action", "off")),
-        "delete_messages": bool(policy.get("delete_messages", False)),
-        "exceptions": list(policy.get("exceptions", [])),
-        "username_spam": bool(policy.get("username_spam", False)),
-        "bot_spam": bool(policy.get("bot_spam", False)),
-    }
-
-
-def _texto_accion_moderacion(action):
-    return {
-        "off": "Off",
-        "warn": "Warn",
-        "kick": "Kick",
-        "mute": "Silenciar",
-        "ban": "Ban",
-        "delete": "Eliminar",
-    }.get(str(action), "Off")
-
-
-def _estado_politica(ajustes, policy_id):
-    policy = _politica_ajuste(ajustes, policy_id)
-    return (
-        f"Castigo: {_texto_accion_moderacion(policy['action'])}\n"
-        f"Eliminación: {'Sí ✅' if policy['delete_messages'] else 'No ❌'}"
-    )
-
-
-def mostrar_menu_antispam(
-    chat_id_admin, canal_key, pagina=0, message=None,
-    seccion="root", policy_id=None, message_id=None, aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    policies = ajustes.get("moderation_policies", {})
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    if seccion == "root":
-        texto = (
-            "📨 <b>Antispam</b>\n"
-            "Configura por separado los enlaces, reenvíos y citas. "
-            "Cada sección permite elegir el castigo, borrar el mensaje y añadir excepciones."
-        )
-        sections = (
-            ("telegram", "📘 Telegram"),
-            ("forward", "↪️ Reenvíos"),
-            ("quotes", "💬 Citas"),
-            ("internet", "🌐 General de internet"),
-        )
-        _agregar_botones_en_filas(markup, [
-            types.InlineKeyboardButton(
-                label,
-                callback_data=f"gmod|open|{canal_key}|{pagina}|{section_id}",
-            )
-            for section_id, label in sections
-        ], columnas=2)
-        markup.add(types.InlineKeyboardButton(
-            "↩️ Volver a configuraciones",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ))
-    elif seccion in ("forward", "quotes") and policy_id is None:
-        noun = "Reenvíos" if seccion == "forward" else "Citas"
-        prefix = "forward" if seccion == "forward" else "quote"
-        texto = (
-            f"📨 <b>{noun}</b>\n"
-            "Selecciona el tipo de origen para ajustar su castigo y sus excepciones."
-        )
-        source_buttons = []
-        for source, label in GROUP_MODERATION_SOURCES:
-            policy_key = f"{prefix}_{source}"
-            policy = _politica_ajuste(ajustes, policy_key)
-            source_buttons.append(types.InlineKeyboardButton(
-                f"{label} — {_texto_accion_moderacion(policy['action'])}",
-                callback_data=f"gmod|policy|{canal_key}|{pagina}|{policy_key}|{seccion}",
-            ))
-        _agregar_botones_en_filas(markup, source_buttons, columnas=2)
-        markup.add(types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"gmod|back|{canal_key}|{pagina}|root",
-        ))
-    else:
-        active_policy = policy_id or {
-            "telegram": "telegram_links",
-            "internet": "internet_links",
-        }.get(seccion)
-        if active_policy not in GROUP_MODERATION_POLICY_LABELS:
-            bot.send_message(chat_id_admin, "No encontré ese ajuste antispam.")
-            return
-        policy = _politica_ajuste(ajustes, active_policy)
-        label = GROUP_MODERATION_POLICY_LABELS[active_policy]
-        texto = (
-            f"<b>{html.escape(label)}</b>\n"
-            f"{html.escape(_estado_politica(ajustes, active_policy))}"
-        )
-        if active_policy == "telegram_links":
-            texto += (
-                "\n\nActiva los controles que deben contar como spam:\n"
-                f"• @username: {'Sí ✅' if policy['username_spam'] else 'No ❌'}\n"
-                f"• Enlaces de bots: {'Sí ✅' if policy['bot_spam'] else 'No ❌'}"
-            )
-        action_buttons = []
-        for label_action, action in GROUP_MODERATION_ACTIONS:
-            current = " ✓" if policy["action"] == action else ""
-            action_buttons.append(types.InlineKeyboardButton(
-                f"{label_action}{current}",
-                callback_data=f"gmod|set|{canal_key}|{pagina}|{active_policy}|{action}",
-            ))
-        _agregar_botones_en_filas(markup, action_buttons, columnas=3)
-        markup.add(types.InlineKeyboardButton(
-            f"🗑️ Borrar los mensajes {'✅' if policy['delete_messages'] else '❌'}",
-            callback_data=f"gmod|del|{canal_key}|{pagina}|{active_policy}",
-        ))
-        if active_policy == "telegram_links":
-            markup.row(
-                types.InlineKeyboardButton(
-                    f"🎯 Antispam de usernames {'✅' if policy['username_spam'] else '❌'}",
-                    callback_data=f"gmod|tg|{canal_key}|{pagina}|usernames",
-                ),
-                types.InlineKeyboardButton(
-                    f"🤖 Antispam de bots {'✅' if policy['bot_spam'] else '❌'}",
-                    callback_data=f"gmod|tg|{canal_key}|{pagina}|bots",
-                ),
-            )
-        markup.add(types.InlineKeyboardButton(
-            f"☀️ Excepciones ({len(policy['exceptions'])})",
-            callback_data=f"gmod|exceptions|{canal_key}|{pagina}|{active_policy}",
-        ))
-        back_section = seccion
-        if policy_id and policy_id.startswith("forward_"):
-            back_section = "forward"
-        elif policy_id and policy_id.startswith("quote_"):
-            back_section = "quotes"
-        markup.add(types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"gmod|back|{canal_key}|{pagina}|{back_section}",
-        ))
-
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True
-    )
-
-
-def mostrar_menu_antiflood(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = ajustes.get("enabled", {}).get("antiflood", False)
-    action = str(ajustes.get("flood_action", "delete" if enabled else "off"))
-    limit = max(1, min(100, int(ajustes.get("flood_limit", 5) or 5)))
-    window = max(1, min(300, int(ajustes.get("flood_window_seconds", 3) or 3)))
-    delete = bool(ajustes.get("flood_delete_messages", enabled))
-    markup = types.InlineKeyboardMarkup(row_width=3)
-    texto = (
-        "🌊 <b>Anti-flood</b>\n"
-        f"Mensajes: <b>{limit}</b> en <b>{window} s</b>\n"
-        f"Castigo: <b>{html.escape(_texto_accion_moderacion(action))}</b>\n"
-        f"Eliminar mensajes: <b>{'Sí ✅' if delete else 'No ❌'}</b>\n\n"
-        "El sistema cuenta mensajes por miembro y aplica el castigo al superar el límite."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    markup.row(*[
-        types.InlineKeyboardButton(
-            label,
-            callback_data=f"gmod|flood_edit|{canal_key}|{pagina}|{value}",
-        )
-        for label, value in (("✉️ Mensajes", "limit"), ("⏱ Tiempo", "window"))
-    ])
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"{label}{' ✓' if action == value else ''}",
-            callback_data=f"gmod|flood_action|{canal_key}|{pagina}|{value}",
-        )
-        for label, value in GROUP_MODERATION_ACTIONS
-    ], columnas=3)
-    markup.row(
-        types.InlineKeyboardButton(
-            f"🗑️ Eliminar mensajes {'✅' if delete else '❌'}",
-            callback_data=f"gmod|flood_delete|{canal_key}|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ),
-    )
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True
-    )
-
-
-def mostrar_menu_multimedia_grupo(
-    chat_id_admin, canal_key, pagina=0, message=None, media_type=None,
-    media_page=0, message_id=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    policies = ajustes.get("media_policies", {})
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    if media_type:
-        action = str(policies.get(media_type, "off"))
-        label = next(
-            (name for key, name in sum(GROUP_MEDIA_PAGES, ()) if key == media_type),
-            media_type,
-        )
-        texto = (
-            f"<b>{html.escape(label)}</b>\n"
-            f"Acción actual: <b>{html.escape(_texto_accion_moderacion(action))}</b>"
-        )
-        _agregar_botones_en_filas(markup, [
-            types.InlineKeyboardButton(
-                f"{label_action}{' ✓' if action == value else ''}",
-                callback_data=f"gmod|media_set|{canal_key}|{pagina}|{media_page}|{media_type}|{value}",
-            )
-            for label_action, value in (
-                ("❌ Off", "off"), ("⚠️ Warn", "warn"), ("❗ Kick", "kick"),
-                ("🔇 Silenciar", "mute"), ("🚫 Ban", "ban"), ("🗑️ Eliminar", "delete"),
-            )
-        ], columnas=3)
-        markup.add(types.InlineKeyboardButton(
-            "↩️ Volver a Multimedia",
-            callback_data=f"gmod|media_page|{canal_key}|{pagina}|{media_page}",
-        ))
-    else:
-        page_index = max(0, min(len(GROUP_MEDIA_PAGES) - 1, int(media_page)))
-        all_media_enabled = bool(
-            ajustes.get(
-                "media_global_block",
-                ajustes.get("enabled", {}).get("multimedia", False),
-            )
-        )
-        texto = (
-            "🖼️ <b>Multimedia</b>\n"
-            "Elige una categoría para configurar su acción. "
-            "Las opciones se guardan por separado.\n"
-            f"Bloqueo general: <b>{'Activado ✅' if all_media_enabled else 'Desactivado ❌'}</b>"
-        )
-        media_buttons = []
-        for media_key, label in GROUP_MEDIA_PAGES[page_index]:
-            action = str(policies.get(media_key, "off"))
-            media_buttons.append(types.InlineKeyboardButton(
-                f"{label} — {_texto_accion_moderacion(action)}",
-                callback_data=f"gmod|media_open|{canal_key}|{pagina}|{page_index}|{media_key}",
-            ))
-        _agregar_botones_en_filas(markup, media_buttons, columnas=2)
-        nav = []
-        if page_index > 0:
-            nav.append(types.InlineKeyboardButton(
-                "⬅️ Anterior",
-                callback_data=f"gmod|media_page|{canal_key}|{pagina}|{page_index - 1}",
-            ))
-        if page_index + 1 < len(GROUP_MEDIA_PAGES):
-            nav.append(types.InlineKeyboardButton(
-                "Siguiente ➡️",
-                callback_data=f"gmod|media_page|{canal_key}|{pagina}|{page_index + 1}",
-            ))
-        if nav:
-            markup.row(*nav)
-        markup.add(types.InlineKeyboardButton(
-            "🌐 Desactivar bloqueo general" if all_media_enabled else "🌐 Bloquear toda la multimedia",
-            callback_data=f"gmod|media_global|{canal_key}|{pagina}|{page_index}",
-        ))
-        markup.add(types.InlineKeyboardButton(
-            "↩️ Volver a configuraciones",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ))
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True
-    )
-
-
-def mostrar_menu_excepciones_moderacion(
-    chat_id_admin, canal_key, pagina, policy_id, message=None, message_id=None,
-    aviso=None,
-):
-    if policy_id not in GROUP_MODERATION_POLICY_LABELS:
-        bot.send_message(chat_id_admin, "No encontré esa lista de excepciones.")
-        return
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    exceptions = _politica_ajuste(ajustes, policy_id)["exceptions"]
-    texto = (
-        f"☀️ <b>Excepciones — {html.escape(GROUP_MODERATION_POLICY_LABELS[policy_id])}</b>\n\n"
-        "Los usuarios o chats de esta lista no recibirán este castigo. "
-        "Envía un ID o @username para añadirlo; antepone <code>-</code> para quitarlo.\n"
-        "Usa <code>/cancelar</code> para volver."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for index, exception in enumerate(exceptions[:20]):
-        markup.add(types.InlineKeyboardButton(
-            f"✖️ Quitar {str(exception)[:35]}",
-            callback_data=f"gmod|exc_rm|{canal_key}|{pagina}|{policy_id}|{index}",
-        ))
-    back_section = (
-        "forward" if policy_id.startswith("forward_") else
-        "quotes" if policy_id.startswith("quote_") else
-        "internet" if policy_id == "internet_links" else "telegram"
-    )
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver al ajuste",
-        callback_data=f"gmod|policy|{canal_key}|{pagina}|{policy_id}|{back_section}",
-    ))
-    try:
-        admin_uid = int(ADMIN_ID)
-    except (TypeError, ValueError):
-        admin_uid = ADMIN_ID
-    admin_estado[admin_uid] = {
-        "paso": "esperando_excepcion_moderacion",
-        "canal_key": canal_key,
-        "pagina": pagina,
-        "policy_id": policy_id,
-        "panel_message_id": message_id or getattr(message, "message_id", None),
-    }
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True
-    )
-
-
-def mostrar_menu_bienvenida_despedida(
-    chat_id_admin, canal_key, feature, pagina=0, message=None, message_id=None,
-    aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("enabled", {}).get(feature))
-    welcome = feature == "bienvenida"
-    title = "💬 Bienvenida" if welcome else "👋 Despedida"
-    text_key = "welcome_text" if welcome else "goodbye_text"
-    text = str(ajustes.get(text_key) or "").strip()
-    if not text:
-        text = "Texto predeterminado."
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton(
-        "🔴 Desactivar" if enabled else "🟢 Activar",
-        callback_data=f"grupo_toggle|{canal_key}|{feature}|{pagina}",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "✏️ Personalizar mensaje",
-        callback_data=f"grupo_editar|{canal_key}|{feature}|{pagina}",
-    ))
-    if welcome:
-        mode = str(ajustes.get("welcome_mode", "always"))
-        markup.add(types.InlineKeyboardButton(
-            "🔁 Siempre" if mode == "always" else "👋 Solo primera vez",
-            callback_data=f"gmod|welcome_mode|{canal_key}|{pagina}|"
-            + ("first" if mode == "always" else "always"),
-        ))
-        markup.add(types.InlineKeyboardButton(
-            f"📩 Enviar por privado {'✅' if ajustes.get('welcome_send_private') else '❌'}",
-            callback_data=f"gmod|member_toggle|{canal_key}|{pagina}|welcome_send_private",
-        ))
-        markup.add(types.InlineKeyboardButton(
-            f"🧹 Eliminar bienvenida anterior {'✅' if ajustes.get('welcome_delete_previous') else '❌'}",
-            callback_data=f"gmod|member_toggle|{canal_key}|{pagina}|welcome_delete_previous",
-        ))
-        mode_text = "en cada ingreso" if mode == "always" else "solo en el primer ingreso registrado"
-    else:
-        markup.add(types.InlineKeyboardButton(
-            f"📩 Enviar por privado {'✅' if ajustes.get('goodbye_send_private') else '❌'}",
-            callback_data=f"gmod|member_toggle|{canal_key}|{pagina}|goodbye_send_private",
-        ))
-        markup.add(types.InlineKeyboardButton(
-            f"🧹 Eliminar despedida anterior {'✅' if ajustes.get('goodbye_delete_previous') else '❌'}",
-            callback_data=f"gmod|member_toggle|{canal_key}|{pagina}|goodbye_delete_previous",
-        ))
-        mode_text = "cuando una persona sale del grupo"
-    text_body = (
-        f"{title}\n"
-        f"Estado: {'Activado ✅' if enabled else 'Desactivado ❌'}\n"
-        f"Envío: {mode_text}\n\n"
-        f"Mensaje actual:\n{html.escape(text[:1200])}"
-    )
-    if aviso:
-        text_body = f"✅ {html.escape(aviso)}\n\n" + text_body
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a configuraciones",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    return editar_o_enviar_panel(
-        chat_id_admin, text_body, markup, message=message,
-        message_id=message_id, forzar_texto=True,
-    )
-
-
-def mostrar_menu_captcha_grupo(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None,
-    aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("enabled", {}).get("captcha"))
-    mode = str(ajustes.get("captcha_mode", "button"))
-    timeout = max(15, min(600, int(ajustes.get("captcha_timeout_seconds", 90) or 90)))
-    action = str(ajustes.get("captcha_action", "ban"))
-    theme = str(ajustes.get("captcha_theme", "classic"))
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton(
-        "🔴 Desactivar" if enabled else "🟢 Activar",
-        callback_data=f"grupo_toggle|{canal_key}|captcha|{pagina}",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "✍🏼 Personalizar mensaje",
-        callback_data=f"grupo_captcha_text|{canal_key}|{pagina}",
-    ))
-    markup.row(
-        types.InlineKeyboardButton(
-            f"🔘 Botón {'✓' if mode == 'button' else ''}",
-            callback_data=f"gmod|captcha_mode|{canal_key}|{pagina}|button",
-        ),
-        types.InlineKeyboardButton(
-            f"🧮 Pregunta {'✓' if mode == 'math' else ''}",
-            callback_data=f"gmod|captcha_mode|{canal_key}|{pagina}|math",
-        ),
-    )
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"⏱ {seconds} s{' ✓' if timeout == seconds else ''}",
-            callback_data=f"gmod|captcha_time|{canal_key}|{pagina}|{seconds}",
-        )
-        for seconds in (30, 60, 90, 120, 300)
-    ], columnas=3)
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"{label}{' ✓' if action == value else ''}",
-            callback_data=f"gmod|captcha_action|{canal_key}|{pagina}|{value}",
-        )
-        for label, value in GROUP_MODERATION_ACTIONS
-    ], columnas=3)
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"{label}{' ✓' if theme == value else ''}",
-            callback_data=f"gmod|captcha_theme|{canal_key}|{pagina}|{value}",
-        )
-        for label, value in (("📘 Clásico", "classic"), ("📜 Con reglas", "rules"), ("✨ Simple", "simple"))
-    ], columnas=3)
-    markup.add(types.InlineKeyboardButton(
-        f"🧹 Eliminar mensaje de servicio {'✅' if ajustes.get('captcha_delete_service_message') else '❌'}",
-        callback_data=f"gmod|captcha_delete|{canal_key}|{pagina}",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a configuraciones",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    theme_text = {
-        "classic": "clásico",
-        "rules": "incluye las reglas",
-        "simple": "breve",
-    }.get(theme, "clásico")
-    text_body = (
-        "🧩 <b>CAPTCHA</b>\n"
-        f"Estado: {'Activado ✅' if enabled else 'Desactivado ❌'}\n"
-        f"Modo: {'botón' if mode == 'button' else 'pregunta matemática'}\n"
-        f"Tiempo: {timeout} segundos\n"
-        f"Castigo si no se verifica: {_texto_accion_moderacion(action)}\n"
-        f"Tema: {theme_text}"
-    )
-    if aviso:
-        text_body = f"✅ {html.escape(aviso)}\n\n" + text_body
-    return editar_o_enviar_panel(
-        chat_id_admin, text_body, markup, message=message,
-        message_id=message_id, forzar_texto=True,
-    )
-
-
-def mostrar_menu_modo_nocturno(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None,
-    aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("enabled", {}).get("modo_nocturno"))
-    hours = ajustes.get("night_hours") or ["22:00", "07:00"]
-    action = str(ajustes.get("night_mode_action", "delete"))
-    duration = int(ajustes.get("night_mode_duration_seconds", 3600) or 3600)
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton(
-        "🔴 Desactivar" if enabled else "🟢 Activar",
-        callback_data=f"grupo_toggle|{canal_key}|modo_nocturno|{pagina}",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "🕒 Cambiar horario",
-        callback_data=f"grupo_editar|{canal_key}|modo_nocturno|{pagina}",
-    ))
-    markup.row(
-        types.InlineKeyboardButton(
-            f"🗑️ Eliminar {'✓' if action == 'delete' else ''}",
-            callback_data=f"gmod|night_action|{canal_key}|{pagina}|delete",
-        ),
-        types.InlineKeyboardButton(
-            f"🔇 Silenciar {'✓' if action == 'mute' else ''}",
-            callback_data=f"gmod|night_action|{canal_key}|{pagina}|mute",
-        ),
-    )
-    for label, seconds in (("1 h", 3600), ("8 h", 28800), ("24 h", 86400)):
-        markup.add(types.InlineKeyboardButton(
-            f"⏱ Silencio {label}{' ✓' if duration == seconds else ''}",
-            callback_data=f"gmod|night_duration|{canal_key}|{pagina}|{seconds}",
-        ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a configuraciones",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    text_body = (
-        "🌙 <b>Modo nocturno</b>\n"
-        f"Estado: {'Activado ✅' if enabled else 'Desactivado ❌'}\n"
-        f"Horario del grupo: <code>{html.escape(str(hours[0]))}-{html.escape(str(hours[1]))}</code>\n"
-        f"Acción: {'Eliminar mensajes' if action == 'delete' else 'Silenciar a quien escribe'}\n"
-        f"Duración del silencio: {duration // 3600} h"
-    )
-    if aviso:
-        text_body = f"✅ {html.escape(aviso)}\n\n" + text_body
-    return editar_o_enviar_panel(
-        chat_id_admin, text_body, markup, message=message,
-        message_id=message_id, forzar_texto=True,
-    )
-
-
-def mostrar_menu_advertencias_grupo(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None,
-    aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("enabled", {}).get("advertencias"))
-    limit = max(1, int(ajustes.get("warning_limit", 3) or 3))
-    action = str(ajustes.get("warning_action", "mute"))
-    duration = int(ajustes.get("warning_duration_seconds", 3600) or 3600)
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton(
-        "🔴 Desactivar" if enabled else "🟢 Activar",
-        callback_data=f"grupo_toggle|{canal_key}|advertencias|{pagina}",
-    ))
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"⚠️ Castigo tras {count}{' ✓' if limit == count else ''}",
-            callback_data=f"gmod|warning_limit|{canal_key}|{pagina}|{count}",
-        )
-        for count in (2, 3, 5, 10)
-    ], columnas=4)
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"{label}{' ✓' if action == value else ''}",
-            callback_data=f"gmod|warning_action|{canal_key}|{pagina}|{value}",
-        )
-        for label, value in GROUP_MODERATION_ACTIONS
-    ], columnas=3)
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"⏱ Duración {label}{' ✓' if duration == seconds else ''}",
-            callback_data=f"gmod|warning_duration|{canal_key}|{pagina}|{seconds}",
-        )
-        for label, seconds in (("1 h", 3600), ("24 h", 86400), ("7 días", 604800))
-    ], columnas=3)
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a configuraciones",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    text_body = (
-        "⚠️ <b>Advertencias</b>\n"
-        f"Estado: {'Activado ✅' if enabled else 'Desactivado ❌'}\n"
-        f"Castigo tras: {limit} advertencias\n"
-        f"Acción final: {_texto_accion_moderacion(action)}\n"
-        f"Duración: {duration // 3600} h"
-    )
-    if aviso:
-        text_body = f"✅ {html.escape(aviso)}\n\n" + text_body
-    return editar_o_enviar_panel(
-        chat_id_admin, text_body, markup, message=message,
-        message_id=message_id, forzar_texto=True,
-    )
-
-
-def mostrar_menu_enlace_grupo(chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("group_link_enabled"))
-    link = str(ajustes.get("group_link") or "")
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton(
-            "🤚 Establecer / actualizar",
-            callback_data=f"gmod|link_set|{canal_key}|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "🔴 Desactivar" if enabled else "🟢 Activar",
-            callback_data=f"gmod|link_toggle|{canal_key}|{pagina}",
-        ),
-    )
-    if link:
-        markup.add(types.InlineKeyboardButton(
-            "🔗 Abrir enlace guardado", url=link
-        ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    texto = (
-        "🔗 <b>Enlace del grupo</b>\n"
-        "Permite mostrar el enlace de invitación con /grouplink (para todos) "
-        "y /link (para miembros).\n\n"
-        "Al actualizarlo, Telegram invalida el enlace principal anterior.\n"
-        f"Estado: <b>{'Activado ✅' if enabled and link else 'Desactivado ❌'}</b>"
-        + (f"\nEnlace: {html.escape(link)}" if link else "\nTodavía no hay un enlace guardado.")
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True,
-    )
-
-
-def mostrar_menu_aprobacion_grupo(chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("enabled", {}).get("aprobacion"))
-    automatic = bool(ajustes.get("approval_auto_enabled"))
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton(
-            "🔐 Auto-aprobación " + ("✅" if automatic else "❌"),
-            callback_data=f"gmod|approval_toggle|{canal_key}|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "📩 Crear enlace con aprobación",
-            callback_data=f"gmod|approval_link|{canal_key}|{pagina}",
-        ),
-    )
-    markup.row(
-        types.InlineKeyboardButton(
-            "🔴 Desactivar solicitudes" if enabled else "🟢 Activar solicitudes",
-            callback_data=f"grupo_toggle|{canal_key}|aprobacion|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ),
-    )
-    approval_link = str(ajustes.get("approval_link") or "")
-    if approval_link:
-        markup.add(types.InlineKeyboardButton(
-            "🔗 Abrir enlace guardado", url=approval_link
-        ))
-    texto = (
-        "📬 <b>Modo de aprobación</b>\n"
-        "Las solicitudes pueden revisarse manualmente o, si el usuario puede abrir el chat privado "
-        "del bot, completar una verificación para aprobarse automáticamente.\n\n"
-        f"Solicitudes: <b>{'Activadas ✅' if enabled else 'Desactivadas ❌'}</b>\n"
-        f"Auto-aprobación: <b>{'Activada ✅' if automatic else 'Desactivada ❌'}</b>\n\n"
-        "Si Telegram impide que el bot escriba al usuario en privado, la solicitud queda para revisión manual."
-        + (f"\n\nEnlace: {html.escape(approval_link)}" if approval_link else "")
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True,
-    )
-
-
-def mostrar_menu_palabras_grupo(chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    policy = _politica_ajuste(ajustes, "blocked_words")
-    words = list(ajustes.get("blocked_words", []))
-    markup = types.InlineKeyboardMarkup(row_width=3)
-    actions = [
-        ("❌ Off", "off"), ("⚠️ Warn", "warn"), ("❗ Kick", "kick"),
-        ("🔇 Silenciar", "mute"), ("🚫 Ban", "ban"),
+    def es_flood(user_id):
+        ahora = time.time()
+        historial = _flood_registro.get(user_id, [])
+        historial = [t for t in historial if ahora - t < FLOOD_VENTANA]
+        historial.append(ahora)
+        _flood_registro[user_id] = historial
+        return len(historial) > FLOOD_LIMITE
+    # --- para solo grupos a los que el bot es agregado por mi usurio principal ) ---
+    COMANDOS_VALIDOS_PRIVADO = [
+        "/start", "/menu", "/reglas", "/compartir", "/vchat", "/admin", "/reportar",
+        "🏠 /start", "🏹 /menu", "📜 /reglas", "🚀 /compartir", "👤 /admin", "🔥 /vchat"
     ]
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            f"{label}{' ✓' if policy['action'] == value else ''}",
-            callback_data=f"gmod|words_action|{canal_key}|{pagina}|{value}",
-        )
-        for label, value in actions
-    ], columnas=3)
-    markup.add(types.InlineKeyboardButton(
-        f"🗑️ Borrar los mensajes {'✅' if policy['delete_messages'] else '❌'}",
-        callback_data=f"gmod|words_delete|{canal_key}|{pagina}",
-    ))
-    markup.row(
-        types.InlineKeyboardButton(
-            "➕ Añadir",
-            callback_data=f"grupo_editar|{canal_key}|palabras|{pagina}|add",
-        ),
-        types.InlineKeyboardButton(
-            "➖ Eliminar",
-            callback_data=f"grupo_editar|{canal_key}|palabras|{pagina}|remove",
-        ),
-    )
-    markup.row(
-        types.InlineKeyboardButton(
-            f"🔠 Lista ({len(words)})",
-            callback_data=f"gmod|words_list|{canal_key}|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ),
-    )
-    texto = (
-        "🔤 <b>Palabras prohibidas</b>\n"
-        "El bot detecta palabras o frases configuradas en los mensajes del grupo.\n\n"
-        f"Castigo: <b>{html.escape(_texto_accion_moderacion(policy['action']))}</b>\n"
-        f"Eliminación: <b>{'Sí ✅' if policy['delete_messages'] else 'No ❌'}</b>\n"
-        f"Palabras configuradas: <b>{len(words)}</b>"
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True,
-    )
 
-
-def mostrar_menu_bloqueos_grupo(chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    flags = (
-        ("block_join_enabled", "🚫 Bloquear unión"),
-        ("block_leave_enabled", "🚪 Bloquear reingreso tras salida"),
-        ("block_join_leave_enabled", "🔁 Bloquear unión y salida rápida"),
-        ("block_multiple_join_enabled", "👥 Bloquear ingresos múltiples"),
-        ("block_bots_enabled", "🤖 Bloquear bots"),
+    # --- LIBRERÍA ESTÉTICA EXPANDIDA (FUEGO PURO) ---
+    MSG_INVITACION_LARGO = (
+        "🏹 **HAS SIDO INVITADO AL TEMPLO DEL CACIQUE**\n\n"
+        "Únete a la tribu más exclusiva de Telegram. Contenido único, las mejores fotos y "
+        "videos de los guerreros más calientes de la tribu. 🔥\n\n"
+        f"ÚNETE AQUÍ: {LINK_GRUPO}"
     )
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for field, label in flags:
-        markup.add(types.InlineKeyboardButton(
-            f"{label} {'✅' if ajustes.get(field) else '❌'}",
-            callback_data=f"gmod|block_toggle|{canal_key}|{pagina}|{field}",
-        ))
-    markup.row(
-        types.InlineKeyboardButton(
-            f"📋 Blocklist / Blacklist ({len(ajustes.get('blocked_user_ids', []))})",
-            callback_data=f"gmod|block_list|{canal_key}|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ),
-    )
-    texto = (
-        "🔐 <b>Bloqueos</b>\n"
-        "La Blocklist usa IDs numéricos; al activar «Bloquear unión», el bot expulsa a esas cuentas si intentan entrar.\n"
-        "«Bloquear bots» expulsa bots nuevos, incluidos otros bots de administración.\n"
-        "«Unión y salida rápida» considera rápida una salida dentro de 60 segundos.\n\n"
-        "«Bloquear reingreso tras salida» no impide que una persona salga: impide que vuelva a entrar. "
-        "Los ingresos múltiples se detectan con 5 entradas en 10 segundos y se bloquean mientras la opción esté activa."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True,
-    )
+    MSG_ENCODED = urllib.parse.quote(MSG_INVITACION_LARGO)
+    LINK_SHARE = f"https://t.me/share/url?url={MSG_ENCODED}"
+    TEXTOS_VC_HOT = [
+        "🔥 **¡EL TEMPLO ESTÁ ARDIENDO!** 🔥\n¿Quieres acción real? Pincha el botón y entra al videochat, aquí mandas tú. 🔞",
+        "😈 **¡ADRENALINA PURA EN VIVO!** 💦\nEntra ahora al videochat y mira lo que los guerreros tienen para ti. 🔥",
+        "🍌 **¡EL CACIQUE ESTÁ ACTIVO Y FOGOSO!** 🔞\nLa temperatura está al máximo. Entra al videochat ahora. 🏹",
+        "🍑 **LA TRIBU SE PONE CALIENTE...** 🔥\nDale al botón y únete a la fiesta privada en vivo. 💦",
+        "🔱 **CONCILIO DE GUERREROS EN VIVO** 🔞\n¿Te atreves a mirar? Pincha abajo y entra al círculo de fuego. 🔥",
+        "💥 **¡EXPLOSIÓN DE PLACER EN DIRECTO!** 🔞\nEl videochat está encendido. ¿Y tú? 🏹",
+        "🔥 **¡SÓLO PARA VALIENTES!** 🔞\nEntra al videochat y descubre por qué somos la tribu más dominante. 💦"
+    ]
+    EMOJIS_ACCION = ["🚀", "🔥", "💦", "🔞", "🏹", "🔱", "🍑", "🍌", "💥", "🥵", "💎", "🛡️", "⚔️", "😈"]
 
+    # --- FUNCIONES DE SISTEMA ---
+    app = Flask('')
 
-def mostrar_menu_miembros_grupo(chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    sanctions = ajustes.get("known_sanctions", {})
-    mutes = sum(1 for value in sanctions.values() if value == "mute")
-    bans = sum(1 for value in sanctions.values() if value == "ban")
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    actions = (
-        ("🔇 Des-silenciar todos", "unmute_all"),
-        ("🚫 Desbloquear todos", "unban_all"),
-        ("❗ Expulsar usuarios silenciados", "kick_muted"),
-        ("💀 Expulsar cuentas eliminadas conocidas", "kick_deleted"),
-    )
-    _agregar_botones_en_filas(markup, [
-        types.InlineKeyboardButton(
-            label, callback_data=f"gmod|members_confirm|{canal_key}|{pagina}|{action}",
-        )
-        for label, action in actions
-    ], columnas=2)
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    texto = (
-        "👥 <b>Gestión de miembros</b>\n"
-        "Acciones sobre los miembros sancionados que el bot haya registrado.\n\n"
-        f"Silenciados conocidos: <b>{mutes}</b> · Bloqueados conocidos: <b>{bans}</b>\n"
-        "Telegram no permite al bot consultar la lista completa de miembros ni sanciones hechas por otros bots; "
-        "por eso estas acciones solo alcanzan los registros de este bot."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True,
-    )
+    @app.route('/')
+    def home():
+        return "SISTEMA CACIQUE SUPREMO ACTIVO - VERSIÓN ESTÉTICA V17.5 (ID LOCKED)"
 
-
-def mostrar_menu_enmascarados_grupo(chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    enabled = bool(ajustes.get("enabled", {}).get("enmascarados"))
-    delete = bool(ajustes.get("masked_delete_messages", True))
-    exceptions = list(ajustes.get("masked_exceptions", []))
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton(
-            "🔴 Desactivar" if enabled else "🟢 Activar",
-            callback_data=f"grupo_toggle|{canal_key}|enmascarados|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            f"🗑️ Borrar mensajes {'✅' if delete else '❌'}",
-            callback_data=f"gmod|masked_delete|{canal_key}|{pagina}",
-        ),
-    )
-    markup.row(
-        types.InlineKeyboardButton(
-            f"☀️ Excepciones ({len(exceptions)})",
-            callback_data=f"gmod|masked_exceptions|{canal_key}|{pagina}",
-        ),
-        types.InlineKeyboardButton(
-            "↩️ Volver",
-            callback_data=f"grupo_config|{canal_key}|{pagina}",
-        ),
-    )
-    texto = (
-        "👥 <b>Usuarios enmascarados</b>\n"
-        "Controla mensajes enviados como un canal o chat anónimo. El Bot API no revela qué administrador "
-        "humano publicó ese mensaje; al activarlo, la regla se aplica al remitente visible.\n\n"
-        f"Estado: <b>{'Activado ✅' if enabled else 'Desactivado ❌'}</b>\n"
-        f"Eliminar mensajes: <b>{'Sí ✅' if delete else 'No ❌'}</b>"
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id,
-        forzar_texto=True,
-    )
-
-
-def mostrar_configuracion_grupo(chat_id_admin, canal_key, pagina=0, message=None):
-    if canal_key not in CANALES:
-        bot.send_message(chat_id_admin, "No encontré ese grupo o canal.")
-        return
-    ajustes = obtener_ajustes_grupo(canal_key)
-    if not ajustes:
-        bot.send_message(chat_id_admin, "Este destino todavía no tiene un ID guardado.")
-        return
-
-    ingles = ajustes.get("language", "es") == "en"
-    total_paginas = max(
-        1,
-        (len(GROUP_CONFIG_CATEGORIES) + GROUP_CONFIG_PAGE_SIZE - 1)
-        // GROUP_CONFIG_PAGE_SIZE,
-    )
-    pagina_visible = min(pagina + 1, total_paginas)
-    inicio = pagina * GROUP_CONFIG_PAGE_SIZE
-    categorias = GROUP_CONFIG_CATEGORIES[inicio:inicio + GROUP_CONFIG_PAGE_SIZE]
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    botones = []
-    for feature, titulo in categorias:
-        habilitado = funcion_grupo_activada(canal_key, ajustes, feature)
-        estado = "🟢" if habilitado else "⚪"
-        if ingles:
-            titulo = GROUP_FEATURE_TITLES_EN.get(feature, titulo)
-        botones.append(types.InlineKeyboardButton(
-            f"{estado} {titulo}",
-            callback_data=f"grupo_feature|{canal_key}|{feature}|{pagina}",
-        ))
-    for i in range(0, len(botones), 2):
-        markup.row(*botones[i:i + 2])
-
-    navegacion = []
-    if pagina > 0:
-        navegacion.append(types.InlineKeyboardButton(
-            "⬅️ Previous" if ingles else "⬅️ Anterior",
-            callback_data=f"grupo_config|{canal_key}|{pagina - 1}"
-        ))
-    if inicio + GROUP_CONFIG_PAGE_SIZE < len(GROUP_CONFIG_CATEGORIES):
-        navegacion.append(types.InlineKeyboardButton(
-            "More ➡️" if ingles else "Más ➡️",
-            callback_data=f"grupo_config|{canal_key}|{pagina + 1}"
-        ))
-    if navegacion:
-        markup.row(*navegacion)
-    markup.add(
-        types.InlineKeyboardButton(
-            "📋 Buttons and posts" if ingles else "📋 Botones y publicaciones",
-            callback_data=f"grupo_botones|{canal_key}|{pagina}"
-        ),
-        types.InlineKeyboardButton(
-            "📋 Copy ID" if ingles else "📋 Copiar ID",
-            copy_text=types.CopyTextButton(text=str(ajustes["chat_id"])),
-        ),
-        types.InlineKeyboardButton(
-            "↩️ Back" if ingles else "↩️ Volver",
-            callback_data=f"grupo_ficha|{canal_key}",
-        ),
-    )
-
-    tipo = html.escape(str(ajustes.get("type", "grupo/canal")))
-    titulo = html.escape(str(ajustes.get("title", CANALES[canal_key]["nombre"])))
-    texto_menu = (
-        f"⚙️ <b>{'Settings for' if ingles else 'Configuración de'} {tipo}</b>\n"
-        f"<b>{titulo}</b>\nID: <code>{html.escape(str(ajustes['chat_id']))}</code>\n\n"
-        + (
-            f"Page {pagina_visible} of {total_paginas} · "
-            f"{len(GROUP_CONFIG_CATEGORIES)} available sections.\n"
-            "Choose Rules to edit this group's rules or Group shortcuts to control the member toolbar. "
-            "Changes apply only to this destination. Navigation stays in this message; "
-            "recurring messages are managed separately."
-            if ingles else
-            f"Página {pagina_visible} de {total_paginas} · "
-            f"{len(GROUP_CONFIG_CATEGORIES)} secciones disponibles.\n"
-            "Entra en Reglamento para editar las reglas de este grupo o en Botones rápidos del grupo "
-            "para controlar la barra de los miembros. Los cambios son solo para este destino. "
-            "La navegación queda en este mensaje y los mensajes recurrentes siguen en su sección independiente."
-        )
-    )
-    editar_o_enviar_panel(
-        chat_id_admin,
-        texto_menu,
-        markup,
-        message=message,
-        forzar_texto=True,
-    )
-
-
-GROUP_FEATURE_TITLES = dict(GROUP_CONFIG_CATEGORIES)
-GROUP_FEATURE_TEXT_PROMPTS = {
-    "reglamento": ("Reglamento", "Escribe el reglamento que quieres mostrar con /rules."),
-    "bienvenida": ("Mensaje de bienvenida", "Usa {name} para incluir el nombre del miembro."),
-    "despedida": ("Mensaje de despedida", "Usa {name} para incluir el nombre del miembro."),
-    "etiqueta": ("Etiqueta del grupo", "Escribe el texto que se enviará al usar /tag."),
-    "filtros": ("Filtro", "Escribe palabra=respuesta. Para borrar uno, escribe -palabra."),
-    "palabras": ("Palabras prohibidas", "Escribe una palabra para bloquear. Para retirar una, antepón - (guion)."),
-    "bloqueos": ("Lista de bloqueo", "Escribe el ID numérico de un usuario. Anteponle - para retirarlo de la lista."),
-    "enmascarados": ("Excepciones de remitentes enmascarados", "Escribe un ID o @username. Anteponle - para retirar la excepción."),
-    "comandos": ("Comando personal", "Escribe comando=respuesta, sin la barra. Ejemplo: precios=Consulta /start."),
-    "longitud": ("Longitud máxima", "Escribe el máximo de caracteres (1–4096), o 0 para desactivar."),
-    "modo_nocturno": ("Horario nocturno", "Escribe inicio-fin en formato 24 h. Ejemplo: 22:00-07:00."),
-}
-
-
-RULES_HELP_HTML = (
-    "📚 <b>Todo lo que puedes hacer con las reglas</b>\n\n"
-    "────────────\n"
-    "🔘 <b>BOTONES</b>\n"
-    "Las reglas pueden mostrarse mediante botones personalizados para facilitar "
-    "su acceso a los miembros del grupo, utilizando la siguiente sintaxis al crear el botón:\n\n"
-    "<code>Nombre del botón - rules</code>\n\n"
-    "Al pulsarlo, el usuario verá automáticamente el reglamento configurado para el grupo.\n"
-    "────────────\n"
-    "🧠 <b>CAPTCHA</b>\n"
-    "Puedes utilizar el tag:\n\n"
-    "<code>{RULES}</code>\n\n"
-    "Al hacerlo, el bot reemplazará automáticamente el tag por el texto completo de las reglas "
-    "configuradas.\n\n"
-    "Esta función resulta especialmente útil para mostrar las normas durante el proceso de "
-    "verificación de nuevos usuarios.\n"
-    "────────────\n"
-    "🔎 <b>ARGUMENTOS</b>\n"
-    "Los argumentos permiten mostrar únicamente una parte específica del reglamento.\n\n"
-    "Puedes utilizar números, palabras o emojis para acceder directamente a una regla determinada.\n\n"
-    "Ejemplo: <code>/rules 1</code>\n"
-    "                <code>/rules spam</code>\n"
-    "                <code>/rules 🚫</code>\n\n"
-    "El bot mostrará únicamente la línea o párrafo relacionado con el argumento indicado.\n"
-    "────────────\n"
-    "📝 <b>CONTENIDO DEL MENSAJE</b>\n"
-    "Desde el botón ✍🏼 Personalizar mensaje puedes configurar cómo se mostrará el reglamento "
-    "a los usuarios.\n\n"
-    "Elementos disponibles:\n\n"
-    "📄 <b>Texto</b>\n"
-    "Contenido del reglamento.\n\n"
-    "🖼️ <b>Multimedia</b>\n"
-    "Imágenes o banners que pueden mostrarse encima o debajo del reglamento.\n\n"
-    "🔠 <b>Teclado</b>\n"
-    "Botones personalizados para enlaces, comandos o secciones relacionadas."
-)
-
-
-def mostrar_menu_reglamento(
-    chat_id_admin,
-    canal_key,
-    pagina=0,
-    message=None,
-    message_id=None,
-    mostrar_ayuda=False,
-    aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    if not ajustes:
-        return
-    acceso = ajustes.get("rules_access", "all")
-    acceso_texto = "solo administradores" if acceso == "admins" else "todos los miembros"
-    texto = (
-        "📜 <b>Reglamento</b>\n\n"
-        "En esta sección puedes crear y gestionar las normas que regulan la conducta de los "
-        "miembros de tu grupo.\n\n"
-        "Una vez configuradas, los usuarios podrán consultar el reglamento utilizando el comando:\n"
-        "<code>/rules</code>\n\n"
-        "También es posible mostrar las reglas mediante botones, incluirlas en el CAPTCHA o "
-        "complementar su contenido con mensajes personalizados."
-    )
-    if mostrar_ayuda:
-        texto += "\n\n" + RULES_HELP_HTML
-    texto += (
-        "\n\n📍 <b>Acceso al comando</b>\n"
-        f"Actualmente, pueden utilizar <code>/rules</code> {acceso_texto}.\n"
-        "Configúralo desde «Permisos de comandos»."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton(
-        "🔽 Ocultar detalles" if mostrar_ayuda else "📚 Todo lo que puedes hacer con las reglas",
-        callback_data=(
-            f"grp_rules|help|{canal_key}|{pagina}|{0 if mostrar_ayuda else 1}"
-        ),
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "✍🏼 Personalizar mensaje",
-        callback_data=f"grp_rules|editor|{canal_key}|{pagina}",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "📍 Permisos de comandos",
-        callback_data=f"grp_rules|permisos|{canal_key}|{pagina}|{int(mostrar_ayuda)}",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    return editar_o_enviar_panel(
-        chat_id_admin,
-        texto,
-        markup,
-        message=message,
-        message_id=message_id,
-        forzar_texto=True,
-    )
-
-
-def mostrar_editor_reglamento(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    reglas = str(ajustes.get("rules", "")).strip()
-    multimedia = []
-    for posicion, titulo in (("before", "encima"), ("after", "debajo")):
-        item = ajustes.get(f"rules_media_{posicion}")
-        if item:
-            multimedia.append(f"• Multimedia {titulo}: configurada")
+    @app.route(f'/{TOKEN}', methods=['POST'])
+    def webhook():
+        if request.headers.get('content-type') == 'application/json':
+            try:
+                json_string = request.get_data().decode('utf-8')
+                update = telebot.types.Update.de_json(json_string)
+                bot.process_new_updates([update])
+            except Exception as e:
+                print(f"❌ ERROR EN WEBHOOK: {e}")
+            return '', 200
         else:
-            multimedia.append(f"• Multimedia {titulo}: no configurada")
-    botones_reglas = ajustes.get("rules_keyboard", [])
-    resumen = "\n".join(
-        f"• <b>{html.escape(str(item.get('label', 'Botón')))}</b> → "
-        f"<code>{html.escape(str(item.get('action', ''))[:80])}</code>"
-        for item in botones_reglas[:6]
-    ) or "Todavía no hay botones personalizados."
-    texto = (
-        f"✍🏼 <b>Personalizar mensaje — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
-        f"<b>Texto actual:</b>\n{html.escape(reglas[:900]) if reglas else '<i>Sin texto configurado.</i>'}\n\n"
-        f"{chr(10).join(multimedia)}\n"
-        f"• Botones configurados: {len(botones_reglas)}\n{resumen}\n\n"
-        "Puedes cambiar el texto, colocar un archivo arriba o debajo y configurar botones."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton(
-        "✏️ Editar texto",
-        callback_data=f"grp_rules|edit|{canal_key}|{pagina}",
-    ))
-    markup.row(
-        types.InlineKeyboardButton(
-            "🖼️ Multimedia encima",
-            callback_data=f"grp_rules|media|{canal_key}|{pagina}|before",
-        ),
-        types.InlineKeyboardButton(
-            "🖼️ Multimedia debajo",
-            callback_data=f"grp_rules|media|{canal_key}|{pagina}|after",
-        ),
-    )
-    limpiar_media = []
-    for posicion, item in (("before", ajustes.get("rules_media_before")), ("after", ajustes.get("rules_media_after"))):
-        if item:
-            limpiar_media.append(types.InlineKeyboardButton(
-                "🗑️ Quitar multimedia " + ("encima" if posicion == "before" else "debajo"),
-                callback_data=f"grp_rules|media_clear|{canal_key}|{pagina}|{posicion}",
-            ))
-    for boton in limpiar_media:
-        markup.add(boton)
-    markup.add(types.InlineKeyboardButton(
-        "🔠 Configurar teclado",
-        callback_data=f"grp_rules|keyboard|{canal_key}|{pagina}",
-    ))
-    if botones_reglas:
-        markup.add(types.InlineKeyboardButton(
-            "🗑️ Quitar todos los botones",
-            callback_data=f"grp_rules|keyboard_clear|{canal_key}|{pagina}",
-        ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a Reglamento",
-        callback_data=f"grp_rules|home|{canal_key}|{pagina}|0",
-    ))
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id
-    )
+            abort(403)
 
+    def eliminar_mensaje_seguro(chat_id, message_id):
+        try:
+            bot.delete_message(chat_id, message_id)
+        except:
+            pass
 
-def mostrar_teclado_reglamento(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None, aviso=None
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    botones = ajustes.get("rules_keyboard", [])
-    lineas = "\n".join(
-        f"• <b>{html.escape(str(item.get('label', 'Botón')))}</b> → "
-        f"<code>{html.escape(str(item.get('action', '')))}</code>"
-        for item in botones[:20]
-    ) or "Todavía no hay botones personalizados."
-    texto = (
-        f"🔠 <b>Teclado del Reglamento — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
-        f"{lineas}\n"
-        + (f"… y {len(botones) - 8} botón(es) más.\n" if len(botones) > 8 else "")
-        + "\n"
-        "Agrega una línea con <code>etiqueta=acción</code> o "
-        "<code>Nombre del botón - rules</code>. "
-        "La acción puede ser un enlace, <code>/rules</code>, "
-        "<code>/rules palabra</code> o un comando personalizado existente."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton(
-        "➕ Agregar botón",
-        callback_data=f"grp_rules|keyboard_add|{canal_key}|{pagina}",
-    ))
-    for index, item in enumerate(botones[:20]):
-        markup.add(types.InlineKeyboardButton(
-            f"🗑️ Quitar: {str(item.get('label', 'Botón'))[:48]}",
-            callback_data=f"grp_rules|keyboard_del|{canal_key}|{pagina}|{index}",
-        ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a personalizar mensaje",
-        callback_data=f"grp_rules|editor|{canal_key}|{pagina}",
-    ))
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id
-    )
-
-
-def mostrar_permisos_reglamento(
-    chat_id_admin, canal_key, pagina=0, message=None, message_id=None,
-    mostrar_ayuda=False, aviso=None,
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    acceso = ajustes.get("rules_access", "all")
-    texto = (
-        f"📍 <b>Permisos de comandos — {html.escape(str(ajustes.get('title') or 'Grupo'))}</b>\n\n"
-        "Elige quién puede consultar el reglamento con <code>/rules</code>.\n\n"
-        f"Acceso actual: <b>{'Solo administradores' if acceso == 'admins' else 'Todos los miembros'}</b>."
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton(
-        ("✅ " if acceso == "all" else "") + "👥 Todos los miembros",
-        callback_data=f"grp_rules|access|{canal_key}|{pagina}|all",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        ("✅ " if acceso == "admins" else "") + "🛡️ Solo administradores",
-        callback_data=f"grp_rules|access|{canal_key}|{pagina}|admins",
-    ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a Reglamento",
-        callback_data=f"grp_rules|home|{canal_key}|{pagina}|{int(mostrar_ayuda)}",
-    ))
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id
-    )
-
-
-def construir_teclado_reglamento(canal_key, ajustes):
-    botones = ajustes.get("rules_keyboard", [])
-    if not botones or canal_key not in CANALES:
-        return None
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    fila = []
-    for index, item in enumerate(botones[:20]):
-        etiqueta = str(item.get("label", "Botón"))[:64]
-        accion = str(item.get("action", "")).strip()
-        if accion.startswith(("https://", "http://")):
-            boton = types.InlineKeyboardButton(etiqueta, url=accion)
+    def registrar_actividad_stats(user_id, username):
+        res = Estadisticas.search(User.id == user_id)
+        if res:
+            nueva_puntuacion = res[0].get('puntos', 0) + 1
+            Estadisticas.update({'puntos': nueva_puntuacion, 'last_seen': str(datetime.now())}, User.id == user_id)
         else:
-            boton = types.InlineKeyboardButton(
-                etiqueta, callback_data=f"rules_inline|{canal_key}|{index}"
+            Estadisticas.insert({'id': user_id, 'username': username, 'puntos': 1, 'last_seen': str(datetime.now())})
+
+    def aplicar_castigo(chat_id, user_id, nombre):
+        stats = Warnings.search(User.id == user_id)
+        count = stats[0]['count'] + 1 if stats else 1
+        if count >= 3:
+            try:
+                bot.kick_chat_member(chat_id, user_id)
+                bot.send_message(
+                    chat_id,
+                    f"🪓 **SENTENCIA FINAL**\n"
+                    f"El guerrero @{nombre} ha acumulado 3 penalizaciones y ha sido expulsado permanentemente de la tribu."
+                )
+                markup = types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton("🔓 PERDONAR", callback_data=f"indulto_{user_id}")
+                )
+                bot.send_message(ADMIN_ID, f"🚩 **EXPULSIÓN EJECUTADA**\nUsuario: @{nombre}\nID: {user_id}", reply_markup=markup)
+                Warnings.remove(User.id == user_id)
+                return
+            except:
+                pass
+        else:
+            until_date = int(time.time()) + (35 * 60)
+            try:
+                bot.restrict_chat_member(chat_id, user_id, until_date=until_date, can_send_messages=False)
+            except:
+                pass
+            if stats:
+                Warnings.update({'count': count, 'last_warn': str(datetime.now())}, User.id == user_id)
+            else:
+                Warnings.insert({'id': user_id, 'username': nombre, 'count': count, 'last_warn': str(datetime.now())})
+            bot.send_message(
+                chat_id,
+                f"⚠️ **ADVERTENCIA OFICIAL — PENALIZACIÓN {count}/3**\n\n"
+                f"Guerrero @{nombre}, has sido reportado por conducta inapropiada. "
+                f"Tienes {3 - count} advertencia(s) restante(s). "
+                f"A la tercera serás expulsado permanentemente de la tribu. 🏹\n\n"
+                f"_Silenciado por 35 minutos._"
             )
-        fila.append(boton)
-        if len(fila) == 2:
-            markup.row(*fila)
-            fila = []
-    if fila:
-        markup.row(*fila)
-    return markup
 
+    def cerrar_sesion_segura(chat_id):
+        markup = types.ReplyKeyboardRemove()
+        bot.send_message(chat_id, "🔒 **SESIÓN FINALIZADA**", reply_markup=markup)
 
-def separar_sintaxis_boton(texto):
-    if "=" in texto:
-        etiqueta, accion = texto.split("=", 1)
-    else:
-        coincidencia = re.fullmatch(r"\s*(.{1,32}?)\s+-\s+(.+?)\s*", texto)
-        if not coincidencia:
-            raise ValueError("Usa etiqueta=acción o «Nombre del botón - rules».")
-        etiqueta, accion = coincidencia.groups()
-    etiqueta = etiqueta.strip()
-    accion = accion.strip()
-    if accion.casefold() == "rules":
-        accion = "/rules"
-    return etiqueta, accion
+    def guardar_evidencia(message):
+        if message.chat.id != GRUPO_ID:
+            return
+        evidencia = {
+            'id': message.from_user.id,
+            'uname': (message.from_user.username or "Anonimo").lower(),
+            'msg_id': message.message_id,
+            'date': str(datetime.now()),
+            'type': message.content_type,
+            'text': message.text or message.caption or "",
+            'file_id': None
+        }
+        if message.photo:
+            evidencia['file_id'] = message.photo[-1].file_id
+        if message.video:
+            evidencia['file_id'] = message.video.file_id
+        RegistroActividad.insert(evidencia)
 
+    def obtener_teclado_cuadritos():
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="Selecciona tu arma de guerra... 🏹")
+        markup.row(types.KeyboardButton("🏠 /start"), types.KeyboardButton("🏹 /menu"))
+        markup.row(types.KeyboardButton("📜 /reglas"), types.KeyboardButton("🚀 /compartir"))
+        markup.row(types.KeyboardButton("👤 /admin"), types.KeyboardButton("🔥 /vchat"))
+        return markup
 
-def mostrar_menu_atajos_grupo(
-    chat_id_admin, canal_key, pagina, message=None, message_id=None, aviso=None
-):
-    ajustes = obtener_ajustes_grupo(canal_key) or {}
-    botones = ajustes.get("quick_buttons", [])
-    es_grupo = str(ajustes.get("type") or "grupo").lower() != "canal"
-    etiqueta_videochat = etiqueta_boton_videochat(ajustes)
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    if es_grupo:
-        enabled = ajustes.get("quick_commands_enabled", {})
-        for start in range(0, len(GROUP_MEMBER_SHORTCUTS), 2):
-            row = []
-            for key, label, _action in GROUP_MEMBER_SHORTCUTS[start:start + 2]:
-                if key == "vchat":
-                    label = etiqueta_videochat
-                activo = enabled.get(key, True)
-                marca = "✅" if activo else "⚪"
-                row.append(types.InlineKeyboardButton(
-                    f"{marca} {label}",
-                    callback_data=f"grupo_atajo_toggle|{canal_key}|{key}|{pagina}",
+    def obtener_emoji_link(url):
+        url = url.lower()
+        if "t.me" in url: return "🌀"
+        if "x.com" in url or "twitter.com" in url: return "𝕏 🔥"
+        if "instagram" in url: return "🍉"
+        if "onlyfans" in url: return "🔞 💎"
+        return "🔗"
+
+    def obtener_nombre_red(url):
+        url = url.lower()
+        if "t.me" in url: return "Telegram"
+        if "instagram" in url: return "Instagram"
+        if "onlyfans" in url: return "OnlyFans"
+        return "Enlace"
+
+    def enviar_invitacion_vchat():
+        global ID_ULTIMA_INVITACION
+        if ID_ULTIMA_INVITACION:
+            eliminar_mensaje_seguro(GRUPO_ID, ID_ULTIMA_INVITACION)
+        msg_random = random.choice(TEXTOS_VC_HOT)
+        e1, e2 = random.sample(EMOJIS_ACCION, 2)
+        markup = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(f"{e1} ENTRAR AL VIDEOCHAT {e2}", url="https://t.me/indiosavoy?videochat")
+        )
+        try:
+            nuevo_msg = bot.send_message(GRUPO_ID, msg_random, reply_markup=markup)
+            ID_ULTIMA_INVITACION = nuevo_msg.message_id
+        except:
+            pass
+
+    def bucle_notificacion_menu():
+        while True:
+            time.sleep(45 * 60)
+            try:
+                bot.send_message(
+                    GRUPO_ID,
+                    "🔱 **¡GUERRERO!** ¿Ya tienes tus herramientas activas?\n\n"
+                    "Presiona el botón 🏹 **/menu** de la barra de mensajes y desbloquea todo el poder de la tribu . 💎🔥"
+                )
+            except:
+                pass
+
+    def bucle_repost_automatico():
+        while True:
+            time.sleep(172800)
+            todas = PromosAprobadas.all()
+            for p in todas:
+                try:
+                    markup = types.InlineKeyboardMarkup()
+                    for btn in p['botones']:
+                        markup.add(types.InlineKeyboardButton(btn['text'], url=btn['url']))
+                    if p['is_video']:
+                        bot.send_video(GRUPO_ID, p['file_id'], caption=f"🔄 **RE-POST**\n\n{p['desc']}", reply_markup=markup)
+                    else:
+                        bot.send_photo(GRUPO_ID, p['file_id'], caption=f"🔄 **RE-POST**\n\n{p['desc']}", reply_markup=markup)
+                    time.sleep(10)
+                except:
+                    continue
+
+    # --- SEGURIDAD: BLOQUEO DE GRUPOS/CANALES NO AUTORIZADOS ---
+    @bot.my_chat_member_handler()
+    def guardian_grupos(update):
+        chat = update.chat
+        nuevo_estado = update.new_chat_member.status
+        if chat.id == GRUPO_ID:
+            return
+        if nuevo_estado in ['member', 'administrator']:
+            try:
+                bot.send_message(
+                    chat.id,
+                    "🔒 Este bot es privado y no puede ser agregado a grupos o canales no autorizados."
+                )
+            except:
+                pass
+            try:
+                bot.leave_chat(chat.id)
+            except:
+                pass
+            tipo = "canal" if chat.type == "channel" else "grupo"
+            nombre = chat.title or str(chat.id)
+            bot.send_message(
+                ADMIN_ID,
+                f"🚨 *ALERTA DE SEGURIDAD*\n\n"
+                f"Intentaron agregar el bot a un {tipo} no autorizado:\n"
+                f"📛 *Nombre:* {nombre}\n"
+                f"🆔 *ID:* {chat.id}\n\n"
+                f"✅ El bot salió automáticamente."
+            )
+
+    # --- MOTOR PRINCIPAL ---
+    @bot.message_handler(content_types=['text', 'photo', 'video'])
+    def motor_principal(message):
+        global ULTIMOS_MSGS
+        chat_id, uid = message.chat.id, message.from_user.id
+        print(f"📨 MENSAJE RECIBIDO — chat:{chat_id} uid:{uid} tipo:{message.content_type} texto:{message.text or '[media]'}")
+        COMANDOS = ["/menu", "/compartir", "/reglas", "/vchat", "/admin", "/start", "/reportar"]
+
+        # --- SEGURIDAD: BLOQUEAR GRUPOS NO AUTORIZADOS ---
+        if message.chat.type in ['group', 'supergroup', 'channel'] and chat_id != GRUPO_ID:
+            try:
+                bot.leave_chat(chat_id)
+            except:
+                pass
+            return
+
+        # --- SEGURIDAD: BLACKLIST ---
+        if Blacklist.search(User.id == uid):
+            return
+
+        # --- SEGURIDAD: ANTI-FLOOD ---
+        if uid != ADMIN_ID and es_flood(uid):
+            try:
+                bot.send_message(chat_id, "⚠️ Estás enviando mensajes muy rápido. Espera unos segundos.")
+            except:
+                pass
+            return
+
+        # --- SEGURIDAD: EN PRIVADO SOLO COMANDOS VÁLIDOS ---
+        if message.chat.type == 'private' and uid != ADMIN_ID:
+            texto_check = (message.text or "").strip()
+            es_comando = (
+                any(texto_check.lower().startswith(c) for c in COMANDOS_VALIDOS_PRIVADO)
+                or texto_check.startswith("/")
+            )
+            if not es_comando and message.content_type == 'text':
+                return
+
+        if uid == 1087968824:
+            if message.text:
+                bot_info = bot.get_me()
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton(
+                    "🏠 ABRIR MENÚ PRINCIPAL",
+                    url=f"https://t.me/{bot_info.username}?start=menu"
                 ))
-            markup.row(*row)
-        markup.add(types.InlineKeyboardButton(
-            f"✏️ Nombre del botón de videochat: {etiqueta_videochat}",
-            callback_data=f"grupo_atajos_video_label|{canal_key}|{pagina}",
-        ))
+                bot.send_message(
+                    chat_id,
+                    "🏹 Pulsa el botón para abrir el Menú del Templo en privado. 🔥",
+                    reply_markup=markup
+                )
+            return
+
+        uname = (message.from_user.username or "chat_id == GRUPO_ID:o").lower()
+        guardar_evidencia(message)
+        if chat_id == GRUPO_ID:
+            registrar_actividad_stats(uid, uname)
+        if not message.text:
+            return
+        texto = message.text.lower()
+
+        if texto.startswith("/reportar") or (texto.startswith("/start") and "reporte" in texto):
+            if chat_id != GRUPO_ID:
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(
+                    types.InlineKeyboardButton("👤 REPORTAR USUARIO POR NOMBRE", callback_data="menu_reportar_nombre"),
+                    types.InlineKeyboardButton("🖼️ REPORTAR MULTIMEDIA", callback_data="menu_reportar_multimedia")
+                )
+                bot.send_message(
+                    chat_id,
+                    "🕵️ **CENTRO DE JUSTICIA — GRAN CACIQUE**\n\n"
+                    "¿Qué tipo de denuncia quieres realizar?\n\n"
+                    "👤 *Reportar por nombre* — envía una advertencia oficial al infractor en el grupo.\n"
+                    "🖼️ *Reportar multimedia* — revisa las últimas publicaciones del usuario y denuncia contenido específico.",
+                    reply_markup=markup
+                )
+            else:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                if ULTIMOS_MSGS['reportar']:
+                    eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['reportar'])
+                markup = types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton("🚩 REPORTAR AQUÍ", url=f"https://t.me/{bot.get_me().username}?start=reporte")
+                )
+                resp = bot.send_message(chat_id, f"👤 @{uname}, clica para denunciar.", reply_markup=markup)
+                ULTIMOS_MSGS['reportar'] = resp.message_id
+            return
+
+        # --- BLOQUE DE START ---
+        if texto in ["/start", "🏠 /start"] or texto.startswith("/start@") or texto.startswith("/start "):
+            if chat_id != GRUPO_ID:
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                btn_grupo = types.InlineKeyboardButton("🔥 ENTRAR AL GRUPO PRINCIPAL", url=LINK_GRUPO)
+                btn_invitar = types.InlineKeyboardButton("🚀 INVITAR A GUERREROS", url=LINK_SHARE)
+                btn_vip = types.InlineKeyboardButton("💎 SOLICITAR ACCESO VIP", callback_data="solicitar_vip")
+                btn_promo = types.InlineKeyboardButton("📢 CREAR MI PUBLICACIÓN", callback_data="crear_promo")
+                btn_canal = types.InlineKeyboardButton("📺 ENTRAR AL CANAL GRATUITO", callback_data="canal_gratuito")
+                markup.add(btn_grupo, btn_invitar, btn_vip, btn_promo, btn_canal)
+                if uid == ADMIN_ID:
+                    markup.add(types.InlineKeyboardButton("⚙️ CONFIGURACIÓN DEL CACIQUE", callback_data="admin_config_panel"))
+                bot.send_message(
+                    chat_id,
+                    "🏹 *¡BIENVENIDO AL TEMPLO DEL CACIQUE!*\n\nSelecciona una opción de combate:",
+                    reply_markup=markup
+                )
+                bot.send_message(chat_id, "⚔️ Tus armas de guerrero están listas.", reply_markup=obtener_teclado_cuadritos())
+            else:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                if ULTIMOS_MSGS['start']:
+                    eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['start'])
+                bot_info = bot.get_me()
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton(
+                    "🏠 ABRIR MENÚ DEL CACIQUE",
+                    url=f"https://t.me/{bot_info.username}?start=menu"
+                ))
+                aviso = bot.send_message(
+                    chat_id,
+                    f"🏹 @{uname}, pulsa el botón para abrir el Menú del Templo en privado. 🔥",
+                    reply_markup=markup
+                )
+                ULTIMOS_MSGS['start'] = aviso.message_id
+            return
+
+        if "/menu" in texto:
+            nombre_display = message.from_user.first_name or f"@{uname}"
+            msg_menu = (
+                f"🔱 **¡{nombre_display}, tus herramientas están activas!** ⚔️⚔️\n\n"
+                f"Usa los botones de la barra de mensajes para dominar la tribu.\n"
+                f"💎 Todo el poder de la tribu está en tus manos. 🏹🔥"
+            )
+            if chat_id == GRUPO_ID:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                if ULTIMOS_MSGS['menu']:
+                    eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['menu'])
+                resp = bot.send_message(chat_id, msg_menu, reply_markup=obtener_teclado_cuadritos())
+                ULTIMOS_MSGS['menu'] = resp.message_id
+            else:
+                bot.send_message(chat_id, msg_menu, reply_markup=obtener_teclado_cuadritos())
+
+        elif "/compartir" in texto:
+            if chat_id == GRUPO_ID:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                if ULTIMOS_MSGS['compartir']:
+                    eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['compartir'])
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(types.InlineKeyboardButton("🚀 INVITAR GUERREROS AL TEMPLO", url=LINK_SHARE))
+            txt_compartir = (
+                f"🏹 @{uname}, ¡recluta más guerreros para la tribu!\n\n"
+                f"Pulsa el botón y elige a quién quieres invitar directamente desde tus contactos. 🔥"
+            )
+            if chat_id == GRUPO_ID:
+                resp = bot.send_message(chat_id, txt_compartir, reply_markup=markup)
+                ULTIMOS_MSGS['compartir'] = resp.message_id
+            else:
+                bot.send_message(chat_id, txt_compartir, reply_markup=markup)
+
+        elif "/reglas" in texto:
+            reglas_cfg = Config.search(User.tipo == 'reglamento')
+            val = reglas_cfg[0]['valor.'] if reglas_cfg else "Respeta al Cacique."
+            if chat_id == GRUPO_ID:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                if ULTIMOS_MSGS['reglas']:
+                    eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['reglas'])
+                resp = bot.send_message(chat_id, f"📜 **REGLAMENTO SAGRADO**\n\n{val}", reply_markup=obtener_teclado_cuadritos())
+                ULTIMOS_MSGS['reglas'] = resp.message_id
+            else:
+                bot.send_message(chat_id, f"📜 **REGLAMENTO SAGRADO**\n\n{val}", reply_markup=obtener_teclado_cuadritos())
+
+        elif "/vchat" in texto:
+            if chat_id == GRUPO_ID:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                enviar_invitacion_vchat()
+
+        elif "/admin" in texto:
+            bot_info = bot.get_me()
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("👤 Contactar Cacique", url=f"https://t.me/{MY_USER}"),
+                types.InlineKeyboardButton("🚩 REPORTAR INFRACTOR", url=f"https://t.me/{bot_info.username}?start=reporte")
+            )
+            if chat_id == GRUPO_ID:
+                eliminar_mensaje_seguro(chat_id, message.message_id)
+                if ULTIMOS_MSGS['admin']:
+                    eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['admin'])
+                resp = bot.send_message(chat_id, "🚩 **CENTRO DE COMANDO**", reply_markup=markup)
+                ULTIMOS_MSGS['admin'] = resp.message_id
+            else:
+                bot.send_message(chat_id, "🚩 **CENTRO DE COMANDO**", reply_markup=markup)
+
+
+    # --- MANEJO DE CALLBACKS ---
+    @bot.callback_query_handler(func=lambda call: True)
+    def manejar_clics(call):
+        uid, mid = call.from_user.id, call.message.message_id
+        u_name = call.from_user.first_name
+        u_user = call.from_user.username or "SinUser"
+
+        if Blacklist.search(User.id == uid):
+            bot.answer_callback_query(call.id, "❌ Acceso denegado.")
+            return
+
+        if uid != ADMIN_ID and es_flood(uid):
+            bot.answer_callback_query(call.id, "⚠️ Demasiadas acciones. Espera un momento.")
+            return
     markup.add(
         types.InlineKeyboardButton(
             "➕ Agregar botón",
@@ -2936,447 +2481,71 @@ def mostrar_menu_atajos_grupo(
             f"🗑️ Quitar: {etiqueta}",
             callback_data=f"grupo_atajos_del|{canal_key}|{index}|{pagina}",
         ))
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Volver a ajustes",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    lineas = "\n".join(
-        f"• <b>{html.escape(str(item.get('label', 'Botón')))}</b> → "
-        f"<code>{html.escape(str(item.get('action', '')))}</code>"
-        for item in botones[:20]
-    ) or "Todavía no hay botones configurados."
-    if es_grupo:
-        enabled = ajustes.get("quick_commands_enabled", {})
-        acciones = {
-            "start": "abre el menú privado del bot",
-            "menu": "muestra las acciones rápidas del grupo",
-            "rules": "muestra el reglamento de este grupo",
-            "share": "comparte el enlace de invitación del grupo",
-            "admin": "muestra un enlace para contactar a @Ja2610X",
-            "vchat": "muestra la guía/enlace disponible; el bot no inicia la llamada",
-        }
-        etiquetas_actuales = {
-            key: etiqueta_videochat if key == "vchat" else label
-            for key, label, _action in GROUP_MEMBER_SHORTCUTS
-        }
-        fijos = "\n".join(
-            f"{'✅' if enabled.get(key, True) else '⚪'} "
-            f"<b>{html.escape(etiquetas_actuales[key])}</b> → {acciones[key]}"
-            for key, _label, _action in GROUP_MEMBER_SHORTCUTS
-        )
-        lineas = f"{fijos}\n\n<b>Botones personalizados</b>\n{lineas}"
-    tipo = (ajustes.get("type") or "grupo").lower()
-    limitacion = (
-        "En grupos, los botones aparecen junto a la barra para escribir después de publicar el teclado. "
-        "Al pulsar un atajo con enlace, el bot muestra un botón «Abrir enlace»; Telegram "
-        "requiere ese segundo toque porque una tecla de respuesta no puede abrir enlaces."
-        if tipo != "canal" else
-        "En canales se publica un teclado de botones debajo de un mensaje; Telegram no ofrece "
-        "una barra de respuesta para suscriptores."
-    )
-    texto = (
-        f"⌨️ <b>Atajos para {html.escape(ajustes.get('title', 'este chat'))}</b>\n\n"
-        f"{lineas}\n\n"
-        + (
-            "Pulsa cada botón de arriba para activarlo o desactivarlo para los miembros. "
-            "El teclado queda activo hasta que lo quites o publiques otro.\n\n"
-            if es_grupo else ""
-        )
-        + "Para agregar uno, escribe etiqueta=acción. También puedes usar "
-        "<code>Nombre del botón - rules</code>. Ejemplos: "
-        "<code>📜 Reglamento=/rules</code> o "
-        "<code>🌐 Sitio=https://ejemplo.com</code>.\n"
-        + (
-            "El atajo /admin abre un enlace al perfil de @Ja2610X. "
-            "El botón de videochat ofrece la guía/enlace del grupo; el bot no puede iniciar la llamada.\n"
-            if es_grupo else ""
-        )
-        + f"{html.escape(limitacion)}"
-    )
-    if aviso:
-        texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    return editar_o_enviar_panel(
-        chat_id_admin, texto, markup, message=message, message_id=message_id
-    )
-
-
 def guardar_edicion_funcion_grupo(canal_key, feature, texto):
+    if feature != "reglamento":
+        raise ValueError("Esta opción no admite edición de texto.")
     texto = (texto or "").strip()
-    if feature in ("reglamento", "bienvenida", "despedida", "etiqueta"):
-        campo = {
-            "reglamento": "rules",
-            "bienvenida": "welcome_text",
-            "despedida": "goodbye_text",
-            "etiqueta": "tag",
-        }[feature]
-        if texto.lower() == "/vaciar":
-            texto = ""
-        if len(texto) > 4000:
-            raise ValueError("El texto no puede superar 4000 caracteres.")
-        actualizar_ajustes_grupo(canal_key, lambda ajustes: ajustes.update({campo: texto}))
-        if feature in ("bienvenida", "despedida") and texto:
-            actualizar_ajustes_grupo(
-                canal_key,
-                lambda ajustes: ajustes.setdefault("enabled", {}).update({feature: True}),
-            )
-        return "Texto guardado."
-
-    if feature in ("filtros", "palabras", "comandos"):
-        if feature == "filtros" and "=" not in texto and texto.startswith("-"):
-            palabra = texto[1:].strip().casefold()
-            if not palabra:
-                raise ValueError("Escribe la frase que quieres retirar después del guion.")
-            def retirar_filtro(ajustes):
-                ajustes.setdefault("filters", {}).pop(palabra, None)
-            actualizar_ajustes_grupo(canal_key, retirar_filtro)
-            return f"Filtro «{palabra}» retirado."
-        if feature == "comandos" and "=" not in texto and texto.startswith("-"):
-            comando = texto[1:].strip().lstrip("/").casefold()
-            if not re.fullmatch(r"[a-z0-9_]{1,32}", comando):
-                raise ValueError("Escribe el comando que quieres retirar después del guion.")
-            def retirar_comando(ajustes):
-                ajustes.setdefault("custom_commands", {}).pop(comando, None)
-            actualizar_ajustes_grupo(canal_key, retirar_comando)
-            return f"Comando /{comando} retirado."
-        if "=" not in texto and feature != "palabras":
-            raise ValueError("Usa el formato indicado, con un signo = entre el nombre y la respuesta.")
-        if feature == "filtros":
-            palabra, respuesta = texto.split("=", 1)
-            palabra = palabra.strip().casefold()
-            respuesta = respuesta.strip()
-            if not palabra or not respuesta:
-                raise ValueError("La palabra y la respuesta no pueden quedar vacías.")
-            if len(palabra) > 100 or len(respuesta) > 1000:
-                raise ValueError("La palabra admite 100 caracteres y la respuesta 1000.")
-            def guardar_filtro(ajustes):
-                ajustes.setdefault("filters", {})[palabra] = respuesta
-                ajustes.setdefault("enabled", {})["filtros"] = True
-            actualizar_ajustes_grupo(canal_key, guardar_filtro)
-            return f"Filtro guardado para «{palabra}»."
-        if feature == "comandos":
-            comando, respuesta = texto.split("=", 1)
-            comando = comando.strip().lstrip("/").casefold()
-            respuesta = respuesta.strip()
-            if not re.fullmatch(r"[a-z0-9_]{1,32}", comando):
-                raise ValueError("El comando solo puede usar letras, números y guion bajo (máximo 32).")
-            if not respuesta or len(respuesta) > 1000:
-                raise ValueError("La respuesta debe tener entre 1 y 1000 caracteres.")
-            actualizar_ajustes_grupo(
-                canal_key,
-                lambda ajustes: ajustes.setdefault("custom_commands", {}).update({comando: respuesta}),
-            )
-            return f"Comando /{comando} guardado."
-
-        palabra = texto.strip()
-        quitar = palabra.startswith("-")
-        palabra = palabra[1:].strip() if quitar else palabra
-        palabra = palabra.casefold()
-        if not palabra or len(palabra) > 100:
-            raise ValueError("Escribe una palabra de entre 1 y 100 caracteres.")
-        def actualizar_palabras(ajustes):
-            palabras = ajustes.setdefault("blocked_words", [])
-            if quitar:
-                ajustes["blocked_words"] = [p for p in palabras if str(p).casefold() != palabra]
-            elif palabra not in [str(p).casefold() for p in palabras]:
-                palabras.append(palabra)
-                ajustes.setdefault("enabled", {})["palabras"] = True
-        actualizar_ajustes_grupo(canal_key, actualizar_palabras)
-        return f"Palabra «{palabra}» {'retirada' if quitar else 'añadida'}."
-
-    if feature == "bloqueos":
-        valor = texto.removeprefix("-").strip()
-        if not valor.isdigit():
-            raise ValueError("Escribe el ID numérico de Telegram. Anteponle - para retirarlo.")
-        user_id = str(int(valor))
-        quitar = texto.startswith("-")
-        def actualizar_lista(ajustes):
-            ids = [str(item) for item in ajustes.setdefault("blocked_user_ids", [])]
-            if quitar:
-                ajustes["blocked_user_ids"] = [item for item in ids if item != user_id]
-            elif user_id not in ids:
-                ids.append(user_id)
-                ajustes["blocked_user_ids"] = ids[-1000:]
-        actualizar_ajustes_grupo(canal_key, actualizar_lista)
-        return f"ID {user_id} {'retirado de' if quitar else 'añadido a'} la lista de bloqueo."
-
-    if feature == "enmascarados":
-        valor = texto.removeprefix("-").strip()
-        if not valor or len(valor) > 80:
-            raise ValueError("Escribe un ID de chat o @username. Anteponle - para retirarlo.")
-        valor = valor.casefold()
-        quitar = texto.startswith("-")
-        def actualizar_excepciones(ajustes):
-            actuales = [str(item).casefold() for item in ajustes.setdefault("masked_exceptions", [])]
-            if quitar:
-                ajustes["masked_exceptions"] = [item for item in actuales if item != valor]
-            elif valor not in actuales:
-                actuales.append(valor)
-                ajustes["masked_exceptions"] = actuales[-100:]
-        actualizar_ajustes_grupo(canal_key, actualizar_excepciones)
-        return f"Excepción {valor} {'retirada' if quitar else 'guardada'}."
-
-    if feature == "longitud":
-        try:
-            maximo = int(texto)
-        except ValueError:
-            raise ValueError("Escribe un número entero entre 0 y 4096.")
-        if maximo < 0 or maximo > 4096:
-            raise ValueError("El límite válido es de 0 a 4096; 0 desactiva la longitud máxima.")
-        actualizar_ajustes_grupo(canal_key, lambda ajustes: ajustes.update({"max_length": maximo}))
-        return "Límite guardado."
-
-    if feature == "modo_nocturno":
-        coincidencia = re.fullmatch(r"([0-2]\d:[0-5]\d)-([0-2]\d:[0-5]\d)", texto)
-        if not coincidencia:
-            raise ValueError("Usa el formato HH:MM-HH:MM, por ejemplo 22:00-07:00.")
-        inicio, fin = coincidencia.groups()
-        if any(int(hora[:2]) > 23 for hora in (inicio, fin)):
-            raise ValueError("Las horas deben estar entre 00:00 y 23:59.")
-        actualizar_ajustes_grupo(
-            canal_key,
-            lambda ajustes: ajustes.update({"night_hours": [inicio, fin]}),
-        )
-        return f"Horario guardado: {inicio}–{fin}."
-
-    raise ValueError("Esta opción todavía no acepta texto.")
+    if texto.lower() == "/vaciar":
+        texto = ""
+    if len(texto) > 4000:
+        raise ValueError("El texto no puede superar 4000 caracteres.")
+    actualizar_ajustes_grupo(
+        canal_key, lambda ajustes: ajustes.update({"rules": texto})
+    )
+    return "Reglamento guardado."
 
 
 def mostrar_menu_funcion_grupo(
     chat_id_admin, canal_key, feature, pagina=0, message=None,
     message_id=None, aviso=None,
 ):
-    ajustes = obtener_ajustes_grupo(canal_key)
-    if not ajustes or feature not in GROUP_FEATURE_TITLES:
-        bot.send_message(chat_id_admin, "No encontré esa opción de configuración.")
-        return
-
-    ingles = ajustes.get("language", "es") == "en"
-    titulo = GROUP_FEATURE_TITLES_EN.get(feature, GROUP_FEATURE_TITLES[feature]) if ingles else GROUP_FEATURE_TITLES[feature]
     if feature == "reglamento":
         return mostrar_menu_reglamento(
-            chat_id_admin,
-            canal_key,
-            pagina,
-            message=message,
-            message_id=message_id,
-            aviso=aviso,
+            chat_id_admin, canal_key, pagina, message=message,
+            message_id=message_id, aviso=aviso,
         )
     if feature == "atajos":
         return mostrar_menu_atajos_grupo(
             chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso
-        )
-    if feature == "antispam":
-        return mostrar_menu_antispam(
-            chat_id_admin, canal_key, pagina, message=message,
             message_id=message_id, aviso=aviso,
         )
-    if feature == "antiflood":
-        return mostrar_menu_antiflood(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "multimedia":
-        return mostrar_menu_multimedia_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id,
-        )
-    if feature in ("bienvenida", "despedida"):
-        return mostrar_menu_bienvenida_despedida(
-            chat_id_admin, canal_key, feature, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "captcha":
-        return mostrar_menu_captcha_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "modo_nocturno":
-        return mostrar_menu_modo_nocturno(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "advertencias":
-        return mostrar_menu_advertencias_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "enlace":
-        return mostrar_menu_enlace_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "aprobacion":
-        return mostrar_menu_aprobacion_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "palabras":
-        return mostrar_menu_palabras_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "bloqueos":
-        return mostrar_menu_bloqueos_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "miembros":
-        return mostrar_menu_miembros_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    if feature == "enmascarados":
-        return mostrar_menu_enmascarados_grupo(
-            chat_id_admin, canal_key, pagina, message=message,
-            message_id=message_id, aviso=aviso,
-        )
-    habilitado = funcion_grupo_activada(canal_key, ajustes, feature)
-    estado = (
-        ("🟢 Enabled" if habilitado else "⚪ Disabled")
-        if ingles else
-        ("🟢 Activado" if habilitado else "⚪ Desactivado")
-    )
-    descripcion = {
-        "reglamento": "Guarda las reglas y permite mostrarlas en el grupo con /rules.",
-        "antispam": "Elimina mensajes cuando una cuenta supera el límite de mensajes por ventana.",
-        "bienvenida": "Envía un mensaje personalizado cuando alguien entra.",
-        "antiflood": "Elimina mensajes cuando alguien publica demasiado rápido.",
-        "despedida": "Envía un mensaje personalizado cuando alguien sale.",
-        "alfabetos": "Bloquea mensajes dominados por alfabetos no latinos.",
-        "captcha": "Publica un botón de verificación cuando se une una persona.",
-        "filtros": "Responde a palabras o frases configuradas por ti.",
-        "reportes": "Permite que los miembros usen /report para avisar a la administración.",
-        "bloqueos": "Administra palabras bloqueadas y las acciones de moderación.",
-        "multimedia": "Bloquea fotos, vídeos, archivos, audio y animaciones de miembros.",
-        "antiporno": "Bloquea textos y enlaces con términos explícitos; no analiza imágenes.",
-        "advertencias": "Activa el contador de advertencias y el comando /warn.",
-        "modo_nocturno": "Elimina mensajes de miembros durante el horario configurado.",
-        "etiqueta": "Guarda una etiqueta de grupo para publicar con /tag.",
-        "enlace": "Genera un enlace de invitación si el bot tiene permiso.",
-        "guardian": "Activa en conjunto las protecciones de spam, flood y palabras prohibidas.",
-        "aprobacion": "Crea un enlace de invitación que requiere aprobación de administradores.",
-        "eliminacion": "Configura el borrado automático de mensajes del grupo.",
-        "topics": "Crea un tema nuevo si el grupo tiene Topics habilitados.",
-        "palabras": "Añade o retira palabras que deben borrarse de los mensajes.",
-        "miembros": "Usa /ban, /unban, /mute y /warn respondiendo al miembro o con su ID.",
-        "enmascarados": "Permite bloquear mensajes enviados como administrador anónimo o canal.",
-        "discusion": "Telegram exige vincular el grupo de discusión desde los ajustes del canal.",
-        "comandos": "Crea comandos propios en formato comando=respuesta.",
-        "stickers_gif": "Bloquea stickers y GIF/animaciones enviados por miembros.",
-        "longitud": "Borra textos que excedan el máximo configurado.",
-        "canales": "Administra botones y publicaciones para este destino.",
-        "permisos": "Al activarse, solo los administradores podrán escribir; los mensajes de otros miembros se borrarán.",
-        "registro": "Selecciona el chat donde se enviarán avisos de moderación.",
-        "lang": "Cambia el idioma de los mensajes de configuración entre español e inglés.",
-    }.get(feature, "")
-    if ingles:
-        descripcion = GROUP_FEATURE_DESCRIPTIONS_EN.get(feature, descripcion)
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    if feature in {
-        "antispam", "bienvenida", "antiflood", "despedida", "alfabetos", "captcha",
-        "reportes", "multimedia", "antiporno", "advertencias", "modo_nocturno",
-        "guardian", "enmascarados", "stickers_gif", "permisos",
-        "aprobacion",
-    }:
-        if feature == "permisos":
-            texto_boton = (
-                ("🔓 Allow members to write" if habilitado else "🔒 Admins only")
-                if ingles else
-                ("🔓 Permitir que escriban los miembros" if habilitado else "🔒 Solo administradores pueden escribir")
-            )
-        else:
-            texto_boton = (
-                "🔴 Disable" if ingles and habilitado else
-                "🟢 Enable" if ingles else
-                "🔴 Desactivar" if habilitado else
-                "🟢 Activar"
-            )
-        markup.add(types.InlineKeyboardButton(
-            texto_boton,
-            callback_data=f"grupo_toggle|{canal_key}|{feature}|{pagina}",
-        ))
-
-    if feature in GROUP_FEATURE_TEXT_PROMPTS:
-        texto_configurar = "✏️ Configure" if ingles else "✏️ Configurar"
-        markup.add(types.InlineKeyboardButton(
-            texto_configurar,
-            callback_data=f"grupo_editar|{canal_key}|{feature}|{pagina}",
-        ))
-    if feature == "captcha":
-        markup.add(types.InlineKeyboardButton(
-            "✍🏼 Personalizar mensaje",
-            callback_data=f"grupo_captcha_text|{canal_key}|{pagina}",
-        ))
-    elif feature == "enlace":
-        markup.add(types.InlineKeyboardButton(
-            "🔗 Generate invite link" if ingles else "🔗 Generar enlace",
-            callback_data=f"grupo_accion|{canal_key}|enlace|generar|{pagina}"
-        ))
-    elif feature == "aprobacion":
-        markup.add(types.InlineKeyboardButton(
-            "📩 Create join-request link" if ingles else "📩 Crear enlace con aprobación",
-            callback_data=f"grupo_accion|{canal_key}|aprobacion|crear|{pagina}",
-        ))
-    elif feature == "eliminacion":
-        markup.row(
-            types.InlineKeyboardButton("1 day" if ingles else "24 h", callback_data=f"grupo_accion|{canal_key}|eliminacion|86400|{pagina}"),
-            types.InlineKeyboardButton("7 days" if ingles else "7 días", callback_data=f"grupo_accion|{canal_key}|eliminacion|604800|{pagina}"),
-            types.InlineKeyboardButton("31 days" if ingles else "31 días", callback_data=f"grupo_accion|{canal_key}|eliminacion|2678400|{pagina}"),
-        )
-        markup.add(types.InlineKeyboardButton(
-            "Disable" if ingles else "Desactivar",
-            callback_data=f"grupo_accion|{canal_key}|eliminacion|0|{pagina}"
-        ))
-    elif feature == "topics":
-        markup.add(types.InlineKeyboardButton(
-            "➕ Create topic" if ingles else "➕ Crear tema",
-            callback_data=f"grupo_accion|{canal_key}|topics|crear|{pagina}"
-        ))
-    elif feature in ("miembros", "bloqueos"):
-        markup.add(types.InlineKeyboardButton(
-            "📖 Show moderation commands" if ingles else "📖 Ver comandos de gestión",
-            callback_data=f"grupo_accion|{canal_key}|miembros|ayuda|{pagina}",
-        ))
-    elif feature == "discusion":
-        markup.add(types.InlineKeyboardButton(
-            "ℹ️ How to link" if ingles else "ℹ️ Cómo vincular",
-            callback_data=f"grupo_accion|{canal_key}|discusion|ayuda|{pagina}"
-        ))
-    elif feature == "canales":
-        markup.add(types.InlineKeyboardButton(
-            "📋 Open buttons and posts" if ingles else "📋 Abrir botones y publicaciones",
-            callback_data=f"grupo_botones|{canal_key}"
-        ))
-    elif feature == "registro":
-        markup.add(types.InlineKeyboardButton(
-            "📢 Choose log channel" if ingles else "📢 Elegir canal de registro",
-            callback_data=f"grupo_accion|{canal_key}|registro|elegir|{pagina}",
-        ))
-    elif feature == "lang":
-        markup.add(types.InlineKeyboardButton(
-            "🌐 Change language" if ingles else "🌐 Cambiar idioma",
-            callback_data=f"grupo_accion|{canal_key}|lang|cambiar|{pagina}",
-        ))
-
-    markup.add(types.InlineKeyboardButton(
-        "↩️ Back to settings" if ingles else "↩️ Volver a ajustes",
-        callback_data=f"grupo_config|{canal_key}|{pagina}",
-    ))
-    texto_menu = (
-        f"<b>{html.escape(titulo)}</b>\n{'Status' if ingles else 'Estado'}: {estado}\n\n"
-        f"{html.escape(descripcion)}"
-    )
-    if aviso:
-        texto_menu = f"✅ {html.escape(aviso)}\n\n" + texto_menu
-    editar_o_enviar_panel(
-        chat_id_admin,
-        texto_menu,
-        markup,
-        message=message,
+    return mostrar_configuracion_grupo(
+        chat_id_admin, canal_key, pagina, message=message,
         message_id=message_id,
+        aviso="Esta opción ya no forma parte del panel de configuración.",
     )
+
+
+def _mostrar_configuracion_grupo_reemplazada(
+    chat_id_admin, canal_key, *args, **kwargs
+):
+    return mostrar_configuracion_grupo(
+        chat_id_admin,
+        canal_key,
+        message=kwargs.get("message"),
+        message_id=kwargs.get("message_id"),
+        aviso="Esta sección se administra ahora desde Reglamento y Botones rápidos.",
+    )
+
+
+for _nombre_menu_reemplazado in (
+    "mostrar_menu_antispam",
+    "mostrar_menu_antiflood",
+    "mostrar_menu_multimedia_grupo",
+    "mostrar_menu_bienvenida_despedida",
+    "mostrar_menu_captcha_grupo",
+    "mostrar_menu_modo_nocturno",
+    "mostrar_menu_advertencias_grupo",
+    "mostrar_menu_excepciones_moderacion",
+    "mostrar_menu_enlace_grupo",
+    "mostrar_menu_aprobacion_grupo",
+    "mostrar_menu_palabras_grupo",
+    "mostrar_menu_bloqueos_grupo",
+    "mostrar_menu_miembros_grupo",
+    "mostrar_menu_enmascarados_grupo",
+):
+    globals()[_nombre_menu_reemplazado] = _mostrar_configuracion_grupo_reemplazada
+
 
 # ── Datos de pago ─────────────────────────────────────────────────────────────
 _AVISO = "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines de procesar tu pedido para obtener el GoldPass."

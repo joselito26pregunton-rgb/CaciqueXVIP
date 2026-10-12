@@ -1,0 +1,119 @@
+{
+  "canales": {
+    "goldpass": "-1003561176552",
+    "freeclub": "-1003561176552"
+  },
+  "recurrentes": {
+    "freeclub": {
+      "activo": true,
+      "botones_key": "freeclub",
+      "destino_key": "freeclub",
+      "intervalo_segundos": 172800,
+      "texto": "Elige una opción:",
+      "media_id": "BAACAgEAAxkBAAIB8WoaDomIj84AAdGHspwln9s3z5ey1wACmQcAAj8z0URSmSznjtqqaTsE",
+      "media_type": "video",
+      "media_items": [
+        {
+          "media_id": "BAACAgEAAxkBAAIB8WoaDomIj84AAdGHspwln9s3z5ey1wACmQcAAj8z0URSmSznjtqqaTsE",
+          "media_type": "video"
+        }
+      ],
+      "proximo_envio": 1791902611.6189473,
+      "ultimo_message_id": null,
+      "ultimo_message_ids": null,
+      "ultimo_chat_id": null,
+      "ultimo_envio": null
+    }
+  },
+  "ultima_publicacion": {},
+  "destinos": {
+    "dest_bc7501322c": {
+      "nombre": "🔱CX HOTGO🔱 Chat",
+      "chat_id": "-1003898364797",
+      "tipo": "grupo"
+    },
+    "dest_8d8efd584f": {
+      "nombre": "Heteros RD🔥🇩🇴",
+      "chat_id": "-1003924722529",
+      "tipo": "canal",
+      "archivado": true
+    },
+    "dest_dfb7b293d6": {
+      "nombre": "Detective pack #2 respaldo",
+      "chat_id": "-1003960002242",
+      "tipo": "grupo",
+      "archivado": true
+    }
+  },
+  "group_settings": {
+    "-1003898364797": {
+      "chat_id": "-1003898364797",
+      "title": "🔱CX HOTGO🔱 Chat",
+      "type": "grupo",
+      "enabled": {
+        "bienvenida": true,
+        "advertencias": true
+      },
+      "rules": "📜 REGLAMENTO DEL JUEGO 😈\n\nBienvenido/a al lugar donde la temperatura sube… pero el respeto no baja 🔥\nAquí todos venimos a disfrutar, conversar y compartir — sin dramas ni desastres.\n\nAntes de soltar tus ganas, recuerda estas reglas:\n 1. 💬 Respeta a todos los miembros.\nNo se aceptan insultos, acoso, ni actitudes tóxicas. Aquí se viene a disfrutar, no a molestar.\n 2. 🚫 Cero contenido ilegal o prohibido.\nNada de pornografía infantil, zoofilia, violencia, incesto, ni nada fuera de la ley.\nEsto es un espacio adulto, no un delito.\n 3. 📵 Sin spam ni publicidad externa.\nSi quieres compartir algo, consulta primero con la administración.\nNadie vino aquí a ver tu link de criptos ni tu grupo copia 😅\n 4. 🧠 Consentimiento y buen gusto.\nSi alguien dice “no”, se respeta.\nJugar no significa cruzar límites.\n 5. 🤖 Nada de bots, cuentas falsas ni robo de contenido.\nSi lo haces, serás eliminado más rápido de lo que dura un suspiro.\n 6. 😏 Participa con actitud.\nSé amable, sé divertido/a, sé tú — pero recuerda: lo sexy también puede ser educado.\n\n✨ Cumple las reglas y disfruta del juego.\nEl placer es más intenso cuando hay límites claros.\n\n— 🛡️ Administración del Grupo GRAN JEFE",
+      "welcome_text": "🌴🔥 Bienvenido(a)🔥🌴  \n\nEl Gran Jefe te saluda con cacao y fuego...  \nAquí no se entra por error, sino por deseo 😈  \n\n🍫 Disfruta del ambiente, respeta al resto de los guerreros y comparte la buena vibra.  \n\n📜 REGLAMENTO DEL JUEGO 😈\n\nBienvenido/a al lugar donde la temperatura sube… pero el respeto no baja 🔥\nAquí todos venimos a disfrutar, conversar y compartir — sin dramas ni desastres.\n\nAntes de soltar tus ganas, recuerda estas reglas:\n 1. 💬 Respeta a todos los miembros.\nNo se aceptan insultos, acoso, ni actitudes tóxicas. Aquí se viene a disfrutar, no a molestar.\n 2. 🚫 Cero contenido ilegal o prohibido.\nNada de pornografía infantil, zoofilia, violencia, incesto, ni nada fuera de la ley.\nEsto es un espacio adulto, no un delito.\n 3. 📵 Sin spam ni publicidad externa.\nSi quieres compartir algo, consulta primero con la administración.\nNadie vino aquí a ver tu link de criptos ni tu grupo copia 😅\n 4. 🧠 Consentimiento y buen gusto.\nSi alguien dice “no”, se respeta.\nJugar no significa cruzar límites.\n 5. 🤖 Nada de bots, cuentas falsas ni robo de contenido.\nSi lo haces, serás eliminado más rápido de lo que dura un suspiro.\n 6. 😏 Participa con actitud.\nSé amable, sé divertido/a, sé tú — pero recuerda: lo sexy también puede ser educado.\n\n✨ Cumple las reglas y disfruta del juego.\nEl placer es más intenso cuando hay límites claros.\n\n— 🛡️ Administración del Grupo GRAN JEFE  \n\n💋 Si llegaste hasta aquí, prepárate…\nPorque en esta tribu, el placer se saborea lento, como el chocolate Savoy. ya somos 🤷‍♂️ almas ardientes en esta tribu 🔥  Bienvenid@ gerrer@",
+      "goodbye_text": "👋 {name} salió del grupo.",
+      "blocked_words": [],
+      "filters": {},
+      "custom_commands": {},
+      "max_length": 0,
+      "warnings": {},
+      "welcome_mode": "always",
+      "welcome_send_private": true,
+      "welcome_delete_previous": true,
+      "warning_duration_seconds": 86400
+    },
+    "-1003561176552": {
+      "chat_id": "-1003561176552",
+      "title": "🏆 GoldPass CX HOTGO",
+      "type": "grupo/canal",
+      "enabled": {
+        "antispam": false
+      },
+      "rules": "",
+      "welcome_text": "¡Bienvenido/a, {name}!",
+      "goodbye_text": "👋 {name} salió del grupo.",
+      "blocked_words": [],
+      "filters": {},
+      "custom_commands": {},
+      "quick_buttons": [],
+      "max_length": 0,
+      "warnings": {},
+      "rules_access": "admins"
+    },
+    "-1003924722529": {
+      "chat_id": "-1003924722529",
+      "title": "Heteros RD🔥🇩🇴",
+      "type": "canal",
+      "enabled": {},
+      "rules": "",
+      "welcome_text": "¡Bienvenido/a, {name}!",
+      "goodbye_text": "👋 {name} salió del grupo.",
+      "blocked_words": [],
+      "filters": {},
+      "custom_commands": {},
+      "quick_buttons": [],
+      "max_length": 0,
+      "warnings": {}
+    },
+    "-1003960002242": {
+      "chat_id": "-1003960002242",
+      "title": "Detective pack #2 respaldo",
+      "type": "grupo",
+      "enabled": {},
+      "rules": "",
+      "welcome_text": "¡Bienvenido/a, {name}!",
+      "goodbye_text": "👋 {name} salió del grupo.",
+      "blocked_words": [],
+      "filters": {},
+      "custom_commands": {},
+      "quick_buttons": [],
+      "max_length": 0,
+      "warnings": {}
+    }
+  }
+}

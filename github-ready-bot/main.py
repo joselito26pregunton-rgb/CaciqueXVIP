@@ -331,19 +331,25 @@ def responder_primer_contacto_business(message):
 
     try:
         connection = bot.get_business_connection(connection_id)
-    except Exception:
-        app.logger.warning("No se pudo validar una conexión de Chat Automation.")
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo validar una conexión de Chat Automation (error=%s).",
+            type(error).__name__,
+        )
         return
 
     profile_id = str(getattr(getattr(connection, "user", None), "id", ""))
     rights = getattr(connection, "rights", None)
-    if (
-        not getattr(connection, "is_enabled", False)
-        or not rights
-        or not getattr(rights, "can_reply", False)
-        or profile_id not in _perfiles_business_autorizados()
-        or str(sender.id) == profile_id
-    ):
+    if not getattr(connection, "is_enabled", False):
+        app.logger.warning("Se ignoró un saludo Business: conexión desactivada.")
+        return
+    if not rights or not getattr(rights, "can_reply", False):
+        app.logger.warning("Se ignoró un saludo Business: falta permiso para responder.")
+        return
+    if profile_id not in _perfiles_business_autorizados():
+        app.logger.warning("Se ignoró un saludo Business: perfil no autorizado.")
+        return
+    if str(sender.id) == profile_id:
         return
 
     recipient_id = str(getattr(sender, "id", ""))
@@ -371,9 +377,12 @@ def responder_primer_contacto_business(message):
                         business_connection_id=connection_id,
                     )
                 enviado = True
-            except Exception:
+            except Exception as error:
                 app.logger.warning(
-                    "Falló la foto del saludo Business; se intentará enviar el texto."
+                    "Falló la foto del saludo Business; se intentará enviar el texto "
+                    "(error=%s, telegram_code=%s).",
+                    type(error).__name__,
+                    getattr(error, "error_code", None),
                 )
 
         if not enviado:
@@ -386,8 +395,13 @@ def responder_primer_contacto_business(message):
                     business_connection_id=connection_id,
                 )
                 enviado = True
-            except Exception:
-                app.logger.warning("No se pudo enviar el saludo automático Business.")
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo enviar el saludo automático Business "
+                    "(error=%s, telegram_code=%s).",
+                    type(error).__name__,
+                    getattr(error, "error_code", None),
+                )
 
         if enviado:
             try:
@@ -6319,6 +6333,10 @@ def proceso_obtener_usuario_reporte(message):
 
 
 if __name__ == "__main__":
+    print(
+        "📬 Saludo Business listo para "
+        f"{len(_perfiles_business_autorizados())} perfil(es) autorizado(s)."
+    )
     threading.Thread(target=revisar_vencimientos, name="vip-expiry", daemon=True).start()
     threading.Thread(
         target=revisar_vencimientos_free_goldpass,

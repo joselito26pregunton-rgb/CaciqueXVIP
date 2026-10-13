@@ -43,6 +43,16 @@
       "chat_id": "-1003960002242",
       "tipo": "grupo",
       "archivado": true
+    },
+    "dest_113443d367": {
+      "nombre": "🔱FreeClub CX Hub🔱",
+      "chat_id": "-1003561176552",
+      "tipo": "canal"
+    },
+    "dest_0544f643e9": {
+      "nombre": "🔱GOLDPASS CX HOTGO🔱",
+      "chat_id": "-1003914257220",
+      "tipo": "canal"
     }
   },
   "group_settings": {
@@ -69,8 +79,8 @@
     },
     "-1003561176552": {
       "chat_id": "-1003561176552",
-      "title": "🏆 GoldPass CX HOTGO",
-      "type": "grupo/canal",
+      "title": "🔱FreeClub CX Hub🔱",
+      "type": "canal",
       "enabled": {
         "antispam": false
       },
@@ -85,35 +95,17 @@
       "warnings": {},
       "rules_access": "admins"
     },
-    "-1003924722529": {
-      "chat_id": "-1003924722529",
-      "title": "Heteros RD🔥🇩🇴",
-      "type": "canal",
-      "enabled": {},
-      "rules": "",
-      "welcome_text": "¡Bienvenido/a, {name}!",
-      "goodbye_text": "👋 {name} salió del grupo.",
-      "blocked_words": [],
-      "filters": {},
-      "custom_commands": {},
-      "quick_buttons": [],
-      "max_length": 0,
-      "warnings": {}
-    },
-    "-1003960002242": {
-      "chat_id": "-1003960002242",
-      "title": "Detective pack #2 respaldo",
-      "type": "grupo",
-      "enabled": {},
-      "rules": "",
-      "welcome_text": "¡Bienvenido/a, {name}!",
-      "goodbye_text": "👋 {name} salió del grupo.",
-      "blocked_words": [],
-      "filters": {},
-      "custom_commands": {},
-      "quick_buttons": [],
-      "max_length": 0,
-      "warnings": {}
+    "-1003914257220": {
+      "title": "🔱GOLDPASS CX HOTGO🔱",
+      "type": "canal"
     }
+  },
+  "free_goldpass": {
+    "active": true,
+    "duration_seconds": 86400,
+    "campaign_id": "15470f7953924414b557c6190a022b03",
+    "promo_chat_id": "-1003561176552",
+    "promo_message_id": 246,
+    "activated_at": "2026-10-13 02:00:53"
   }
 }

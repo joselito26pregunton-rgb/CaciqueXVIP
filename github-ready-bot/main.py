@@ -1,4 +1,4 @@
-import os, threading, time, json, hashlib, hmac, html, random, re, uuid, urllib.parse
+import os, threading, time, json, hashlib, hmac, html, random, re, uuid, urllib.parse, unicodedata
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import telebot
@@ -11,11 +11,15 @@ TOKEN = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID = "7827130679"
 CANAL_ID = "-1003914257220"
 CanaL_ID = "-1003561176552"
+FREE_GOLDPASS_PROMO_CHAT_ID = "-1003561176552"
 GROUP_ADMIN_CONTACT_URL = "https://t.me/Ja2610X"
 CANAL_INVITE_LINK = "https://t.me/+U7Kk_sC9pToxZjIx"
 CANAL_INVITE_LINK_EXTERNO = "https://t.me/+xjHnFXb_QTY0NGEx"
 LINK_GRUPO = "https://t.me/+DT-eLLYZ0g8wNmMx"
 LINK_CANAL_GRATUITO = "https://t.me/+c6gutVsBfRw4YWUx"
+VIDEOCHAT_INVITE_URLS = {
+    "cxhotgochat": "https://t.me/CXHOTGOChat?videochat=a627e2ca16ca8e697d",
+}
 MY_USER = GROUP_ADMIN_CONTACT_URL.rsplit("/", 1)[-1]
 BOT_PAGO = "@CaciqueXmembot"
 WEBHOOK_PATH = "/telegram-webhook"
@@ -43,6 +47,9 @@ CONFIG_LOCK = threading.RLock()
 PAYMENT_CONFIG_FILE = os.path.join(BASE_DIR, "payment_config.json")
 PAYMENT_CONFIG_LOCK = threading.RLock()
 db = TinyDB(os.path.join(BASE_DIR, "usuarios.json"))
+FreeGoldPasses = db.table("free_goldpass")
+FREE_GOLDPASS_QUERY = Query()
+FREE_GOLDPASS_LOCK = threading.RLock()
 PANELES_PRIVADOS = db.table("paneles_privados")
 TECLADOS_PRIVADOS = db.table("teclados_privados")
 PANEL_QUERY = Query()
@@ -53,6 +60,7 @@ solicitudes_info = {}
 user_data = {}
 ID_ULTIMA_INVITACION = {}
 ULTIMOS_MSGS = {'reglas': None, 'admin': None, 'menu': None, 'compartir': None, 'start': None, 'reportar': None, 'anon': None}
+PANELES_GRUPO_MIEMBRO = {}
 reporte_msgs = {}
 BUSINESS_WELCOME_FILE = os.path.join(BASE_DIR, "business_welcome_users.json")
 BUSINESS_WELCOME_LOCK = threading.RLock()
@@ -77,11 +85,46 @@ Config = TinyDB(os.path.join(BASE_DIR, "group_rules.json"))
 Blacklist = TinyDB(os.path.join(BASE_DIR, "blacklist.json"))
 UltimaPromo = TinyDB(os.path.join(BASE_DIR, "ultima_promo.json"))
 Warnings = TinyDB(os.path.join(BASE_DIR, "warnings.json"))
+GroupReports = TinyDB(os.path.join(BASE_DIR, "group_reports.json"))
+GroupModerationLog = TinyDB(os.path.join(BASE_DIR, "group_moderation_log.json"))
+GroupBannedWords = TinyDB(os.path.join(BASE_DIR, "group_banned_words.json")).table("words")
 PromosAprobadas = TinyDB(os.path.join(BASE_DIR, "promos_aprobadas.json"))
 RegistroActividad = TinyDB(os.path.join(BASE_DIR, "registro_actividad.json"))
 Suscripciones = TinyDB(os.path.join(BASE_DIR, "suscripciones.json"))
 Estadisticas = TinyDB(os.path.join(BASE_DIR, "stats.json"))
 User = Query()
+
+DEFAULT_PROHIBITED_WORD_GROUPS = (
+    ("Abuso sexual infantil", (
+        "cp", "pedofilia", "pedofilo", "paidofilia", "pedophile", "pedo",
+        "cp link", "cp telegram", "lolita", "loli", "p3do", "p3dofilia",
+        "p*do", "niñas", "niños", "menores", "underage", "preteen",
+        "toddler", "child", "childporn", "childpornography", "csam", "csae",
+        "infantil", "schoolgirl", "kinder",
+    )),
+    ("Bestialismo y zoofilia", (
+        "zoofilia", "zoofilico", "zoophilia", "bestialismo", "bestiality",
+        "zoo", "zooporn", "animales", "perros", "caballos", "zoo video",
+    )),
+    ("Violencia extrema, gore y mutilación", (
+        "gore", "snuff", "decapitacion", "decapitado", "mutilacion",
+        "tortura", "torture", "asesinato", "murder", "sangre extrema",
+        "dismemberment", "execution", "ejecucion", "cartel gore", "suicidio",
+        "suicide", "autolesion", "cutters",
+    )),
+    ("Abuso, no consensual y necrofilia", (
+        "necrofilia", "necro", "necrophilia", "cadáver", "cadaver", "corpse",
+        "violacion", "rape", "forced", "forzado", "sin consentimiento",
+        "non consensual", "drogada", "unconscious", "inconsciente",
+    )),
+    ("Estafas, spam y material ilegal adicional", (
+        "carding", "bins", "cc", "clonadas", "drogas", "drugs",
+        "venta de armas", "weapons", "hitman", "sicario",
+    )),
+)
+_PROHIBITED_WORDS_READY = set()
+_PROHIBITED_WORDS_CACHE = {}
+_PROHIBITED_WORDS_DESTINATION_CACHE = {}
 
 @app.route("/", methods=["GET"])
 def home():
@@ -120,6 +163,9 @@ def actualizar_config(actualizar):
         cfg = cargar_config()
         actualizar(cfg)
         guardar_config(cfg)
+        _PROHIBITED_WORDS_DESTINATION_CACHE.clear()
+        _PROHIBITED_WORDS_READY.clear()
+        _PROHIBITED_WORDS_CACHE.clear()
         return cfg
 
 
@@ -144,13 +190,23 @@ COMANDOS_VALIDOS_PRIVADO = [
 
 # --- LIBRERÍA ESTÉTICA EXPANDIDA (FUEGO PURO) ---
 MSG_INVITACION_LARGO = (
-    "🏹 **HAS SIDO INVITADO AL TEMPLO DEL CACIQUE**\n\n"
+    "🏹 HAS SIDO INVITADO AL TEMPLO DEL CACIQUE\n\n"
     "Únete a la tribu más exclusiva de Telegram. Contenido único, las mejores fotos y "
     "videos de los guerreros más calientes de la tribu. 🔥\n\n"
     f"ÚNETE AQUÍ: {LINK_GRUPO}"
 )
-MSG_ENCODED = urllib.parse.quote(MSG_INVITACION_LARGO)
-LINK_SHARE = f"https://t.me/share/url?url={MSG_ENCODED}"
+MSG_INVITACION_TEXTO = (
+    "🏹 HAS SIDO INVITADO AL TEMPLO DEL CACIQUE\n\n"
+    "Únete a la tribu más exclusiva de Telegram. Contenido único, las mejores fotos y "
+    "videos de los guerreros más calientes de la tribu. 🔥\n\n"
+    "ÚNETE AQUÍ:"
+)
+MSG_ENCODED = urllib.parse.quote(MSG_INVITACION_TEXTO, safe="")
+LINK_SHARE = (
+    "https://t.me/share/url"
+    f"?url={urllib.parse.quote(LINK_GRUPO, safe='')}"
+    f"&text={MSG_ENCODED}"
+)
 TEXTOS_VC_HOT = [
     "🔥 **¡EL TEMPLO ESTÁ ARDIENDO!** 🔥\n¿Quieres acción real? Pincha el botón y entra al videochat, aquí mandas tú. 🔞",
     "😈 **¡ADRENALINA PURA EN VIVO!** 💦\nEntra ahora al videochat y mira lo que los guerreros tienen para ti. 🔥",
@@ -161,6 +217,31 @@ TEXTOS_VC_HOT = [
     "🔥 **¡SÓLO PARA VALIENTES!** 🔞\nEntra al videochat y descubre por qué somos la tribu más dominante. 💦"
 ]
 EMOJIS_ACCION = ["🚀", "🔥", "💦", "🔞", "🏹", "🔱", "🍑", "🍌", "💥", "🥵", "💎", "🛡️", "⚔️", "😈"]
+_indice_texto_vchat = 0
+_lock_texto_vchat = threading.Lock()
+
+DEFAULT_GROUP_RULES = (
+    "📜 REGLAMENTO DEL JUEGO 😈\n\n"
+    "Antes de soltar tus ganas, recuerda estas reglas:\n"
+    "1. 💬 Respeta a todos los miembros.\n"
+    "No se aceptan insultos, acoso, ni actitudes tóxicas. Aquí se viene a disfrutar, no a molestar.\n\n"
+    "2. 🚫 Cero contenido ilegal o prohibido.\n"
+    "Nada de pornografía infantil, zoofilia, violencia, incesto, ni nada fuera de la ley.\n"
+    "Esto es un espacio adulto, no un delito.\n\n"
+    "3. 📵 Sin spam ni publicidad externa.\n"
+    "Si quieres compartir algo, consulta primero con la administración.\n"
+    "Nadie vino aquí a ver tu link de criptos ni tu grupo copia 😅\n\n"
+    "4. 🧠 Consentimiento y buen gusto.\n"
+    "Si alguien dice “no”, se respeta.\n"
+    "Jugar no significa cruzar límites.\n\n"
+    "5. 🤖 Nada de bots, cuentas falsas ni robo de contenido.\n"
+    "Si lo haces, serás eliminado más rápido de lo que dura un suspiro.\n\n"
+    "6. 😏 Participa con actitud.\n"
+    "Sé amable, sé divertido/a, sé tú pero recuerda: lo sexy también puede ser educado.\n\n"
+    "✨ Cumple las reglas y disfruta del juego.\n"
+    "El placer es más intenso cuando hay límites claros.\n\n"
+    "🛡️ Administración del Grupo GRAN JEFE"
+)
 
 def eliminar_mensaje_seguro(chat_id, message_id):
     try:
@@ -322,43 +403,232 @@ def registrar_actividad_stats(user_id, username):
     else:
         Estadisticas.insert({'id': user_id, 'username': username, 'puntos': 1, 'last_seen': str(datetime.now())})
 
-def aplicar_castigo(chat_id, user_id, nombre):
-    stats = Warnings.search(User.id == user_id)
-    count = stats[0]['count'] + 1 if stats else 1
+def _usuario_en_lista_negra(user_id, chat_id=None):
+    registros = Blacklist.search(User.id == int(user_id))
+    for registro in registros:
+        if registro.get("status", "active") != "active":
+            continue
+        alcance = registro.get("chat_id")
+        if not alcance and (
+            chat_id is None or str(chat_id) == str(GRUPO_ID)
+        ):
+            return True
+        if alcance and chat_id is not None and str(alcance) == str(chat_id):
+            return True
+    return False
+
+
+def _advertencias_usuario(chat_id, user_id):
+    registros = Warnings.search(User.id == int(user_id))
+    salida = []
+    for registro in registros:
+        alcance = registro.get("chat_id")
+        if alcance is None:
+            # Los registros del ZIP anterior solo pueden asociarse al grupo
+            # principal que usaba aquella versión.
+            if str(chat_id) == str(GRUPO_ID):
+                salida.append(registro)
+        elif str(alcance) == str(chat_id):
+            salida.append(registro)
+    return salida
+
+
+def _registrar_accion_moderacion(
+    chat_id,
+    user_id,
+    nombre,
+    accion,
+    count,
+    reporter_id=None,
+    evidence_doc_id=None,
+    reason=None,
+):
+    momento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    motivo = str(reason or (
+        "Reporte de miembro" if reporter_id else "Moderación automática"
+    ))
+    GroupModerationLog.insert({
+        "chat_id": str(chat_id),
+        "user_id": int(user_id),
+        "username": str(nombre or ""),
+        "action": accion,
+        "count": int(count),
+        "reporter_id": int(reporter_id) if reporter_id else None,
+        "evidence_doc_id": evidence_doc_id,
+        "reason": motivo,
+        "date": momento,
+    })
+    if reporter_id:
+        GroupReports.insert({
+            "chat_id": str(chat_id),
+            "reporter_id": int(reporter_id),
+            "reported_user_id": int(user_id),
+            "reported_username": str(nombre or ""),
+            "action": accion,
+            "count": int(count),
+            "evidence_doc_id": evidence_doc_id,
+            "reason": motivo,
+            "date": momento,
+        })
+
+
+def _destino_key_por_chat_id(chat_id):
+    cid = str(chat_id)
+    cfg = cargar_config()
+    for key, destino in cfg.get("destinos", {}).items():
+        if isinstance(destino, dict) and str(destino.get("chat_id")) == cid:
+            return key
+    if cid in cfg.get("group_settings", {}):
+        return f"group:{cid}"
+    return None
+
+
+def aplicar_castigo(
+    chat_id, user_id, nombre, reporter_id=None, evidence=None, reason=None
+):
+    chat_id, user_id = int(chat_id), int(user_id)
+    stats = _advertencias_usuario(chat_id, user_id)
+    anterior = stats[-1] if stats else None
+    count = int(anterior.get("count", 0)) + 1 if anterior else 1
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    motivo = str(reason or (
+        "Reporte de miembro" if reporter_id else "Moderación automática"
+    ))
+
     if count >= 3:
         try:
-            bot.kick_chat_member(chat_id, user_id)
-            bot.send_message(
+            bot.ban_chat_member(chat_id, user_id)
+        except Exception:
+            app.logger.exception(
+                "No se pudo expulsar al usuario %s del grupo %s.",
+                user_id,
                 chat_id,
-                f"🪓 **SENTENCIA FINAL**\n"
-                f"El guerrero @{nombre} ha acumulado 3 penalizaciones y ha sido expulsado permanentemente de la tribu."
             )
-            markup = types.InlineKeyboardMarkup().add(
-                types.InlineKeyboardButton("🔓 PERDONAR", callback_data=f"indulto_{user_id}")
-            )
-            bot.send_message(ADMIN_ID, f"🚩 **EXPULSIÓN EJECUTADA**\nUsuario: @{nombre}\nID: {user_id}", reply_markup=markup)
-            Warnings.remove(User.id == user_id)
-            return
-        except:
-            pass
-    else:
-        until_date = int(time.time()) + (35 * 60)
-        try:
-            bot.restrict_chat_member(chat_id, user_id, until_date=until_date, can_send_messages=False)
-        except:
-            pass
-        if stats:
-            Warnings.update({'count': count, 'last_warn': str(datetime.now())}, User.id == user_id)
+            accion = "ban_failed"
         else:
-            Warnings.insert({'id': user_id, 'username': nombre, 'count': count, 'last_warn': str(datetime.now())})
-        bot.send_message(
+            accion = "ban"
+            existentes = [
+                registro for registro in Blacklist.search(User.id == user_id)
+                if str(registro.get("chat_id", "")) == str(chat_id)
+            ]
+            datos_lista = {
+                "id": user_id,
+                "chat_id": str(chat_id),
+                "username": str(nombre or ""),
+                "reason": f"Tres sanciones: {motivo}",
+                "date": ahora,
+                "status": "active",
+            }
+            if existentes:
+                Blacklist.update(datos_lista, doc_ids=[existentes[-1].doc_id])
+            else:
+                Blacklist.insert(datos_lista)
+            if anterior:
+                try:
+                    Warnings.remove(doc_ids=[anterior.doc_id])
+                except Exception:
+                    app.logger.exception("No se pudo cerrar el contador de advertencias.")
+
+        _registrar_accion_moderacion(
             chat_id,
-            f"⚠️ **ADVERTENCIA OFICIAL — PENALIZACIÓN {count}/3**\n\n"
-            f"Guerrero @{nombre}, has sido reportado por conducta inapropiada. "
-            f"Tienes {3 - count} advertencia(s) restante(s). "
-            f"A la tercera serás expulsado permanentemente de la tribu. 🏹\n\n"
-            f"_Silenciado por 35 minutos._"
+            user_id,
+            nombre,
+            accion,
+            count,
+            reporter_id,
+            getattr(evidence, "doc_id", None),
+            motivo,
         )
+        if accion == "ban":
+            dest_key = _destino_key_por_chat_id(chat_id)
+            markup = None
+            if dest_key:
+                markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+                    "🔓 Reingresar (2/3)",
+                    callback_data=f"mod_perdonar|{dest_key}|{chat_id}|{user_id}",
+                ))
+            try:
+                bot.send_message(
+                    int(ADMIN_ID),
+                    "🚩 <b>EXPULSIÓN EJECUTADA</b>\n"
+                    f"Grupo: <code>{chat_id}</code>\n"
+                    f"Usuario: @{html.escape(str(nombre or 'sin_usuario'))}\n"
+                    f"ID: <code>{user_id}</code>\n\n"
+                    f"Motivo: {html.escape(motivo)}\n\n"
+                    "La sanción y la notificación del bot se mantienen privadas.",
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    protect_content=True,
+                )
+            except Exception:
+                app.logger.exception("No se pudo avisar al administrador de la expulsión.")
+        mensaje_reporte = (
+            f"✅ Tu reporte sobre @{nombre} fue revisado y el usuario fue expulsado."
+            if accion == "ban"
+            else (
+                f"⚠️ Se registró tu reporte sobre @{nombre}, pero Telegram no permitió "
+                "aplicar la expulsión. El administrador podrá revisarlo."
+            )
+        )
+    else:
+        silenciado = False
+        try:
+            bot.restrict_chat_member(
+                chat_id,
+                user_id,
+                until_date=int(time.time()) + (35 * 60),
+                can_send_messages=False,
+            )
+            silenciado = True
+        except Exception:
+            app.logger.exception(
+                "No se pudo silenciar al usuario %s en el grupo %s.",
+                user_id,
+                chat_id,
+            )
+        accion = "mute" if silenciado else "warning"
+        datos_warning = {
+            "id": user_id,
+            "chat_id": str(chat_id),
+            "username": str(nombre or ""),
+            "count": count,
+            "last_warn": ahora,
+            "reason": motivo,
+        }
+        if anterior:
+            Warnings.update(datos_warning, doc_ids=[anterior.doc_id])
+        else:
+            Warnings.insert(datos_warning)
+        _registrar_accion_moderacion(
+            chat_id,
+            user_id,
+            nombre,
+            accion,
+            count,
+            reporter_id,
+            getattr(evidence, "doc_id", None),
+            motivo,
+        )
+        mensaje_reporte = (
+            f"✅ Tu reporte sobre @{nombre} fue registrado como sanción "
+            f"{count}/3. El grupo no recibió una notificación pública."
+            if silenciado
+            else f"✅ Tu reporte sobre @{nombre} quedó registrado para revisión."
+        )
+
+    if reporter_id:
+        try:
+            bot.send_message(
+                int(reporter_id),
+                mensaje_reporte,
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.info(
+                "No se pudo enviar la confirmación privada del reporte a %s.",
+                reporter_id,
+            )
+    return {"action": accion, "count": count}
 
 def cerrar_sesion_segura(chat_id):
     markup = types.ReplyKeyboardRemove()
@@ -369,6 +639,7 @@ def guardar_evidencia(message):
         return
     evidencia = {
         'id': message.from_user.id,
+        'chat_id': str(message.chat.id),
         'uname': (message.from_user.username or "Anonimo").lower(),
         'msg_id': message.message_id,
         'date': str(datetime.now()),
@@ -380,7 +651,8 @@ def guardar_evidencia(message):
         evidencia['file_id'] = message.photo[-1].file_id
     if message.video:
         evidencia['file_id'] = message.video.file_id
-    RegistroActividad.insert(evidencia)
+    evidence_doc_id = RegistroActividad.insert(evidencia)
+    return RegistroActividad.get(doc_id=evidence_doc_id)
 
 def obtener_teclado_cuadritos():
     markup = types.ReplyKeyboardMarkup(
@@ -414,25 +686,47 @@ def _videochat_guide_url(chat_id):
     try:
         chat=bot.get_chat(chat_id)
         username=getattr(chat,"username",None)
-        if username: return f"https://t.me/{username}?videochat"
+        if username and str(username).lower() in VIDEOCHAT_INVITE_URLS:
+            return VIDEOCHAT_INVITE_URLS[str(username).lower()]
+        if username: return f"https://t.me/{username}"
+        invite_link=getattr(chat,"invite_link",None)
+        if invite_link: return invite_link
     except Exception:
-        app.logger.info("El grupo no tiene un enlace público de videochat disponible.")
-    return LINK_GRUPO
-
-def enviar_invitacion_vchat(chat_id):
-    global ID_ULTIMA_INVITACION
-    if ID_ULTIMA_INVITACION.get(chat_id):
-        eliminar_mensaje_seguro(chat_id, ID_ULTIMA_INVITACION[chat_id])
-    msg_random = random.choice(TEXTOS_VC_HOT)
-    e1, e2 = random.sample(EMOJIS_ACCION, 2)
-    markup = types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton(f"{e1} ENTRAR AL VIDEOCHAT {e2}", url=_videochat_guide_url(chat_id))
-    )
+        app.logger.info("No se pudo obtener el enlace del grupo para la guía de videochat.")
     try:
-        nuevo_msg = bot.send_message(chat_id, msg_random, reply_markup=markup)
-        ID_ULTIMA_INVITACION[chat_id] = nuevo_msg.message_id
-    except:
+        if int(chat_id)==int(GRUPO_ID):
+            return LINK_GRUPO
+    except (NameError, TypeError, ValueError):
         pass
+    return None
+
+def enviar_invitacion_vchat(chat_id, destino_chat_id=None):
+    global _indice_texto_vchat
+    with _lock_texto_vchat:
+        msg_random = TEXTOS_VC_HOT[_indice_texto_vchat % len(TEXTOS_VC_HOT)]
+        _indice_texto_vchat += 1
+    e1, e2 = random.sample(EMOJIS_ACCION, 2)
+    url_grupo = _videochat_guide_url(destino_chat_id or chat_id)
+    markup = types.InlineKeyboardMarkup()
+    if url_grupo:
+        msg_random += (
+            "\n\nPulsa el botón para abrir el grupo y usa los controles de Telegram "
+            "para iniciar el videochat."
+        )
+        markup.add(types.InlineKeyboardButton(
+            f"{e1} ABRIR GRUPO / VIDEOCHAT {e2}",
+            url=url_grupo,
+        ))
+    else:
+        msg_random += (
+            "\n\nUsa los controles de llamada de Telegram en el grupo para iniciar "
+            "el videochat. El bot no tiene un enlace de acceso disponible para este grupo."
+        )
+    return editar_panel_miembro(
+        chat_id,
+        msg_random,
+        markup if url_grupo else None,
+    )
 
 def bucle_notificacion_menu():
     while True:
@@ -694,6 +988,19 @@ def cargar_config_pagos():
                 raise ValueError(
                     f"El campo privado de pagos {campo} no tiene el formato esperado."
                 )
+            # Migra en memoria el formato anterior (un texto por método) a una
+            # lista de opciones sin mostrar ni modificar los datos existentes.
+            for metodo, valores in list(datos[campo].items()):
+                if isinstance(valores, str):
+                    datos[campo][metodo] = [valores] if valores.strip() else []
+                elif isinstance(valores, list):
+                    datos[campo][metodo] = [
+                        valor.strip()
+                        for valor in valores
+                        if isinstance(valor, str) and valor.strip()
+                    ]
+                else:
+                    datos[campo][metodo] = []
         if datos.get("portada_file_id") is not None and not isinstance(
             datos.get("portada_file_id"), str
         ):
@@ -725,10 +1032,13 @@ def actualizar_config_pagos(actualizar):
 
 
 def obtener_datos_pago(metodo):
-    datos = cargar_config_pagos()
-    texto = str(datos.get("metodos", {}).get(metodo) or "").strip()
-    if not texto:
+    opciones = cargar_config_pagos().get("metodos", {}).get(metodo, [])
+    if isinstance(opciones, str):
+        opciones = [opciones] if opciones.strip() else []
+    opciones = [str(opcion).strip() for opcion in opciones if str(opcion).strip()]
+    if not opciones:
         return ""
+    texto = "\n\n────────────\n\n".join(opciones)
     if metodo not in METODOS_PAGO_POR_ENLACE and _AVISO.strip() not in texto:
         texto += _AVISO
     return texto
@@ -736,16 +1046,32 @@ def obtener_datos_pago(metodo):
 
 def obtener_mensaje_solicitud_enlace(metodo):
     guardados = cargar_config_pagos().get("mensajes_link", {})
-    texto = str(guardados.get(metodo) or "").strip()
-    return html.escape(texto) if texto else _MSG_LINK
+    textos = guardados.get(metodo, [])
+    if isinstance(textos, str):
+        textos = [textos] if textos.strip() else []
+    textos = [str(texto).strip() for texto in textos if str(texto).strip()]
+    return html.escape("\n\n────────────\n\n".join(textos)) if textos else _MSG_LINK
 
 
-def guardar_metodo_pago(metodo, texto):
+def guardar_metodo_pago(metodo, texto, reemplazar_indice=None):
     es_enlace = metodo in METODOS_PAGO_POR_ENLACE
     grupo = "mensajes_link" if es_enlace else "metodos"
 
     def actualizar(datos):
-        datos.setdefault(grupo, {})[metodo] = texto
+        opciones = datos.setdefault(grupo, {}).get(metodo, [])
+        if isinstance(opciones, str):
+            opciones = [opciones] if opciones.strip() else []
+        elif not isinstance(opciones, list):
+            opciones = []
+        opciones = [opcion for opcion in opciones if isinstance(opcion, str) and opcion.strip()]
+        if (
+            isinstance(reemplazar_indice, int)
+            and 0 <= reemplazar_indice < len(opciones)
+        ):
+            opciones[reemplazar_indice] = texto
+        else:
+            opciones.append(texto)
+        datos[grupo][metodo] = opciones
 
     actualizar_config_pagos(actualizar)
 
@@ -774,6 +1100,172 @@ _AVISO_LINK = (
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 PASE_EXPRES_URL = "https://t.me/+xjHnFXb_QTY0NGEx"
+FREE_GOLDPASS_DURATIONS = {
+    60: ("1 minuto", "1m"),
+    300: ("5 minutos", "5m"),
+    600: ("10 minutos", "10m"),
+    86400: ("24 horas", "24h"),
+    259200: ("72 horas", "72h"),
+}
+
+
+def free_goldpass_config():
+    cfg = cargar_config().get("free_goldpass", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def free_goldpass_activo():
+    return bool(free_goldpass_config().get("active"))
+
+
+def _formato_duracion_freepass(segundos):
+    return FREE_GOLDPASS_DURATIONS.get(int(segundos), ("duración no válida", ""))[0]
+
+
+def _fecha_freepass(registro):
+    try:
+        return datetime.strptime(str(registro.get("vence")), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _registro_freepass(user_id):
+    try:
+        with FREE_GOLDPASS_LOCK:
+            return FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == int(user_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _suscripcion_vip_activa(user_id):
+    registro = db.get(Query().id == int(user_id))
+    if not registro:
+        return None
+    vence = _fecha_freepass(registro)
+    return registro if vence and vence > datetime.now() else None
+
+
+def _editar_anuncio_freepass(config, texto):
+    chat_id = config.get("promo_chat_id")
+    message_id = config.get("promo_message_id")
+    if not chat_id or not message_id:
+        return
+    try:
+        bot.edit_message_text(
+            texto,
+            chat_id=chat_id,
+            message_id=message_id,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=types.InlineKeyboardMarkup(),
+        )
+    except Exception:
+        app.logger.exception("No se pudo cerrar el anuncio de Free Gold Pass.")
+
+
+def _cancelar_enlaces_pendientes_freepass(campaign_id):
+    with FREE_GOLDPASS_LOCK:
+        pendientes = [
+            dict(registro)
+            for registro in FreeGoldPasses.all()
+            if registro.get("status") == "pending"
+            and registro.get("campaign_id") == campaign_id
+        ]
+    for registro in pendientes:
+        invite_link = registro.get("invite_link")
+        if invite_link:
+            try:
+                bot.revoke_chat_invite_link(CANAL_ID, invite_link)
+            except Exception:
+                app.logger.exception(
+                    "No se pudo revocar un enlace pendiente de Free Gold Pass."
+                )
+        try:
+            with FREE_GOLDPASS_LOCK:
+                FreeGoldPasses.update(
+                    {
+                        "status": "cancelled",
+                        "cancelled_at": datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    },
+                    FREE_GOLDPASS_QUERY.id == int(registro.get("id")),
+                )
+        except (TypeError, ValueError):
+            app.logger.exception(
+                "No se pudo marcar como cancelado un pase pendiente."
+            )
+
+
+def _desactivar_free_goldpass(motivo, campaign_id=None):
+    estado = free_goldpass_config()
+    if not estado.get("active"):
+        return False
+    if campaign_id and estado.get("campaign_id") != campaign_id:
+        return False
+    actual = dict(estado)
+    actual.update({
+        "active": False,
+        "disabled_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "disabled_reason": motivo,
+    })
+    actualizar_config(lambda cfg: cfg.update({"free_goldpass": actual}))
+    _cancelar_enlaces_pendientes_freepass(actual.get("campaign_id"))
+    _editar_anuncio_freepass(
+        actual,
+        "⏰ <b>El pase gratuito GoldPass terminó.</b>\n\n"
+        "Los métodos de pago están disponibles nuevamente en el bot.",
+    )
+    return True
+
+
+def mostrar_menu_free_goldpass_usuario(chat_id, user_id, registro=None):
+    estado = free_goldpass_config()
+    duracion = _formato_duracion_freepass(
+        registro.get("duration_seconds")
+        if registro
+        else estado.get("duration_seconds", 0)
+    )
+    markup = types.InlineKeyboardMarkup()
+    if registro and registro.get("status") == "pending":
+        markup.add(types.InlineKeyboardButton(
+            "🎟️🏆 Entrar al canal GoldPass",
+            url=registro.get("invite_link"),
+        ))
+        texto = (
+            "🎟️🏆 <b>Tu pase gratuito GoldPass está listo.</b>\n\n"
+            f"Tu pase dura <b>{html.escape(duracion)}</b>. El tiempo empieza "
+            "cuando el bot apruebe tu entrada al canal; desde ahí se contará "
+            "tu acceso y, al terminar, el bot te retirará.\n\n"
+            "¡Disfrútalo! 🔥"
+        )
+    elif registro and registro.get("status") == "active":
+        vence = _fecha_freepass(registro)
+        fecha_txt = vence.strftime("%d/%m/%Y %H:%M") if vence else "la hora indicada"
+        texto = (
+            "🎟️🏆 <b>Tu pase gratuito GoldPass está activo.</b>\n\n"
+            f"Tu acceso termina el <b>{fecha_txt}</b>; después el bot te retirará "
+            "del canal. ¡Disfrútalo! 🔥"
+        )
+    else:
+        texto = (
+            "🎟️🏆 <b>Free Gold Pass disponible</b>\n\n"
+            f"Puedes solicitar un acceso gratuito por <b>{html.escape(duracion)}</b>. "
+            "El plazo comienza cuando se emite tu enlace; al vencer, el bot te "
+            "retirará del canal.\n\n"
+            "Pulsa el botón para recibir tu enlace personal. 🔥"
+        )
+        markup.add(types.InlineKeyboardButton(
+            "🎟️🏆 Iniciar Gold Pass",
+            callback_data="free_goldpass_claim",
+        ))
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        protect_content=True,
+        forzar_texto=True,
+    )
 
 def pase_expres_activo():
     """Devuelve True si el pase exprés está configurado y no ha vencido."""
@@ -786,7 +1278,41 @@ def pase_expres_activo():
         return False
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S') <= vence
 
-def mostrar_metodos_pago(chat_id):
+def mostrar_metodos_pago(chat_id, aviso=None):
+    promocion_activa = free_goldpass_activo()
+    try:
+        user_id = int(chat_id)
+    except (TypeError, ValueError):
+        user_id = 0
+    if user_id > 0:
+        pase_personal = _registro_freepass(user_id)
+        if pase_personal and pase_personal.get("status") in ("pending", "active"):
+            vence = _fecha_freepass(pase_personal)
+            if vence and vence <= datetime.now():
+                procesar_vencimiento_freepass(pase_personal)
+                return
+            return mostrar_menu_free_goldpass_usuario(
+                chat_id, user_id, registro=pase_personal
+            )
+        suscripcion = (
+            _suscripcion_vip_activa(user_id)
+            if promocion_activa
+            else None
+        )
+        if suscripcion:
+            vence = _fecha_freepass(suscripcion)
+            fecha_txt = vence.strftime("%d/%m/%Y %H:%M") if vence else "la fecha registrada"
+            return editar_o_enviar_panel(
+                chat_id,
+                "✅ <b>Tu acceso GoldPass ya está activo.</b>\n\n"
+                f"Tu suscripción está vigente hasta <b>{fecha_txt}</b>.",
+                types.InlineKeyboardMarkup(),
+                protect_content=True,
+                forzar_texto=True,
+            )
+    if promocion_activa:
+        return mostrar_menu_free_goldpass_usuario(chat_id, user_id)
+
     markup = types.InlineKeyboardMarkup(row_width=2)
 
     # Pase Exprés gratuito (solo cuando está activo)
@@ -822,6 +1348,8 @@ def mostrar_metodos_pago(chat_id):
             "👑 <b>COSTO DE ACCESO: $1.99 USD</b>\n\n"
             "Selecciona tu método de pago preferido 👇"
         )
+    if aviso:
+        texto = f"ℹ️ {html.escape(aviso)}\n\n{texto}"
     photo_id = cargar_config_pagos().get("portada_file_id")
     if photo_id:
         try:
@@ -854,33 +1382,82 @@ def mostrar_metodos_pago(chat_id):
 
 
 def markup_admin_config_pagos():
+    estado_free = "ACTIVADO" if free_goldpass_activo() else "DESACTIVADO"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "💳 Métodos de pago",
+            callback_data="admin_pagos_metodos",
+        ),
+        types.InlineKeyboardButton(
+            "🖼️ Cambiar foto del menú",
+            callback_data="admin_pagos_cambiar_foto",
+        ),
+        types.InlineKeyboardButton(
+            f"🎟️ Free Gold Pass · {estado_free}",
+            callback_data="admin_free_goldpass",
+        ),
+        types.InlineKeyboardButton(
+            "🔙 Volver al panel",
+            callback_data="admin_pagos_volver",
+        ),
+    )
+    return markup
+
+
+def markup_lista_metodos_pago():
     config_pagos = cargar_config_pagos()
     markup = types.InlineKeyboardMarkup(row_width=1)
     for metodo, nombre in NOMBRE_METODO.items():
-        if metodo in METODOS_PAGO_POR_ENLACE:
-            configurado = bool(
-                config_pagos.get("mensajes_link", {}).get(metodo) or _MSG_LINK
-            )
-        else:
-            configurado = bool(config_pagos.get("metodos", {}).get(metodo))
-        estado = "✅" if configurado else "⚠️"
+        campo = "mensajes_link" if metodo in METODOS_PAGO_POR_ENLACE else "metodos"
+        opciones = config_pagos.get(campo, {}).get(metodo, [])
+        if isinstance(opciones, str):
+            opciones = [opciones] if opciones.strip() else []
+        cantidad = len(opciones)
+        estado = "✅" if cantidad else "⚠️"
+        etiqueta = f"{estado} {nombre}"
+        if cantidad:
+            etiqueta += f" · {cantidad} opción{'es' if cantidad != 1 else ''}"
+        elif metodo in METODOS_PAGO_POR_ENLACE:
+            etiqueta += " · predeterminado"
         markup.add(types.InlineKeyboardButton(
-            f"{estado} {nombre}",
+            etiqueta,
             callback_data=f"admin_pagos_metodo|{metodo}",
         ))
     markup.add(types.InlineKeyboardButton(
-        "🖼️ Cambiar foto del menú",
-        callback_data="admin_pagos_cambiar_foto",
+        "🔙 Volver",
+        callback_data="admin_pagos_metodos_volver",
     ))
-    if config_pagos.get("portada_file_id"):
+    return markup
+
+
+def _opciones_guardadas_pago(metodo):
+    config_pagos = cargar_config_pagos()
+    campo = "mensajes_link" if metodo in METODOS_PAGO_POR_ENLACE else "metodos"
+    opciones = config_pagos.get(campo, {}).get(metodo, [])
+    if isinstance(opciones, str):
+        opciones = [opciones] if opciones.strip() else []
+    return [opcion for opcion in opciones if isinstance(opcion, str) and opcion.strip()]
+
+
+def markup_opciones_metodo_pago(metodo):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    cantidad = len(_opciones_guardadas_pago(metodo))
+    for indice in range(cantidad):
         markup.add(types.InlineKeyboardButton(
-            "♻️ Usar la foto original",
-            callback_data="admin_pagos_foto_original",
+            f"✏️ Actualizar opción {indice + 1}",
+            callback_data=f"admin_pagos_actualizar|{metodo}|{indice}",
         ))
-    markup.add(types.InlineKeyboardButton(
-        "🔙 Volver al panel",
-        callback_data="admin_pagos_volver",
-    ))
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Agregar otro pago",
+            callback_data=f"admin_pagos_agregar|{metodo}",
+        ),
+        types.InlineKeyboardButton(
+            "🔙 Volver",
+            callback_data="admin_pagos_metodos",
+        ),
+    )
     return markup
 
 
@@ -888,6 +1465,7 @@ def mostrar_admin_config_pagos(
     chat_id, message=None, message_id=None, aviso=None
 ):
     config_pagos = cargar_config_pagos()
+    estado_free = free_goldpass_config()
     portada = (
         "personalizada"
         if config_pagos.get("portada_file_id")
@@ -895,11 +1473,12 @@ def mostrar_admin_config_pagos(
     )
     texto = (
         "💳 <b>Métodos de pago e imagen</b>\n\n"
-        "Selecciona un método para reemplazar su información. "
-        "Los datos no se muestran en esta pantalla.\n"
-        "En los métodos por enlace se cambia el mensaje que recibe el usuario "
-        "al solicitarlo.\n\n"
+        "Administra por separado los métodos de pago y la imagen de este menú. "
+        "El texto de pago guardado no se muestra en los paneles.\n\n"
         f"Foto del menú: <b>{portada}</b>.\n"
+        "Free Gold Pass: <b>"
+        + ("activado" if estado_free.get("active") else "desactivado")
+        + "</b>.\n"
         "Las imágenes y los mensajes de pago enviados por el bot usarán "
         "la protección de contenido de Telegram."
     )
@@ -911,7 +1490,263 @@ def mostrar_admin_config_pagos(
         markup_admin_config_pagos(),
         message=message,
         message_id=message_id,
+        protect_content=True,
         forzar_texto=True,
+    )
+
+
+def markup_admin_free_goldpass():
+    estado = free_goldpass_config()
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    if estado.get("active"):
+        markup.add(
+            types.InlineKeyboardButton(
+                "⛔ Cancelar Free Gold Pass",
+                callback_data="admin_free_goldpass_disable",
+            ),
+            types.InlineKeyboardButton(
+                "🔙 Volver",
+                callback_data="admin_free_goldpass_back",
+            ),
+        )
+    else:
+        for segundos, (etiqueta, _) in FREE_GOLDPASS_DURATIONS.items():
+            markup.add(types.InlineKeyboardButton(
+                etiqueta,
+                callback_data=f"admin_free_goldpass_enable|{segundos}",
+            ))
+        markup.add(types.InlineKeyboardButton(
+            "🔙 Volver a métodos de pago",
+            callback_data="admin_free_goldpass_back",
+        ))
+    return markup
+
+
+def mostrar_admin_free_goldpass(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    estado = free_goldpass_config()
+    if estado.get("active"):
+        duracion = html.escape(
+            _formato_duracion_freepass(estado.get("duration_seconds", 0))
+        )
+        texto = (
+            "🎟️ <b>Free Gold Pass · ACTIVADO</b>\n\n"
+            "Los métodos de pago se ocultan para todos mientras esta promoción "
+            "esté activa. Cada pase empieza a contar cuando el bot aprueba la "
+            "entrada de esa persona al canal.\n"
+            f"Duración por persona: <b>{duracion}</b>.\n"
+            "Al vencer el primer pase admitido, la promoción se desactivará "
+            "automáticamente; los pases activos conservarán su vencimiento. "
+            "Si cancelas ahora, se restauran los métodos de pago y se revocan "
+            "los enlaces pendientes; quienes ya entraron conservan su tiempo."
+        )
+    else:
+        texto = (
+            "🎟️ <b>Free Gold Pass · DESACTIVADO</b>\n\n"
+            "Al activarlo, sustituirá los métodos de pago para todos y publicará "
+            "un anuncio en el canal gratuito. Cada persona recibirá un enlace "
+            "individual; el plazo comenzará cuando el bot apruebe su entrada "
+            "al canal privado.\n"
+            "Cuando venza el primer pase, se desactivará para todos y volverán "
+            "los métodos de pago."
+        )
+    if aviso:
+        texto = f"ℹ️ {html.escape(aviso)}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup_admin_free_goldpass(),
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def activar_free_goldpass(segundos):
+    if segundos not in FREE_GOLDPASS_DURATIONS:
+        raise ValueError("La duración seleccionada no está permitida.")
+    if free_goldpass_activo():
+        return free_goldpass_config()
+
+    bot_info = bot.get_me()
+    miembro_goldpass = bot.get_chat_member(CANAL_ID, bot_info.id)
+    if getattr(miembro_goldpass, "status", None) != "administrator":
+        raise RuntimeError(
+            "En el canal privado GoldPass el bot debe ser administrador."
+        )
+    if not getattr(miembro_goldpass, "can_invite_users", False):
+        raise RuntimeError(
+            "En el canal privado GoldPass activa para este bot "
+            "«Invitar usuarios mediante enlace» o «Añadir suscriptores»."
+        )
+    if not getattr(miembro_goldpass, "can_restrict_members", False):
+        raise RuntimeError(
+            "En el canal privado GoldPass activa para este bot "
+            "«Expulsar usuarios»; es necesario para retirar a cada persona "
+            "cuando venza su pase."
+        )
+    canal = bot.get_chat(FREE_GOLDPASS_PROMO_CHAT_ID)
+    if getattr(canal, "type", None) != "channel":
+        raise RuntimeError(
+            "El destino configurado para el anuncio no es un canal de Telegram."
+        )
+    miembro_canal = bot.get_chat_member(canal.id, bot_info.id)
+    if (
+        getattr(miembro_canal, "status", None) != "administrator"
+        or not getattr(miembro_canal, "can_post_messages", False)
+    ):
+        raise RuntimeError(
+            "En el canal gratuito el bot debe ser administrador con permiso "
+            "para publicar mensajes."
+        )
+
+    etiqueta = _formato_duracion_freepass(segundos)
+    url_bot = f"https://t.me/{bot_info.username}?start=free_goldpass"
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🎟️🏆 Reclamar Free Gold Pass",
+            url=url_bot,
+        )
+    )
+    texto = (
+        "🏹🔥 <b>¡Porque eres uno de los mejores guerreros de mi tribu, "
+        "te regalo un pase gratis!</b> 🔥🏹\n\n"
+        "Accede por tiempo limitado a GoldPass, con contenido explícito para "
+        "adultos. 🎟️💎\n\n"
+        f"Tu pase durará <b>{html.escape(etiqueta)}</b> desde que el bot "
+        "apruebe tu entrada al canal privado.\n"
+        "¿Qué esperas? Reclámalo ahora y disfrútalo. ⏳✨"
+    )
+    anuncio = bot.send_message(
+        canal.id,
+        texto,
+        parse_mode="HTML",
+        reply_markup=markup,
+        disable_web_page_preview=True,
+        protect_content=True,
+    )
+    nuevo_estado = {
+        "active": True,
+        "duration_seconds": int(segundos),
+        "campaign_id": uuid.uuid4().hex,
+        "promo_chat_id": str(canal.id),
+        "promo_message_id": anuncio.message_id,
+        "activated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        actualizar_config(
+            lambda cfg: cfg.update({"free_goldpass": nuevo_estado})
+        )
+    except Exception:
+        try:
+            bot.delete_message(canal.id, anuncio.message_id)
+        except Exception:
+            app.logger.exception(
+                "No se pudo retirar el anuncio tras fallar el guardado."
+            )
+        raise
+    return nuevo_estado
+
+
+def mostrar_lista_metodos_pago(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    texto = (
+        "💳 <b>Métodos de pago</b>\n\n"
+        "Selecciona un método para consultar cuántas opciones tiene o agregar "
+        "otra. El contenido de pago se mantiene oculto en este panel."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup_lista_metodos_pago(),
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def mostrar_opciones_metodo_pago(
+    chat_id, metodo, message=None, message_id=None, aviso=None
+):
+    cantidad = len(_opciones_guardadas_pago(metodo))
+    nombre = html.escape(NOMBRE_METODO.get(metodo, metodo))
+    texto = f"💳 <b>{nombre}</b>\n\n"
+    if cantidad:
+        texto += (
+            f"Hay <b>{cantidad}</b> opción{'es' if cantidad != 1 else ''} "
+            "guardada(s). Por privacidad no se muestra su contenido aquí."
+        )
+    elif metodo in METODOS_PAGO_POR_ENLACE:
+        texto += "Se usará el mensaje predeterminado hasta que agregues una opción."
+    else:
+        texto += "Todavía no hay datos configurados para este método."
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup_opciones_metodo_pago(metodo),
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def mostrar_foto_pago_actual(chat_id, message=None, message_id=None, aviso=None):
+    config_pagos = cargar_config_pagos()
+    texto = (
+        "🖼️ <b>Cambiar la foto del menú de pago</b>\n\n"
+        "Esta es la foto que verán los usuarios al elegir cómo pagar. "
+        "Pulsa «Agregar foto» para enviar la nueva imagen; se guardará como foto."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Agregar foto",
+            callback_data="admin_pagos_foto_subir",
+        ),
+        types.InlineKeyboardButton(
+            "🔙 Volver",
+            callback_data="admin_pagos",
+        ),
+    )
+    if config_pagos.get("portada_file_id"):
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Usar foto original",
+            callback_data="admin_pagos_foto_original",
+        ))
+
+    foto_actual = config_pagos.get("portada_file_id")
+    if not foto_actual:
+        foto_actual = os.path.join(BASE_DIR, "portada.jpg")
+        if not os.path.isfile(foto_actual):
+            return editar_o_enviar_panel(
+                chat_id, texto, markup, message=message, message_id=message_id,
+                protect_content=True, forzar_texto=True,
+            )
+    if hasattr(foto_actual, "read"):
+        return enviar_foto_panel(
+            chat_id, foto_actual, texto, markup, forzar_reemplazo=True
+        )
+    if isinstance(foto_actual, str) and os.path.isfile(foto_actual):
+        try:
+            with open(foto_actual, "rb") as foto:
+                return enviar_foto_panel(
+                    chat_id, foto, texto, markup, forzar_reemplazo=True
+                )
+        except OSError:
+            app.logger.exception("No se pudo abrir la foto local del menú de pagos.")
+    return enviar_foto_panel(
+        chat_id, foto_actual, texto, markup, forzar_reemplazo=True
     )
 
 
@@ -936,6 +1771,105 @@ def admin_menu_config_pagos(call):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == "admin_free_goldpass")
+def admin_abrir_free_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_admin_free_goldpass(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_free_goldpass_back"
+)
+def admin_volver_free_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_admin_config_pagos(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_free_goldpass_enable|")
+)
+def admin_activar_free_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        segundos = int(call.data.split("|", 1)[1])
+        activar_free_goldpass(segundos)
+    except Exception as error:
+        app.logger.exception("No se pudo activar Free Gold Pass.")
+        mensaje = str(error)
+        bot.answer_callback_query(
+            call.id,
+            mensaje[:190] or "No se pudo activar Free Gold Pass.",
+            show_alert=True,
+        )
+        mostrar_admin_free_goldpass(
+            call.message.chat.id,
+            message=call.message,
+            aviso="No se activó; revisa los permisos de administración e inténtalo otra vez.",
+        )
+        return
+    bot.answer_callback_query(call.id, "Free Gold Pass activado.")
+    mostrar_admin_free_goldpass(
+        call.message.chat.id,
+        message=call.message,
+        aviso="Activado; el anuncio ya se publicó en el canal gratuito.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_free_goldpass_disable"
+)
+def admin_desactivar_free_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    desactivado = _desactivar_free_goldpass("admin")
+    bot.answer_callback_query(
+        call.id,
+        "Promoción desactivada." if desactivado else "Ya estaba desactivada.",
+    )
+    mostrar_admin_free_goldpass(
+        call.message.chat.id,
+        message=call.message,
+        aviso="Los métodos de pago vuelven a estar disponibles para nuevas solicitudes.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_pagos_metodos"
+)
+def admin_lista_metodos_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_lista_metodos_pago(call.message.chat.id, message=call.message)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_pagos_metodos_volver"
+)
+def admin_pagos_metodos_volver(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_admin_config_pagos(call.message.chat.id, message=call.message)
+
+
 @bot.callback_query_handler(
     func=lambda call: call.data.startswith("admin_pagos_metodo|")
 )
@@ -948,9 +1882,29 @@ def admin_editar_metodo_pago(call):
         bot.answer_callback_query(call.id, "No encontré ese método.")
         return
     bot.answer_callback_query(call.id)
+    mostrar_opciones_metodo_pago(
+        call.message.chat.id,
+        metodo,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_pagos_agregar|")
+)
+def admin_agregar_opcion_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    metodo = call.data.split("|", 1)[1]
+    if metodo not in NOMBRE_METODO:
+        bot.answer_callback_query(call.id, "No encontré ese método.")
+        return
+    bot.answer_callback_query(call.id)
     admin_estado[call.from_user.id] = {
         "paso": "esperando_datos_metodo_pago",
         "metodo_pago": metodo,
+        "reemplazar_indice": None,
         "panel_message_id": call.message.message_id,
     }
     if metodo in METODOS_PAGO_POR_ENLACE:
@@ -959,20 +1913,62 @@ def admin_editar_metodo_pago(call):
         )
     else:
         instruccion = (
-            "Envía toda la información de pago que el administrador copiará "
-            "para compartir con el usuario."
+            "Envía la información de pago que el administrador copiará "
+            "para compartir con el usuario. Envíala completa en un solo mensaje."
         )
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
-        "❌ Cancelar",
+        "🔙 Volver",
         callback_data="admin_pagos_cancelar",
     ))
     editar_o_enviar_panel(
         call.message.chat.id,
-        f"✍️ <b>Actualizar {html.escape(NOMBRE_METODO[metodo])}</b>\n\n"
+        f"✍️ <b>Agregar otra opción de {html.escape(NOMBRE_METODO[metodo])}</b>\n\n"
         f"{instruccion}\n\n"
-        "Envía el texto completo en un solo mensaje. No se mostrará de vuelta "
-        "en el panel y el mensaje que envíes se borrará después de guardarlo.",
+        "No se mostrará el contenido en el panel. El mensaje que envíes se "
+        "borrará después de guardarlo.",
+        markup,
+        message=call.message,
+        protect_content=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_pagos_actualizar|")
+)
+def admin_actualizar_opcion_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, metodo, raw_indice = call.data.split("|", 2)
+        indice = int(raw_indice)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Opción no válida.")
+        return
+    opciones = _opciones_guardadas_pago(metodo)
+    if metodo not in NOMBRE_METODO or not 0 <= indice < len(opciones):
+        bot.answer_callback_query(call.id, "Esa opción ya no existe.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_datos_metodo_pago",
+        "metodo_pago": metodo,
+        "reemplazar_indice": indice,
+        "panel_message_id": call.message.message_id,
+    }
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Volver",
+            callback_data="admin_pagos_cancelar",
+        )
+    )
+    editar_o_enviar_panel(
+        call.message.chat.id,
+        f"✍️ <b>Actualizar opción {indice + 1} de "
+        f"{html.escape(NOMBRE_METODO[metodo])}</b>\n\n"
+        "Envía la información nueva completa en un solo mensaje. "
+        "La opción guardada será reemplazada y el mensaje enviado se borrará.",
         markup,
         message=call.message,
         protect_content=True,
@@ -981,6 +1977,17 @@ def admin_editar_metodo_pago(call):
 
 @bot.callback_query_handler(
     func=lambda call: call.data == "admin_pagos_cambiar_foto"
+)
+def admin_ver_foto_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_foto_pago_actual(call.message.chat.id, message=call.message)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_pagos_foto_subir"
 )
 def admin_cambiar_foto_pagos(call):
     if not es_admin_privado(call):
@@ -993,14 +2000,14 @@ def admin_cambiar_foto_pagos(call):
     }
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
-        "❌ Cancelar",
+        "🔙 Volver",
         callback_data="admin_pagos_cancelar",
     ))
     editar_o_enviar_panel(
         call.message.chat.id,
-        "🖼️ <b>Cambiar la foto del menú de pagos</b>\n\n"
-        "Envíame la nueva imagen como foto. Se usará únicamente en el menú "
-        "de métodos de pago. El mensaje que envíes se borrará al guardarla.",
+        "🖼️ <b>Cambiar la foto del menú de pago</b>\n\n"
+        "Envía la nueva imagen como foto. Se guardará para el menú de pago. "
+        "El mensaje que envíes se borrará al guardarla.",
         markup,
         message=call.message,
         protect_content=True,
@@ -1021,20 +2028,13 @@ def admin_restaurar_foto_pagos(call):
         )
     except Exception:
         app.logger.exception("No se pudo restaurar la foto original de pagos.")
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(
-            "↩️ Volver a métodos de pago",
-            callback_data="admin_pagos",
-        ))
-        editar_o_enviar_panel(
+        mostrar_foto_pago_actual(
             call.message.chat.id,
-            "No pude guardar el cambio. La foto actual se mantiene.",
-            markup,
             message=call.message,
-            protect_content=True,
+            aviso="No pude guardar el cambio; la foto actual se mantiene.",
         )
         return
-    mostrar_admin_config_pagos(
+    mostrar_foto_pago_actual(
         call.message.chat.id,
         message=call.message,
         aviso="Foto original restaurada.",
@@ -1375,6 +2375,157 @@ def expulsar_usuario_vencido(user_id):
     # 3. Eliminar del registro SIEMPRE, sin importar lo anterior
     db.remove(Query().id == user_id)
 
+
+def procesar_vencimiento_freepass(registro):
+    try:
+        user_id = int(registro.get("id"))
+    except (TypeError, ValueError):
+        return False
+    vence = _fecha_freepass(registro)
+    if not vence or vence > datetime.now():
+        return False
+
+    with FREE_GOLDPASS_LOCK:
+        actual = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
+        if not actual or actual.get("status") not in (
+            "active", "expiring", "kick_pending", "expiry_pending"
+        ):
+            return False
+        ultimo_intento = actual.get("last_kick_attempt")
+        if actual.get("status") in ("kick_pending", "expiry_pending") and ultimo_intento:
+            try:
+                momento = datetime.strptime(
+                    ultimo_intento, "%Y-%m-%d %H:%M:%S"
+                )
+                if datetime.now() - momento < timedelta(seconds=60):
+                    return False
+            except ValueError:
+                pass
+        actual["status"] = "expiring"
+        FreeGoldPasses.upsert(actual, FREE_GOLDPASS_QUERY.id == user_id)
+    registro = actual
+
+    error_desactivacion = None
+    try:
+        _desactivar_free_goldpass(
+            "first_pass_expired",
+            campaign_id=registro.get("campaign_id"),
+        )
+    except Exception as error:
+        error_desactivacion = str(error)
+        app.logger.exception(
+            "No se pudo desactivar la promoción al vencer el primer pase."
+        )
+
+    enlace = registro.get("invite_link")
+    if enlace:
+        try:
+            bot.revoke_chat_invite_link(CANAL_ID, enlace)
+        except Exception:
+            # Puede haberse revocado ya al aprobar el ingreso.
+            app.logger.info("El enlace de Free Gold Pass ya no estaba vigente.")
+
+    error_expulsion = None
+    try:
+        bot.ban_chat_member(CANAL_ID, user_id)
+        bot.unban_chat_member(CANAL_ID, user_id)
+    except Exception as error:
+        error_expulsion = str(error)
+        app.logger.exception(
+            "No se pudo retirar del canal GoldPass al usuario con pase vencido."
+        )
+    estado = (
+        "kick_pending"
+        if error_expulsion
+        else "expiry_pending"
+        if error_desactivacion
+        else "expired"
+    )
+
+    with FREE_GOLDPASS_LOCK:
+        actual = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id) or registro
+        actual["status"] = estado
+        actual["last_kick_attempt"] = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        if estado == "expired":
+            actual["expired_at"] = actual["last_kick_attempt"]
+        if error_expulsion:
+            actual["last_kick_error"] = error_expulsion[:500]
+        if error_desactivacion:
+            actual["last_expiry_error"] = error_desactivacion[:500]
+        FreeGoldPasses.upsert(actual, FREE_GOLDPASS_QUERY.id == user_id)
+
+    if not registro.get("notified_at"):
+        try:
+            mostrar_metodos_pago(
+                user_id,
+                aviso=(
+                    "Tu pase gratuito venció y el acceso al canal terminó."
+                    if estado == "expired"
+                    else "Tu pase venció; el bot está terminando la expiración y tu salida del canal."
+                ),
+            )
+            with FREE_GOLDPASS_LOCK:
+                FreeGoldPasses.update(
+                    {"notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                    FREE_GOLDPASS_QUERY.id == user_id,
+                )
+        except Exception:
+            app.logger.exception(
+                "No se pudo notificar el vencimiento de Free Gold Pass al usuario."
+            )
+
+    if (error_expulsion or error_desactivacion) and not registro.get("expiry_error_notified"):
+        try:
+            bot.send_message(
+                int(ADMIN_ID),
+                "⚠️ No pude completar automáticamente la expiración Free Gold Pass "
+                f"del usuario <code>{user_id}</code>. Revisa permisos y almacenamiento. "
+                f"Detalle: {html.escape((error_expulsion or error_desactivacion)[:300])}",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+            with FREE_GOLDPASS_LOCK:
+                FreeGoldPasses.update(
+                    {"expiry_error_notified": True},
+                    FREE_GOLDPASS_QUERY.id == user_id,
+                )
+        except Exception:
+            app.logger.exception(
+                "No se pudo informar al administrador de un fallo de expulsión."
+            )
+    return True
+
+
+def revisar_vencimientos_free_goldpass():
+    while True:
+        ahora = datetime.now()
+        try:
+            with FREE_GOLDPASS_LOCK:
+                vencidos = [
+                    dict(registro)
+                    for registro in FreeGoldPasses.all()
+                    if registro.get("status") in (
+                        "active", "expiring", "kick_pending", "expiry_pending"
+                    )
+                    and _fecha_freepass(registro)
+                    and _fecha_freepass(registro) <= ahora
+                ]
+            for registro in vencidos:
+                try:
+                    procesar_vencimiento_freepass(registro)
+                except Exception:
+                    app.logger.exception(
+                        "Error al procesar un vencimiento de Free Gold Pass."
+                    )
+        except Exception:
+            app.logger.exception(
+                "Error al revisar vencimientos de Free Gold Pass."
+            )
+        time.sleep(10)
+
+
 def revisar_vencimientos():
     while True:
         ahora = datetime.now()
@@ -1401,7 +2552,7 @@ def guardar_foto_menu_pagos(message, foto_id):
         eliminar_mensaje_disparador(message)
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton(
-            "❌ Cancelar",
+            "🔙 Volver",
             callback_data="admin_pagos_cancelar",
         ))
         editar_o_enviar_panel(
@@ -1415,10 +2566,10 @@ def guardar_foto_menu_pagos(message, foto_id):
         return True
     admin_estado.pop(uid, None)
     eliminar_mensaje_disparador(message)
-    mostrar_admin_config_pagos(
+    mostrar_foto_pago_actual(
         message.chat.id,
         message_id=panel_message_id,
-        aviso="Foto del menú de pagos actualizada.",
+        aviso="Foto del menú actualizada.",
     )
     return True
 
@@ -1429,7 +2580,7 @@ def rechazar_archivo_foto_pagos(message):
     eliminar_mensaje_disparador(message)
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
-        "❌ Cancelar",
+        "🔙 Volver",
         callback_data="admin_pagos_cancelar",
     ))
     editar_o_enviar_panel(
@@ -1461,6 +2612,132 @@ def rechazar_media_metodo_pago(message):
         protect_content=True,
     )
     return True
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "free_goldpass_claim"
+)
+def reclamar_free_goldpass(call):
+    if getattr(getattr(call.message, "chat", None), "type", None) != "private":
+        bot.answer_callback_query(
+            call.id,
+            "Abre el bot en privado para reclamar tu pase.",
+            show_alert=True,
+        )
+        return
+    user_id = int(call.from_user.id)
+    estado = free_goldpass_config()
+    if not estado.get("active"):
+        bot.answer_callback_query(
+            call.id,
+            "La promoción terminó; ya puedes consultar los métodos de pago.",
+            show_alert=True,
+        )
+        mostrar_metodos_pago(call.message.chat.id)
+        return
+
+    try:
+        vencido = None
+        enlace_nuevo = False
+        with FREE_GOLDPASS_LOCK:
+            existente = _registro_freepass(user_id)
+            registro = None
+            if existente and existente.get("status") == "pending":
+                vence_enlace_anterior = _fecha_freepass(existente)
+                if (
+                    existente.get("campaign_id") == estado.get("campaign_id")
+                    and existente.get("invite_link")
+                    and (
+                        not vence_enlace_anterior
+                        or vence_enlace_anterior > datetime.now()
+                    )
+                ):
+                    registro = existente
+                elif existente.get("invite_link"):
+                    try:
+                        bot.revoke_chat_invite_link(
+                            CANAL_ID, existente["invite_link"]
+                        )
+                    except Exception:
+                        app.logger.info(
+                            "El enlace pendiente anterior de Free Gold Pass "
+                            "ya no estaba vigente."
+                        )
+            elif existente and existente.get("status") == "active":
+                vence = _fecha_freepass(existente)
+                if vence and vence > datetime.now():
+                    registro = existente
+                elif vence:
+                    vencido = existente
+            if vencido:
+                pass
+            elif registro is None and _suscripcion_vip_activa(user_id):
+                raise RuntimeError("Tu acceso GoldPass ya está activo.")
+            if registro is None and vencido is None:
+                estado = free_goldpass_config()
+                if not estado.get("active"):
+                    raise RuntimeError("La promoción ya terminó.")
+                segundos = int(estado.get("duration_seconds", 0))
+                if segundos not in FREE_GOLDPASS_DURATIONS:
+                    raise RuntimeError("La duración de la promoción no es válida.")
+                emitido = datetime.now().replace(microsecond=0)
+                enlace = bot.create_chat_invite_link(
+                    CANAL_ID,
+                    name="Free GoldPass",
+                    creates_join_request=True,
+                )
+                registro = {
+                    "id": user_id,
+                    "username": call.from_user.username or "",
+                    "campaign_id": estado.get("campaign_id"),
+                    "duration_seconds": segundos,
+                    "issued_at": emitido.strftime("%Y-%m-%d %H:%M:%S"),
+                    "vence": None,
+                    "invite_link": enlace.invite_link,
+                    "status": "pending",
+                    "joined_at": None,
+                    "notified_at": None,
+                }
+                FreeGoldPasses.upsert(
+                    registro,
+                    FREE_GOLDPASS_QUERY.id == user_id,
+                )
+                enlace_nuevo = True
+        if vencido:
+            procesar_vencimiento_freepass(vencido)
+            bot.answer_callback_query(
+                call.id,
+                "Tu pase ya venció; los métodos de pago están disponibles.",
+                show_alert=True,
+            )
+            return
+    except Exception:
+        app.logger.exception(
+            "No se pudo emitir el enlace individual de Free Gold Pass."
+        )
+        bot.answer_callback_query(
+            call.id,
+            "No pude generar el enlace. Verifica en el canal GoldPass los permisos "
+            "«Invitar usuarios mediante enlace» y «Expulsar usuarios».",
+            show_alert=True,
+        )
+        return
+
+    bot.answer_callback_query(
+        call.id,
+        "Tu enlace personal está listo."
+        if enlace_nuevo
+        else (
+            "Ya tienes un enlace personal."
+            if registro.get("status") == "pending"
+            else "Tu acceso está activo."
+        ),
+    )
+    mostrar_menu_free_goldpass_usuario(
+        call.message.chat.id,
+        user_id,
+        registro=registro,
+    )
+
 
 @bot.callback_query_handler(func=lambda call: call.data == "otro_metodo")
 def otro_metodo_pago(call):
@@ -2060,9 +3337,9 @@ def admin_ver_datos(call):
     partes        = call.data.split("_")
     user_id       = int(partes[1])
     metodo        = "_".join(partes[2:])
-    datos         = obtener_datos_pago(metodo)
+    opciones      = _opciones_guardadas_pago(metodo)
     nombre_metodo = NOMBRE_METODO.get(metodo, metodo)
-    if not datos:
+    if not opciones:
         bot.send_message(
             int(ADMIN_ID),
             f"⚠️ No hay información configurada para {html.escape(nombre_metodo)}. "
@@ -2072,39 +3349,59 @@ def admin_ver_datos(call):
         )
         return
 
-    # CopyTextButton tiene límite de 256 chars; eliminar _AVISO del texto a copiar
-    datos_sin_aviso = datos.replace(_AVISO, "").strip()
+    # Cada opción va en su propio mensaje para que varias cuentas no excedan
+    # el límite de Telegram. Todos los mensajes llevan protección de contenido.
+    ids_mensajes = []
+    for indice, opcion in enumerate(opciones, start=1):
+        datos = opcion
+        if metodo not in METODOS_PAGO_POR_ENLACE and _AVISO.strip() not in datos:
+            datos += _AVISO
+        datos_sin_aviso = datos.replace(_AVISO, "").strip()
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        try:
+            markup.add(types.InlineKeyboardButton(
+                f"📋 Copiar opción {indice}",
+                copy_text=types.CopyTextButton(text=datos_sin_aviso[:256]),
+            ))
+        except Exception:
+            pass
+        markup.add(
+            types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
+            types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
+        )
+        datos_msg = bot.send_message(
+            int(ADMIN_ID),
+            f"📋 <b>DATOS — {html.escape(nombre_metodo)} "
+            f"({indice}/{len(opciones)})</b>\n\n"
+            f"<code>{html.escape(datos)}</code>",
+            parse_mode="HTML",
+            reply_markup=markup,
+            protect_content=True,
+        )
+        ids_mensajes.append(datos_msg.message_id)
 
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    try:
-        # Botón de copia directa (Telegram Bot API 7.1+)
-        markup.add(types.InlineKeyboardButton(
-            "📋 Copiar datos",
-            copy_text=types.CopyTextButton(text=datos_sin_aviso[:256])
-        ))
-    except Exception:
-        pass  # Si la versión no lo soporta, los datos están en <code> para tocar y copiar
-    markup.add(
-        types.InlineKeyboardButton("✅ Aprobado",  callback_data=f"adap_{user_id}"),
-        types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
-    )
-
-    datos_msg = bot.send_message(
-        int(ADMIN_ID),
-        f"📋 <b>DATOS — {nombre_metodo}</b>\n\n"
-        f"<code>{html.escape(datos)}</code>",
-        parse_mode="HTML",
-        reply_markup=markup,
-        protect_content=True,
-    )
-    # Guardar ID del mensaje de datos para borrarlo al aprobar/rechazar
+    # Al aprobar/rechazar se retiran todas las opciones mostradas.
     if user_id in solicitudes_info:
-        solicitudes_info[user_id]['datos_msg_id'] = datos_msg.message_id
+        solicitudes_info[user_id]["datos_msg_ids"] = ids_mensajes
+        solicitudes_info[user_id]["datos_msg_id"] = ids_mensajes[-1]
     else:
         solicitudes_info[user_id] = {
             'metodo': metodo, 'username': 'sin_usuario',
-            'notif_msg_id': None, 'datos_msg_id': datos_msg.message_id
+            'notif_msg_id': None, 'datos_msg_id': ids_mensajes[-1],
+            'datos_msg_ids': ids_mensajes,
         }
+
+
+def borrar_mensajes_datos_pago(info):
+    ids = info.get("datos_msg_ids") or []
+    if not ids and info.get("datos_msg_id"):
+        ids = [info["datos_msg_id"]]
+    for message_id in set(ids):
+        try:
+            bot.delete_message(int(ADMIN_ID), message_id)
+        except Exception:
+            pass
+
 
 # ─── Aprobado (desde pantalla de datos) ──────────────────────────
 @bot.callback_query_handler(func=lambda call: call.data.startswith("adap_"))
@@ -2156,11 +3453,8 @@ def admin_aprobar(call):
             parse_mode="HTML"
         )
 
-    # Borrar mensaje de datos (en el chat del admin)
-    try:
-        bot.delete_message(int(ADMIN_ID), call.message.message_id)
-    except:
-        pass
+    # Borrar todos los mensajes con opciones de pago del chat del admin.
+    borrar_mensajes_datos_pago(info)
 
     # Borrar notificación original (en el chat del admin)
     notif_id = info.get('notif_msg_id')
@@ -2199,11 +3493,8 @@ def admin_rechazar_datos(call):
     except Exception as e:
         bot.send_message(int(ADMIN_ID), f"⚠️ No pude notificar al usuario: {e}")
 
-    # Borrar mensaje de datos (en el chat del admin)
-    try:
-        bot.delete_message(int(ADMIN_ID), call.message.message_id)
-    except:
-        pass
+    # Borrar todos los mensajes con opciones de pago del chat del admin.
+    borrar_mensajes_datos_pago(info)
 
     # Borrar notificación original (en el chat del admin)
     notif_id = info.get('notif_msg_id')
@@ -2459,21 +3750,789 @@ def _destino_por_key(key):
             return {"chat_id":cid,"nombre":info.get("title") or info.get("nombre") or cid,"tipo":info.get("type") or "grupo"}
     return None
 
+
+def _registros_grupo(tabla, chat_id, legacy_principal=False, globales=False):
+    salida = []
+    for registro in tabla.all():
+        alcance = registro.get("chat_id")
+        if alcance is None:
+            if globales or (legacy_principal and str(chat_id) == str(GRUPO_ID)):
+                salida.append(registro)
+        elif str(alcance) == str(chat_id):
+            salida.append(registro)
+    return salida
+
+
+def _eventos_publicacion_grupo(chat_id):
+    actividad = _registros_grupo(
+        RegistroActividad, chat_id, legacy_principal=True
+    )
+    promos = _registros_grupo(
+        PromosAprobadas, chat_id, legacy_principal=True
+    )
+    eventos = []
+    for registro in actividad:
+        eventos.append({"date": registro.get("date", ""), "kind": "actividad", "record": registro})
+    for registro in promos:
+        eventos.append({"date": registro.get("approved_at", ""), "kind": "promocion", "record": registro})
+    return sorted(eventos, key=lambda evento: str(evento.get("date", "")), reverse=True)
+
+
+def _normalizar_palabra_prohibida(valor):
+    normalizada = unicodedata.normalize(
+        "NFKD",
+        unicodedata.normalize("NFKC", " ".join(str(valor or "").split())).casefold(),
+    )
+    return "".join(
+        caracter for caracter in normalizada
+        if not unicodedata.combining(caracter)
+    )
+
+
+def _clasificar_destino_palabras(chat_id):
+    cid = str(chat_id)
+    cached = _PROHIBITED_WORDS_DESTINATION_CACHE.get(cid)
+    if cached is not None:
+        return cached
+    cfg = cargar_config()
+    destinos = [
+        (destino, destino.get("chat_id") or destino.get("id"))
+        for destino in cfg.get("destinos", {}).values()
+        if isinstance(destino, dict)
+    ]
+    destinos.extend(
+        (destino, destino.get("chat_id") or destino.get("id") or group_id)
+        for group_id, destino in cfg.get("group_settings", {}).items()
+        if isinstance(destino, dict)
+    )
+    for destino, raw_id in destinos:
+        if str(raw_id) != cid:
+            continue
+        nombre = destino.get("nombre") or destino.get("title") or ""
+        clave = re.sub(
+            r"[^a-z0-9]",
+            "",
+            _normalizar_palabra_prohibida(nombre),
+        )
+        usa_lista_predeterminada = "cxhotgochat" in clave
+        mostrar_panel = usa_lista_predeterminada or any(
+            marca in clave
+            for marca in ("goldpasscxhotgo", "gopasscxhotgo")
+        )
+        resultado = (mostrar_panel, usa_lista_predeterminada)
+        _PROHIBITED_WORDS_DESTINATION_CACHE[cid] = resultado
+        return resultado
+    resultado = (False, False)
+    _PROHIBITED_WORDS_DESTINATION_CACHE[cid] = resultado
+    return resultado
+
+
+def _destino_usa_palabras_predeterminadas(chat_id):
+    return _clasificar_destino_palabras(chat_id)[1]
+
+
+def _destino_muestra_palabras_prohibidas(chat_id):
+    return _clasificar_destino_palabras(chat_id)[0]
+
+
+def _asegurar_palabras_predeterminadas(chat_id):
+    cid = str(chat_id)
+    if cid in _PROHIBITED_WORDS_READY:
+        return
+    if not _destino_usa_palabras_predeterminadas(cid):
+        _PROHIBITED_WORDS_READY.add(cid)
+        _PROHIBITED_WORDS_CACHE.pop(cid, None)
+        return
+    existentes = {
+        _normalizar_palabra_prohibida(row.get("word"))
+        for row in GroupBannedWords.search(
+            lambda row: str(row.get("chat_id")) == cid
+        )
+    }
+    for categoria, palabras in DEFAULT_PROHIBITED_WORD_GROUPS:
+        for palabra in palabras:
+            normalizada = _normalizar_palabra_prohibida(palabra)
+            if normalizada in existentes:
+                continue
+            GroupBannedWords.insert({
+                "chat_id": cid,
+                "word": palabra,
+                "normalized": normalizada,
+                "category": categoria,
+                "source": "default",
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            existentes.add(normalizada)
+    _PROHIBITED_WORDS_READY.add(cid)
+    _PROHIBITED_WORDS_CACHE.pop(cid, None)
+
+
+def _palabras_prohibidas_destino(chat_id):
+    filas = GroupBannedWords.search(
+        lambda row: str(row.get("chat_id")) == str(chat_id)
+    )
+    if not _destino_usa_palabras_predeterminadas(chat_id):
+        filas = [fila for fila in filas if fila.get("source") != "default"]
+    orden_categoria = {
+        categoria: indice
+        for indice, (categoria, _) in enumerate(DEFAULT_PROHIBITED_WORD_GROUPS)
+    }
+    filas_ordenadas = sorted(
+        filas,
+        key=lambda row: (
+            orden_categoria.get(row.get("category"), len(orden_categoria)),
+            _normalizar_palabra_prohibida(row.get("word")),
+        ),
+    )
+    salida = []
+    vistas = set()
+    for fila in filas_ordenadas:
+        normalizada = _normalizar_palabra_prohibida(fila.get("word"))
+        if not normalizada or normalizada in vistas:
+            continue
+        vistas.add(normalizada)
+        salida.append(fila)
+    return salida
+
+
+def encontrar_palabra_prohibida(chat_id, texto):
+    cid = str(chat_id)
+    if not _destino_muestra_palabras_prohibidas(cid):
+        return None
+    _asegurar_palabras_predeterminadas(cid)
+    patrones = _PROHIBITED_WORDS_CACHE.get(cid)
+    if patrones is None:
+        patrones = []
+        for fila in _palabras_prohibidas_destino(cid):
+            palabra = _normalizar_palabra_prohibida(fila.get("word"))
+            if not palabra:
+                continue
+            literal = re.escape(palabra).replace(r"\ ", r"\s+")
+            patrones.append((
+                re.compile(r"(?<!\w)" + literal + r"(?!\w)", re.UNICODE),
+                fila,
+            ))
+        _PROHIBITED_WORDS_CACHE[cid] = patrones
+    texto_normalizado = _normalizar_palabra_prohibida(texto)
+    for patron, fila in patrones:
+        if patron.search(texto_normalizado):
+            return fila
+    return None
+
+
+def moderar_palabras_prohibidas(message, evidencia=None):
+    if message.chat.type not in ("group", "supergroup"):
+        return False
+    if (
+        str(message.from_user.id) == str(ADMIN_ID)
+        or getattr(message.from_user, "is_bot", False)
+    ):
+        return False
+    texto = message.text or message.caption or ""
+    if not texto.strip():
+        return False
+
+    coincidencia = encontrar_palabra_prohibida(message.chat.id, texto)
+    if not coincidencia:
+        return False
+    try:
+        rol = bot.get_chat_member(
+            message.chat.id,
+            message.from_user.id,
+        ).status
+    except Exception:
+        app.logger.exception(
+            "No se pudo verificar el rol antes de aplicar el filtro de palabras."
+        )
+        return False
+    if rol in ("creator", "administrator"):
+        return False
+
+    mensaje_borrado = True
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        mensaje_borrado = False
+        app.logger.exception(
+            "Telegram no permitió borrar un mensaje con una palabra prohibida."
+        )
+
+    motivo = f"Palabra prohibida: {coincidencia.get('word', '')}"
+    if not mensaje_borrado:
+        motivo += " · Telegram no permitió borrar el mensaje"
+    aplicar_castigo(
+        message.chat.id,
+        message.from_user.id,
+        (message.from_user.username or "anonimo").lower(),
+        evidence=evidencia,
+        reason=motivo,
+    )
+    return True
+
+
+def agregar_palabra_prohibida(chat_id, palabra):
+    palabra = " ".join(str(palabra or "").split())
+    normalizada = _normalizar_palabra_prohibida(palabra)
+    if len(palabra) < 2 or len(palabra) > 100 or "\n" in palabra:
+        raise ValueError("La palabra o frase debe tener entre 2 y 100 caracteres.")
+    if not _destino_muestra_palabras_prohibidas(chat_id):
+        raise ValueError("La lista de palabras no está habilitada para este destino.")
+    _asegurar_palabras_predeterminadas(chat_id)
+    existente = GroupBannedWords.search(
+        lambda row: str(row.get("chat_id")) == str(chat_id)
+        and (
+            row.get("source") != "default"
+            or _destino_usa_palabras_predeterminadas(chat_id)
+        )
+        and _normalizar_palabra_prohibida(row.get("word")) == normalizada
+    )
+    if existente:
+        return False
+    GroupBannedWords.insert({
+        "chat_id": str(chat_id),
+        "word": palabra,
+        "normalized": normalizada,
+        "category": "Agregadas por el administrador",
+        "source": "admin",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    _PROHIBITED_WORDS_CACHE.pop(str(chat_id), None)
+    return True
+
+
+def mostrar_palabras_prohibidas(
+    chat_id, dest_key, message=None, message_id=None, aviso=None
+):
+    destino = _destino_por_key(dest_key)
+    if not destino:
+        return None
+    cid = str(destino.get("chat_id"))
+    if not _destino_muestra_palabras_prohibidas(cid):
+        return editar_o_enviar_panel(
+            chat_id,
+            "Las palabras prohibidas solo están habilitadas para CX HOTGO Chat y GoldPass CX HOTGO.",
+            types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+                "🔙 Volver a configuración",
+                callback_data=f"mod_home|{dest_key}",
+            )),
+            message=message,
+            message_id=message_id,
+            protect_content=True,
+            forzar_texto=True,
+        )
+    _asegurar_palabras_predeterminadas(cid)
+    filas = _palabras_prohibidas_destino(cid)
+    por_categoria = {}
+    for fila in filas:
+        por_categoria.setdefault(
+            fila.get("category") or "Agregadas por el administrador", []
+        ).append(str(fila.get("word") or ""))
+
+    lineas = [f"🚫 <b>Palabras prohibidas · {html.escape(str(destino.get('nombre') or cid))}</b>"]
+    if aviso:
+        lineas.append(f"\n✅ {html.escape(str(aviso))}")
+    if not filas:
+        lineas.append("\nLa lista está vacía. Agrega palabras para activar el filtro en este destino.")
+    else:
+        for categoria, palabras in por_categoria.items():
+            lineas.append(f"\n<b>{html.escape(str(categoria))}</b>")
+            lineas.append(", ".join(html.escape(palabra) for palabra in palabras))
+        lineas.append(
+            "\n\nSe eliminan coincidencias de palabra o frase completa. "
+            "La 1.ª y 2.ª sanción silencian 35 minutos; la 3.ª expulsa."
+        )
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Agregar palabra",
+            callback_data=f"mod_palabras_add|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "🔙 Volver a configuración",
+            callback_data=f"mod_home|{dest_key}",
+        ),
+    )
+    return editar_o_enviar_panel(
+        chat_id,
+        "\n".join(lineas),
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def enviar_media_panel_control(chat_id, media_type, file_id, caption, markup):
+    registro = None
+    if int(chat_id) > 0:
+        with PANEL_LOCK:
+            registro = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == str(chat_id))
+    if registro:
+        try:
+            bot.delete_message(chat_id, registro.get("message_id"))
+        except Exception:
+            pass
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == str(chat_id))
+    if media_type == "video":
+        nuevo = bot.send_video(
+            chat_id,
+            file_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=markup,
+            protect_content=True,
+        )
+        tipo = "video"
+    else:
+        nuevo = bot.send_photo(
+            chat_id,
+            file_id,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=markup,
+            protect_content=True,
+        )
+        tipo = "foto"
+    if int(chat_id) > 0:
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.upsert(
+                {
+                    "chat_id": str(chat_id),
+                    "message_id": nuevo.message_id,
+                    "tipo": tipo,
+                    "protect_content": True,
+                },
+                PANEL_QUERY.chat_id == str(chat_id),
+            )
+    return nuevo
+
+
+def enviar_media_panel_publicacion(chat_id, media_type, file_id, caption, markup):
+    metodos = {
+        "photo": bot.send_photo,
+        "video": bot.send_video,
+        "document": bot.send_document,
+        "audio": bot.send_audio,
+        "animation": bot.send_animation,
+    }
+    metodo = metodos.get(media_type)
+    if not metodo:
+        raise ValueError("Ese tipo de multimedia no se puede previsualizar.")
+
+    registro = None
+    if int(chat_id) > 0:
+        with PANEL_LOCK:
+            registro = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == str(chat_id))
+    if registro:
+        try:
+            bot.delete_message(chat_id, registro.get("message_id"))
+        except Exception:
+            app.logger.info("No se pudo reemplazar el panel previo de publicación.")
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == str(chat_id))
+
+    nuevo = metodo(
+        chat_id,
+        file_id,
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=markup,
+        protect_content=True,
+    )
+    if int(chat_id) > 0:
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.upsert(
+                {
+                    "chat_id": str(chat_id),
+                    "message_id": nuevo.message_id,
+                    "tipo": media_type,
+                    "protect_content": True,
+                },
+                PANEL_QUERY.chat_id == str(chat_id),
+            )
+    return nuevo
+
+
+def botones_fijos_publicacion_goldpass():
+    ruta = os.path.join(BASE_DIR, "botones_goldpass.json")
+    try:
+        with open(ruta, "r", encoding="utf-8") as archivo:
+            guardados = json.load(archivo)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "No pude leer los enlaces predeterminados de X y OnlyFans."
+        ) from error
+
+    if not isinstance(guardados, list):
+        raise ValueError("La lista de botones predeterminados no es válida.")
+
+    encontrados = {}
+    for boton in guardados:
+        if not isinstance(boton, dict):
+            continue
+        etiqueta = str(boton.get("texto") or "").strip()
+        normalizada = etiqueta.casefold()
+        url = str(boton.get("url") or "").strip()
+        if normalizada in ("x", "𝕏", "𝕏 x"):
+            clave, texto = "x", "𝕏 X"
+        elif "onlyfans" in normalizada:
+            clave, texto = "onlyfans", "🔞 OnlyFans"
+        else:
+            continue
+        if not url.startswith("https://"):
+            continue
+        encontrados[clave] = {"texto": texto, "url": url}
+
+    if set(encontrados) != {"x", "onlyfans"}:
+        raise ValueError(
+            "El archivo de botones de GoldPass debe contener los enlaces de X y OnlyFans."
+        )
+    return [encontrados["x"], encontrados["onlyfans"]]
+
+
+def markup_publicacion_goldpass():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    botones = botones_fijos_publicacion_goldpass()
+    markup.row(*[
+        types.InlineKeyboardButton(boton["texto"], url=boton["url"])
+        for boton in botones
+    ])
+    return markup
+
+
+def markup_flujo_publicacion_destino(dest_key):
+    return types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "❌ Cancelar",
+            callback_data=f"destpub_cancel|{dest_key}",
+        )
+    )
+
+
+def mostrar_paso_publicacion_destino(chat_id, estado, texto, message=None):
+    panel = editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup_flujo_publicacion_destino(estado["dest_key"]),
+        message=message,
+        message_id=estado.get("panel_message_id"),
+        protect_content=True,
+        forzar_texto=True,
+    )
+    estado["panel_message_id"] = panel.message_id
+    return panel
+
+
+def mostrar_previa_publicacion_destino(chat_id, estado):
+    destino = _destino_por_key(estado.get("dest_key", ""))
+    if not destino:
+        raise ValueError("El canal elegido ya no está guardado.")
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            "✅ Aceptar y publicar",
+            callback_data=f"destpub_accept|{estado['dest_key']}",
+        ),
+        types.InlineKeyboardButton(
+            "✏️ Modificar",
+            callback_data=f"destpub_modify|{estado['dest_key']}",
+        ),
+    )
+    caption = (
+        f"👁️ <b>Vista previa · "
+        f"{html.escape(str(destino.get('nombre') or 'Canal'))}</b>\n\n"
+        f"{html.escape(str(estado.get('descripcion') or ''))}"
+    )
+    panel = enviar_media_panel_publicacion(
+        chat_id,
+        estado["media_type"],
+        estado["media_id"],
+        caption,
+        markup,
+    )
+    estado["paso"] = "revision_publicacion_destino"
+    estado["panel_message_id"] = panel.message_id
+    return panel
+
+
+def mostrar_panel_control_grupo(
+    chat_id, dest_key, destino, message=None, message_id=None, aviso=None
+):
+    cid = str(destino.get("chat_id"))
+    reportes = _registros_grupo(GroupReports, cid)
+    advertencias = _registros_grupo(Warnings, cid, legacy_principal=True)
+    bloqueados = [
+        registro for registro in _registros_grupo(
+            Blacklist, cid, legacy_principal=True
+        )
+        if registro.get("status", "active") == "active"
+    ]
+    publicaciones = _eventos_publicacion_grupo(cid)
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            f"🚩 Reportes ({len(reportes)})",
+            callback_data=f"mod_seccion|{dest_key}|reportes|0",
+        ),
+        types.InlineKeyboardButton(
+            f"⚠️ Sanciones ({len(advertencias) + len(bloqueados)})",
+            callback_data=f"mod_seccion|{dest_key}|sanciones|0",
+        ),
+        types.InlineKeyboardButton(
+            f"⛔ Lista negra ({len(bloqueados)})",
+            callback_data=f"mod_seccion|{dest_key}|blacklist|0",
+        ),
+        types.InlineKeyboardButton(
+            f"📰 Publicaciones ({len(publicaciones)})",
+            callback_data=f"mod_seccion|{dest_key}|publicaciones|0",
+        ),
+    )
+    if str(destino.get("tipo") or "").lower() in ("canal", "channel"):
+        markup.add(
+            types.InlineKeyboardButton(
+                "📣 Enviar publicación",
+                callback_data=f"destpub_start|{dest_key}",
+            )
+        )
+    if _destino_muestra_palabras_prohibidas(cid):
+        markup.add(types.InlineKeyboardButton(
+            "🚫 Palabras prohibidas",
+            callback_data=f"mod_palabras|{dest_key}",
+        ))
+    markup.add(
+        types.InlineKeyboardButton(
+            "🔙 Volver al destino",
+            callback_data=f"destinfo|{dest_key}",
+        ),
+    )
+    nombre = html.escape(str(destino.get("nombre") or cid))
+    texto = (
+        f"🛡️ <b>Control privado · {nombre}</b>\n"
+        f"ID: <code>{html.escape(cid)}</code>\n\n"
+        "Este panel solo se muestra en el chat privado del administrador. "
+        "Aquí se consultan reportes, sanciones y actividad guardada para este destino."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(str(aviso))}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id, texto, markup, message=message, message_id=message_id,
+        protect_content=True, forzar_texto=True,
+    )
+
+
+def mostrar_seccion_control_grupo(
+    chat_id, dest_key, section, page=0, message=None
+):
+    destino = _destino_por_key(dest_key)
+    if not destino:
+        return None
+    cid = str(destino.get("chat_id"))
+    page_size = 7
+    page = max(0, int(page))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    nombre = html.escape(str(destino.get("nombre") or cid))
+    titulo = {
+        "reportes": "🚩 Reportes recibidos",
+        "sanciones": "⚠️ Advertencias y expulsiones",
+        "blacklist": "⛔ Lista negra",
+        "publicaciones": "📰 Actividad y publicaciones",
+    }.get(section)
+    if not titulo:
+        return mostrar_panel_control_grupo(
+            chat_id, dest_key, destino, message=message
+        )
+
+    if section == "reportes":
+        registros = _registros_grupo(GroupReports, cid)
+        registros.sort(key=lambda row: str(row.get("date", "")), reverse=True)
+    elif section == "sanciones":
+        advertencias = _registros_grupo(Warnings, cid, legacy_principal=True)
+        bloqueos = [
+            row for row in _registros_grupo(
+                Blacklist, cid, legacy_principal=True
+            )
+            if row.get("status", "active") == "active"
+        ]
+        acciones = _registros_grupo(GroupModerationLog, cid)
+        registros = (
+            [{"kind": "advertencia", **row} for row in advertencias]
+            + [{"kind": "expulsión", **row} for row in bloqueos]
+            + [{"kind": "acción", **row} for row in acciones]
+        )
+        registros.sort(key=lambda row: str(
+            row.get("date") or row.get("last_warn") or ""
+        ), reverse=True)
+    elif section == "blacklist":
+        registros = [
+            row for row in _registros_grupo(
+                Blacklist, cid, legacy_principal=True
+            )
+            if row.get("status", "active") == "active"
+        ]
+        registros.sort(key=lambda row: str(row.get("date", "")), reverse=True)
+    else:
+        registros = _eventos_publicacion_grupo(cid)
+
+    total = len(registros)
+    start = page * page_size
+    current = registros[start:start + page_size]
+    lines = [f"{titulo} · <b>{nombre}</b>\n"]
+    if not current:
+        lines.append("Todavía no hay registros guardados para este grupo o canal.")
+
+    for row in current:
+        if section == "reportes":
+            username = html.escape(str(row.get("reported_username") or "sin_usuario"))
+            reporter = html.escape(str(row.get("reporter_id") or "desconocido"))
+            action = html.escape(str(row.get("action") or "registrado"))
+            when = html.escape(str(row.get("date") or "fecha no registrada"))
+            lines.append(
+                f"• <b>@{username}</b> · ID "
+                f"<code>{row.get('reported_user_id', '?')}</code>\n"
+                f"  Reportó: <code>{reporter}</code> · {action} · {when}"
+            )
+            evidence_id = row.get("evidence_doc_id")
+            if evidence_id:
+                markup.add(types.InlineKeyboardButton(
+                    "👁️ Ver evidencia",
+                    callback_data=f"mv|{dest_key}|a|{evidence_id}|r|{page}",
+                ))
+        elif section == "sanciones":
+            username = html.escape(str(row.get("username") or "sin_usuario"))
+            user_id = row.get("user_id", row.get("id", "?"))
+            kind = row.get("kind", "acción")
+            when = html.escape(str(
+                row.get("date") or row.get("last_warn") or "fecha no registrada"
+            ))
+            if kind == "advertencia":
+                detalle = f"Advertencias: {row.get('count', 0)}/3"
+                if row.get("reason"):
+                    detalle += f" · {html.escape(str(row.get('reason')))}"
+            elif kind == "expulsión":
+                detalle = html.escape(str(row.get("reason") or "Expulsión activa"))
+            else:
+                detalle = html.escape(str(row.get("action") or "acción registrada"))
+                if row.get("count"):
+                    detalle += f" · {row.get('count')}/3"
+                if row.get("reason"):
+                    detalle += f" · {html.escape(str(row.get('reason')))}"
+            lines.append(
+                f"• <b>@{username}</b> · ID <code>{user_id}</code>\n"
+                f"  {detalle} · {when}"
+            )
+            evidence_id = row.get("evidence_doc_id")
+            if evidence_id:
+                markup.add(types.InlineKeyboardButton(
+                    "👁️ Ver evidencia",
+                    callback_data=f"mv|{dest_key}|a|{evidence_id}|s|{page}",
+                ))
+            if kind == "advertencia":
+                markup.add(
+                    types.InlineKeyboardButton(
+                        f"🔊 Quitar silencio · {str(username)[:12]}",
+                        callback_data=f"unmute|{dest_key}|{cid}|{user_id}",
+                    ),
+                    types.InlineKeyboardButton(
+                        "⚠️ Mantener sanción",
+                        callback_data=f"keepwarn|{dest_key}|{cid}|{user_id}",
+                    ),
+                )
+        elif section == "blacklist":
+            username = html.escape(str(row.get("username") or "sin_usuario"))
+            user_id = row.get("id", "?")
+            when = html.escape(str(row.get("date") or "fecha no registrada"))
+            reason = html.escape(str(row.get("reason") or "Bloqueo activo"))
+            lines.append(
+                f"• <b>@{username}</b> · ID <code>{user_id}</code>\n"
+                f"  {reason} · {when}"
+            )
+            markup.add(
+                types.InlineKeyboardButton(
+                    f"🔓 Reingresar {str(username)[:14]} (2/3)",
+                    callback_data=f"mod_perdonar|{dest_key}|{cid}|{user_id}",
+                ),
+                types.InlineKeyboardButton(
+                    "⛔ Mantener expulsión",
+                    callback_data=f"mod_mantener|{dest_key}|{cid}|{user_id}",
+                ),
+            )
+        else:
+            kind = row.get("kind")
+            if kind == "promocion":
+                promo = row.get("record", {})
+                desc = html.escape(str(promo.get("desc") or "Publicación multimedia")[:180])
+                label = "🎥" if promo.get("is_video") else "🖼️"
+                who = html.escape(str(promo.get("uname") or "miembro"))
+                when = html.escape(str(row.get("date") or "fecha no registrada"))
+                detail = f"{label} Publicación aprobada por @{who}: {desc}"
+            else:
+                post = row.get("record", {})
+                kind_post = html.escape(str(post.get("type") or "mensaje"))
+                who = html.escape(str(post.get("uname") or "miembro"))
+                text = html.escape(str(post.get("text") or "").strip()[:180])
+                when = html.escape(str(row.get("date") or "fecha no registrada"))
+                detail = f"📨 {kind_post} de @{who}"
+                if post.get("file_id"):
+                    detail += " · multimedia guardada"
+                if text:
+                    detail += f": {text}"
+            lines.append(f"• {detail}\n  {when}")
+            record = row.get("record", {})
+            record_kind = "p" if kind == "promocion" else "a"
+            markup.add(types.InlineKeyboardButton(
+                "👁️ Ver publicación",
+                callback_data=(
+                    f"mv|{dest_key}|{record_kind}|{record.doc_id}|p|{page}"
+                ),
+            ))
+
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton(
+            "⬅️ Anterior",
+            callback_data=f"mod_seccion|{dest_key}|{section}|{page - 1}",
+        ))
+    if start + page_size < total:
+        nav.append(types.InlineKeyboardButton(
+            "Siguiente ➡️",
+            callback_data=f"mod_seccion|{dest_key}|{section}|{page + 1}",
+        ))
+    if nav:
+        markup.keyboard.insert(0, nav)
+    if total:
+        lines.insert(1, f"Página {page + 1} · {total} registros\n")
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver",
+        callback_data=f"mod_home|{dest_key}",
+    ))
+    return editar_o_enviar_panel(
+        chat_id,
+        "\n".join(lines),
+        markup,
+        message=message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
 def _markup_grupos_admin():
     m=types.InlineKeyboardMarkup(row_width=1)
     cfg=cargar_config(); items=[]; seen=set()
     for key,d in cfg.get("destinos",{}).items():
         if not isinstance(d,dict) or d.get("archivado"): continue
         cid=str(d.get("chat_id"))
-        if not cid or cid==str(CANAL_ID): continue
+        if not cid: continue
         seen.add(cid); items.append((key,d))
     for cid,info in cfg.get("group_settings",{}).items():
-        if str(cid) in seen or str(cid)==str(CANAL_ID) or not isinstance(info,dict): continue
+        if str(cid) in seen or not isinstance(info,dict): continue
         d={"chat_id":str(cid),"nombre":info.get("title") or info.get("nombre") or str(cid),"tipo":info.get("type") or "grupo"}
         items.append((f"group:{cid}",d))
     for key,d in items:
         m.add(types.InlineKeyboardButton(f"📂 {str(d.get('nombre') or d.get('chat_id'))[:36]} · {d.get('tipo','destino')}",callback_data=f"destinfo|{key}"))
-    m.add(types.InlineKeyboardButton("➕ Buscar/añadir grupo o canal",callback_data="destpicker"))
     m.add(types.InlineKeyboardButton("🔙 Volver",callback_data="admin_home"))
     return m
 
@@ -2553,12 +4612,606 @@ def cb_destkeyboard(c):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dest_rules|"))
 def cb_dest_rules(c):
-    if not es_admin_privado(c): bot.answer_callback_query(c.id,"⛔ Sin permiso."); return
-    key=c.data.split("|",1)[1]; d=_destino_por_key(key)
-    if not d: bot.answer_callback_query(c.id,"Destino no disponible."); return
-    admin_estado[c.from_user.id]={"paso":"esperando_reglas_destino","chat_id":str(d.get("chat_id")),"dest_key":key,"panel_message_id":c.message.message_id}
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    key = c.data.split("|", 1)[1]
+    destino = _destino_por_key(key)
+    if not destino:
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
     bot.answer_callback_query(c.id)
-    editar_o_enviar_panel(c.message.chat.id,"Envía el texto de reglas para este grupo. Se guardará por separado para el destino seleccionado.",types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("Cancelar",callback_data="admin_pagos_cancelar")),message=c.message,protect_content=True)
+    mostrar_panel_control_grupo(
+        c.message.chat.id, key, destino, message=c.message
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_start|")
+)
+def cb_destpub_start(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    destino = _destino_por_key(dest_key)
+    if (
+        not destino
+        or str(destino.get("tipo") or "").lower() not in ("canal", "channel")
+    ):
+        bot.answer_callback_query(
+            c.id, "La publicación directa está disponible para canales."
+        )
+        return
+
+    uid = c.from_user.id
+    estado = {
+        "paso": "esperando_media_dest_publicacion",
+        "dest_key": dest_key,
+        "panel_message_id": c.message.message_id,
+    }
+    admin_estado[uid] = estado
+    bot.answer_callback_query(c.id)
+    mostrar_paso_publicacion_destino(
+        c.message.chat.id,
+        estado,
+        "📣 <b>Nueva publicación</b>\n\n"
+        f"Canal: <b>{html.escape(str(destino.get('nombre') or ''))}</b>\n"
+        "Envía una foto, video, documento, audio o animación. "
+        "Después añadirás la descripción y podrás revisar la vista previa.",
+        message=c.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_cancel|")
+)
+def cb_destpub_cancel(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    estado = admin_estado.get(c.from_user.id, {})
+    if estado.get("dest_key") == dest_key and str(
+        estado.get("paso", "")
+    ).startswith(("esperando_media_dest_publicacion",
+                  "esperando_descripcion_dest_publicacion",
+                  "revision_publicacion_destino")):
+        admin_estado.pop(c.from_user.id, None)
+    destino = _destino_por_key(dest_key)
+    bot.answer_callback_query(c.id, "Edición cancelada.")
+    if destino:
+        mostrar_panel_control_grupo(
+            c.message.chat.id,
+            dest_key,
+            destino,
+            message=c.message,
+            aviso="Publicación cancelada; no se envió al canal.",
+        )
+    else:
+        editar_o_enviar_panel(
+            c.message.chat.id,
+            "El canal ya no está guardado.",
+            _markup_grupos_admin(),
+            message=c.message,
+            protect_content=True,
+            forzar_texto=True,
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_modify|")
+)
+def cb_destpub_modify(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    estado = admin_estado.get(c.from_user.id, {})
+    destino = _destino_por_key(dest_key)
+    if (
+        not destino
+        or estado.get("dest_key") != dest_key
+        or estado.get("paso") != "revision_publicacion_destino"
+    ):
+        bot.answer_callback_query(c.id, "La vista previa ya no está disponible.")
+        return
+
+    estado["paso"] = "esperando_media_dest_publicacion"
+    estado.pop("media_id", None)
+    estado.pop("media_type", None)
+    estado.pop("descripcion", None)
+    bot.answer_callback_query(c.id)
+    mostrar_paso_publicacion_destino(
+        c.message.chat.id,
+        estado,
+        "✏️ <b>Modificar publicación</b>\n\n"
+        "Envía de nuevo la foto, video u otro archivo multimedia. "
+        "Después podrás escribir la descripción actualizada.",
+        message=c.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_accept|")
+)
+def cb_destpub_accept(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    estado = admin_estado.get(c.from_user.id, {})
+    destino = _destino_por_key(dest_key)
+    if (
+        not destino
+        or estado.get("dest_key") != dest_key
+        or estado.get("paso") != "revision_publicacion_destino"
+    ):
+        bot.answer_callback_query(c.id, "La vista previa ya no está disponible.")
+        return
+
+    try:
+        markup = markup_publicacion_goldpass()
+        enviar_publicacion_con_botones(
+            destino["chat_id"],
+            html.escape(str(estado.get("descripcion") or "")),
+            markup,
+            media_id=estado.get("media_id"),
+            media_type=estado.get("media_type"),
+        )
+    except Exception:
+        app.logger.exception(
+            "No se pudo publicar la multimedia en el canal %s.", dest_key
+        )
+        bot.answer_callback_query(
+            c.id,
+            "No se publicó. Revisa el permiso para publicar mensajes y los enlaces de X/OnlyFans.",
+            show_alert=True,
+        )
+        return
+
+    admin_estado.pop(c.from_user.id, None)
+    bot.answer_callback_query(c.id, "Publicación enviada.")
+    mostrar_panel_control_grupo(
+        c.message.chat.id,
+        dest_key,
+        destino,
+        message=c.message,
+        aviso="Publicación enviada al canal con los botones fijos de X y OnlyFans.",
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_home|"))
+def cb_mod_home(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    key = c.data.split("|", 1)[1]
+    destino = _destino_por_key(key)
+    if not destino:
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    bot.answer_callback_query(c.id)
+    mostrar_panel_control_grupo(
+        c.message.chat.id, key, destino, message=c.message
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_seccion|"))
+def cb_mod_seccion(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, section, page = c.data.split("|", 3)
+        page = int(page)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "No pude abrir esa sección.")
+        return
+    if not _destino_por_key(key):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    bot.answer_callback_query(c.id)
+    mostrar_seccion_control_grupo(
+        c.message.chat.id, key, section, page, message=c.message
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_palabras|"))
+def cb_mod_palabras(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    key = c.data.split("|", 1)[1]
+    if not _destino_por_key(key):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    bot.answer_callback_query(c.id)
+    mostrar_palabras_prohibidas(
+        c.message.chat.id, key, message=c.message
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_palabras_add|"))
+def cb_mod_palabras_add(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    key = c.data.split("|", 1)[1]
+    if not _destino_por_key(key):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    admin_estado[c.from_user.id] = {
+        "paso": "esperando_palabra_prohibida",
+        "dest_key": key,
+        "panel_message_id": c.message.message_id,
+    }
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "Cancelar",
+            callback_data=f"mod_palabras_cancel|{key}",
+        )
+    )
+    bot.answer_callback_query(c.id)
+    editar_o_enviar_panel(
+        c.message.chat.id,
+        "Envía una palabra o frase prohibida en un solo mensaje. "
+        "La entrada se guardará solo para este grupo o canal; usa /cancelar para salir.",
+        markup,
+        message=c.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_palabras_cancel|"))
+def cb_mod_palabras_cancel(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    key = c.data.split("|", 1)[1]
+    estado = admin_estado.get(c.from_user.id, {})
+    if estado.get("paso") == "esperando_palabra_prohibida":
+        admin_estado.pop(c.from_user.id, None)
+    bot.answer_callback_query(c.id, "Edición cancelada.")
+    mostrar_palabras_prohibidas(
+        c.message.chat.id,
+        key,
+        message=c.message,
+        aviso="No se agregó ninguna palabra.",
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_mantener|"))
+def cb_mod_mantener(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, raw_chat_id, raw_user_id = c.data.split("|", 3)
+        chat_id, user_id = int(raw_chat_id), int(raw_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "Datos de usuario inválidos.")
+        return
+    destino = _destino_por_key(key)
+    if not destino or str(destino.get("chat_id")) != str(chat_id):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    active = [
+        row for row in Blacklist.search(User.id == user_id)
+        if row.get("status", "active") == "active"
+        and (
+            str(row.get("chat_id")) == str(chat_id)
+            or (not row.get("chat_id") and str(chat_id) == str(GRUPO_ID))
+        )
+    ]
+    if not active:
+        bot.answer_callback_query(c.id, "Ya no hay una expulsión activa.")
+        return
+    bot.answer_callback_query(c.id, "Se mantiene la expulsión.")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("unmute|"))
+def cb_mod_quitar_silencio(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, raw_chat_id, raw_user_id = c.data.split("|", 3)
+        chat_id, user_id = int(raw_chat_id), int(raw_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "Datos de usuario inválidos.")
+        return
+    destino = _destino_por_key(key)
+    if not destino or str(destino.get("chat_id")) != str(chat_id):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    advertencias = _advertencias_usuario(chat_id, user_id)
+    if not advertencias:
+        bot.answer_callback_query(c.id, "No hay una sanción activa para ese usuario.")
+        return
+    if _usuario_en_lista_negra(user_id, chat_id):
+        bot.answer_callback_query(
+            c.id,
+            "El usuario sigue expulsado. Usa «Reingresar» en Lista negra.",
+            show_alert=True,
+        )
+        return
+    try:
+        bot.restrict_chat_member(
+            chat_id,
+            user_id,
+            can_send_messages=True,
+            use_independent_chat_permissions=False,
+        )
+    except Exception:
+        app.logger.exception(
+            "No se pudo quitar el silencio a %s en el destino %s.",
+            user_id,
+            chat_id,
+        )
+        bot.answer_callback_query(
+            c.id,
+            "Telegram no permitió quitar el silencio; revisa los permisos del bot.",
+            show_alert=True,
+        )
+        return
+    GroupModerationLog.insert({
+        "chat_id": str(chat_id),
+        "user_id": user_id,
+        "username": str(advertencias[-1].get("username") or ""),
+        "action": "manual_unmute",
+        "count": int(advertencias[-1].get("count", 0)),
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    bot.answer_callback_query(c.id, "Silencio retirado; se conservó el historial.")
+    mostrar_seccion_control_grupo(
+        c.message.chat.id,
+        key,
+        "sanciones",
+        0,
+        message=c.message,
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("keepwarn|"))
+def cb_mod_mantener_sancion(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, raw_chat_id, raw_user_id = c.data.split("|", 3)
+        chat_id, user_id = int(raw_chat_id), int(raw_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "Datos de usuario inválidos.")
+        return
+    destino = _destino_por_key(key)
+    if not destino or str(destino.get("chat_id")) != str(chat_id):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    if not _advertencias_usuario(chat_id, user_id):
+        bot.answer_callback_query(c.id, "No hay una sanción activa para ese usuario.")
+        return
+    bot.answer_callback_query(c.id, "Se mantiene la sanción.")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mv|"))
+def cb_mod_ver_publicacion(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, record_kind, raw_doc_id, back_kind, raw_page = c.data.split("|", 5)
+        doc_id = int(raw_doc_id)
+        page = int(raw_page)
+        back_section = {
+            "r": "reportes",
+            "s": "sanciones",
+        }.get(back_kind, "publicaciones")
+        destino = _destino_por_key(key)
+        if not destino:
+            raise ValueError("destino")
+        chat_id = str(destino.get("chat_id"))
+        tabla = RegistroActividad if record_kind == "a" else PromosAprobadas
+        if record_kind not in ("a", "p"):
+            raise ValueError("tipo")
+        registro = next(
+            (
+                item for item in _registros_grupo(
+                    tabla, chat_id, legacy_principal=True
+                )
+                if item.doc_id == doc_id
+            ),
+            None,
+        )
+        if not registro:
+            bot.answer_callback_query(c.id, "La publicación ya no está disponible.")
+            return
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "No pude abrir esa publicación.")
+        return
+
+    back_markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Regresar",
+            callback_data=f"mod_seccion|{key}|{back_section}|{page}",
+        )
+    )
+    username = html.escape(str(registro.get("uname") or "miembro"))
+    if record_kind == "p":
+        body = str(registro.get("desc") or "Publicación aprobada")
+        media_type = "video" if registro.get("is_video") else "photo"
+        date = str(registro.get("approved_at") or "fecha no registrada")
+    else:
+        body = str(registro.get("text") or "Sin texto")
+        media_type = str(registro.get("type") or "")
+        date = str(registro.get("date") or "fecha no registrada")
+    if registro.get("file_id") and media_type in ("photo", "video"):
+        caption = (
+            f"📰 <b>Publicación de @{username}</b>\n"
+            f"{html.escape(date)}\n\n{html.escape(body[:700])}"
+        )
+        try:
+            enviar_media_panel_control(
+                c.message.chat.id,
+                media_type,
+                registro["file_id"],
+                caption,
+                back_markup,
+            )
+            bot.answer_callback_query(c.id)
+        except Exception:
+            app.logger.exception("No se pudo mostrar una publicación archivada.")
+            editar_o_enviar_panel(
+                c.message.chat.id,
+                "No pude cargar el archivo multimedia guardado. "
+                "Puedes regresar al listado.",
+                back_markup,
+                protect_content=True,
+                forzar_texto=True,
+            )
+            bot.answer_callback_query(c.id, "No pude cargar el contenido.", show_alert=True)
+        return
+
+    texto = (
+        f"📰 <b>Mensaje de @{username}</b>\n"
+        f"{html.escape(date)}\n\n{html.escape(body[:3000])}"
+    )
+    editar_o_enviar_panel(
+        c.message.chat.id,
+        texto,
+        back_markup,
+        message=c.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+    bot.answer_callback_query(c.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mod_perdonar|"))
+def cb_mod_perdonar(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, chat_id, user_id = c.data.split("|", 3)
+        chat_id, user_id = int(chat_id), int(user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "Datos de usuario inválidos.")
+        return
+    destino = _destino_por_key(key)
+    if not destino or str(destino.get("chat_id")) != str(chat_id):
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    registros = [
+        row for row in Blacklist.search(User.id == user_id)
+        if row.get("status", "active") == "active"
+        and (
+            str(row.get("chat_id")) == str(chat_id)
+            or (not row.get("chat_id") and str(chat_id) == str(GRUPO_ID))
+        )
+    ]
+    if not registros:
+        bot.answer_callback_query(c.id, "Ya no hay una expulsión activa.")
+        return
+    try:
+        bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+    except TypeError:
+        try:
+            bot.unban_chat_member(chat_id, user_id)
+        except Exception:
+            app.logger.exception("No se pudo perdonar al usuario %s.", user_id)
+            bot.answer_callback_query(c.id, "Telegram no permitió perdonarlo.", show_alert=True)
+            return
+    except Exception:
+        app.logger.exception("No se pudo perdonar al usuario %s.", user_id)
+        bot.answer_callback_query(c.id, "Telegram no permitió perdonarlo.", show_alert=True)
+        return
+
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in registros:
+        Blacklist.update(
+            {"status": "pardoned", "pardoned_at": ahora},
+            doc_ids=[row.doc_id],
+        )
+    advertencias = [
+        row for row in Warnings.search(User.id == user_id)
+        if (
+            str(row.get("chat_id")) == str(chat_id)
+            or (not row.get("chat_id") and str(chat_id) == str(GRUPO_ID))
+        )
+    ]
+    datos_advertencia = {
+        "id": user_id,
+        "chat_id": str(chat_id),
+        "username": registros[-1].get("username", ""),
+        "count": 2,
+        "last_warn": ahora,
+        "reentry_probation": True,
+    }
+    if advertencias:
+        Warnings.update(datos_advertencia, doc_ids=[advertencias[-1].doc_id])
+    else:
+        Warnings.insert(datos_advertencia)
+    GroupModerationLog.insert({
+        "chat_id": str(chat_id),
+        "user_id": user_id,
+        "username": registros[-1].get("username", "") if registros else "",
+        "action": "reentry_with_warnings",
+        "count": 2,
+        "date": ahora,
+    })
+    invite_url = None
+    try:
+        invitacion = bot.create_chat_invite_link(
+            chat_id,
+            name="Reingreso con advertencias",
+            expire_date=int(time.time()) + 24 * 60 * 60,
+            member_limit=1,
+        )
+        invite_url = getattr(invitacion, "invite_link", None)
+    except Exception:
+        app.logger.exception(
+            "No se pudo crear un enlace de reingreso para el destino %s.",
+            chat_id,
+        )
+    bot.answer_callback_query(c.id, "Acceso desbloqueado; historial de advertencias conservado.")
+    markup = types.InlineKeyboardMarkup()
+    if invite_url:
+        try:
+            markup.add(types.InlineKeyboardButton(
+                "📋 Copiar invitación (1 uso · 24 h)",
+                copy_text=types.CopyTextButton(text=invite_url),
+            ))
+        except Exception:
+            pass
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a lista negra",
+        callback_data=f"mod_seccion|{key}|blacklist|0",
+    ))
+    texto_reingreso = (
+        "✅ <b>Reingreso autorizado</b>\n"
+        f"ID: <code>{user_id}</code>\n"
+        "Se conservaron 2/3 advertencias. El usuario debe volver a unirse."
+    )
+    if invite_url:
+        texto_reingreso += (
+            "\n\nInvitación individual, válida por 24 horas y para un uso:\n"
+            f"<code>{html.escape(invite_url)}</code>"
+        )
+    else:
+        texto_reingreso += (
+            "\nNo pude generar una invitación. Comparte el enlace habitual del destino "
+            "y revisa que el bot tenga permiso para invitar usuarios."
+        )
+    editar_o_enviar_panel(
+        c.message.chat.id,
+        texto_reingreso,
+        markup,
+        message=c.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
 
 @bot.message_handler(content_types=["chat_shared"])
 def recibir_chat_compartido(message):
@@ -2570,10 +5223,54 @@ def recibir_chat_compartido(message):
     eliminar_mensaje_seguro(message.chat.id,message.message_id)
     editar_o_enviar_panel(
         message.chat.id,
-        f"✅ Guardado: {html.escape(str(title))}\nID: <code>{shared.chat_id}</code>\n\nSelecciona el destino para ver sus acciones.",
+        f"✅ Añadido: {html.escape(str(title))}\n"
+        f"ID: <code>{shared.chat_id}</code>\n\n"
+        "Ya aparece como botón en esta lista. Tócalo para abrir sus opciones.",
         _markup_grupos_admin(),
         protect_content=True,
     )
+
+
+@bot.message_handler(
+    func=lambda m: (
+        m.chat.type == "private"
+        and str(m.from_user.id) == str(ADMIN_ID)
+        and admin_estado.get(m.from_user.id, {}).get("paso")
+        in (
+            "esperando_media_dest_publicacion",
+            "esperando_descripcion_dest_publicacion",
+            "revision_publicacion_destino",
+        )
+    ),
+    content_types=["photo", "video", "document", "audio", "animation"],
+)
+def recibir_media_publicacion_destino(message):
+    estado = admin_estado.get(message.from_user.id, {})
+    if message.photo:
+        media_type, media_id = "photo", message.photo[-1].file_id
+    elif message.video:
+        media_type, media_id = "video", message.video.file_id
+    elif message.document:
+        media_type, media_id = "document", message.document.file_id
+    elif message.audio:
+        media_type, media_id = "audio", message.audio.file_id
+    elif message.animation:
+        media_type, media_id = "animation", message.animation.file_id
+    else:
+        return
+
+    estado["media_type"] = media_type
+    estado["media_id"] = media_id
+    estado["paso"] = "esperando_descripcion_dest_publicacion"
+    eliminar_mensaje_seguro(message.chat.id, message.message_id)
+    mostrar_paso_publicacion_destino(
+        message.chat.id,
+        estado,
+        "✅ Multimedia recibida.\n\n"
+        "Ahora envía la descripción de la publicación "
+        "(máximo 900 caracteres).",
+    )
+
 
 @bot.message_handler(content_types=["users_shared"])
 def recibir_usuario_compartido(message):
@@ -2612,17 +5309,65 @@ def admin_shortcuts(message):
 @bot.callback_query_handler(func=lambda c: c.data=="noop")
 def cb_noop(c): bot.answer_callback_query(c.id)
 
+def enviar_aviso_acceso_grupo(chat_id):
+    me=bot.get_me()
+    markup=types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔥 Abrir menú de acceso 🔥",
+            url=f"https://t.me/{me.username}?start=payment",
+        )
+    )
+    return editar_panel_miembro(
+        chat_id,
+        "Para solicitar o gestionar tu acceso a más diversión, "
+        "comunícate con el indio mayor.\n\n"
+        "🔥 Presiona el botón aquí 🔥",
+        markup,
+    )
+
+
+def _grupo_reporte_seleccionado(valor=None):
+    try:
+        chat_id = int(valor)
+    except (TypeError, ValueError):
+        chat_id = int(GRUPO_ID or 0)
+    if chat_id and es_grupo_autorizado(chat_id):
+        return chat_id
+    return int(GRUPO_ID or _default_group_id() or 0)
+
+
 @bot.message_handler(commands=["start"])
 def start_payment(message):
     uid=message.from_user.id; chat_id=message.chat.id
     if message.chat.type in ("group","supergroup"):
         if not es_grupo_autorizado(chat_id): return
         eliminar_mensaje_seguro(chat_id,message.message_id)
-        me=bot.get_me()
-        m=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("💳 Abrir menú de acceso",url=f"https://t.me/{me.username}?start=payment"))
-        bot.send_message(chat_id,"Para solicitar o gestionar tu acceso, abre el bot en privado:",reply_markup=m,protect_content=True)
+        enviar_aviso_acceso_grupo(chat_id)
         return
     if message.chat.type!="private": return
+    payload=(message.text or "").split(maxsplit=1)
+    if len(payload)>1 and payload[1].strip().lower().startswith("reporte"):
+        partes = payload[1].strip().lower().split("_", 1)
+        group_id = _grupo_reporte_seleccionado(partes[1] if len(partes) > 1 else None)
+        markup=types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(
+                "👤 Reportar usuario por nombre",
+                callback_data=f"menu_reportar_nombre|{group_id}",
+            ),
+            types.InlineKeyboardButton(
+                "🖼️ Reportar multimedia",
+                callback_data=f"menu_reportar_multimedia|{group_id}",
+            ),
+        )
+        editar_o_enviar_panel(
+            chat_id,
+            "🕵️ CENTRO DE REPORTES\n\nElige qué quieres reportar:",
+            markup,
+            protect_content=True,
+            forzar_texto=True,
+        )
+        return
     mostrar_metodos_pago(chat_id)
     if str(uid)==str(ADMIN_ID): bot.send_message(chat_id,"Atajos privados de administración.",reply_markup=teclado_admin_privado(),protect_content=True)
 
@@ -2633,21 +5378,145 @@ def flujo_admin_pago(message):
     paso=state.get("paso")
     if not paso: return
     text=(message.text or "").strip()
-    if text.lower()=="/cancelar" or text=="❌ Cancelar":
+    if text.lower()=="/cancelar" or text in ("❌ Cancelar", "🔙 Volver"):
+        if paso in (
+            "esperando_media_dest_publicacion",
+            "esperando_descripcion_dest_publicacion",
+            "revision_publicacion_destino",
+        ):
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            destino = _destino_por_key(state.get("dest_key", ""))
+            if destino:
+                mostrar_panel_control_grupo(
+                    message.chat.id,
+                    state["dest_key"],
+                    destino,
+                    message_id=state.get("panel_message_id"),
+                    aviso="Publicación cancelada; no se envió al canal.",
+                )
+            else:
+                editar_o_enviar_panel(
+                    message.chat.id,
+                    "El canal ya no está guardado.",
+                    _markup_grupos_admin(),
+                    message_id=state.get("panel_message_id"),
+                    protect_content=True,
+                    forzar_texto=True,
+                )
+            return
+        if paso == "esperando_palabra_prohibida":
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_palabras_prohibidas(
+                message.chat.id,
+                state.get("dest_key"),
+                message_id=state.get("panel_message_id"),
+                aviso="Edición cancelada; no se agregó ninguna palabra.",
+            )
+            return
         admin_estado.pop(message.from_user.id,None); eliminar_mensaje_seguro(message.chat.id,message.message_id)
-        mostrar_admin_config_pagos(message.chat.id,message_id=state.get("panel_message_id"),aviso="Edición cancelada; no se guardaron cambios."); return
+        mostrar_admin_config_pagos(message.chat.id,message_id=state.get("panel_message_id"),aviso="No se guardaron cambios."); return
+    if paso == "esperando_media_dest_publicacion":
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_paso_publicacion_destino(
+            message.chat.id,
+            state,
+            "📣 <b>Nueva publicación</b>\n\n"
+            "Envía una foto, video, documento, audio o animación. "
+            "Después añadirás la descripción.",
+        )
+        return
+    if paso == "esperando_descripcion_dest_publicacion":
+        if not text or len(text) > 900:
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_paso_publicacion_destino(
+                message.chat.id,
+                state,
+                "La descripción debe tener entre 1 y 900 caracteres. "
+                "Envíala de nuevo o escribe /cancelar.",
+            )
+            return
+        state["descripcion"] = text
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        try:
+            mostrar_previa_publicacion_destino(message.chat.id, state)
+        except Exception:
+            app.logger.exception("No se pudo preparar la vista previa del canal.")
+            mostrar_paso_publicacion_destino(
+                message.chat.id,
+                state,
+                "No pude preparar la vista previa. Envía de nuevo la descripción "
+                "o escribe /cancelar.",
+            )
+        return
+    if paso == "revision_publicacion_destino":
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        return
+    if paso == "esperando_palabra_prohibida":
+        dest_key = state.get("dest_key")
+        destino = _destino_por_key(dest_key or "")
+        panel_message_id = state.get("panel_message_id")
+        if not destino:
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_admin_config_pagos(message.chat.id, aviso="El destino ya no está disponible.")
+            return
+        try:
+            agregada = agregar_palabra_prohibida(
+                destino.get("chat_id"),
+                " ".join(text.split()),
+            )
+        except ValueError as error:
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            markup = types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "Cancelar",
+                    callback_data=f"mod_palabras_cancel|{dest_key}",
+                )
+            )
+            editar_o_enviar_panel(
+                message.chat.id,
+                f"{html.escape(str(error))} Envía otra entrada o pulsa Cancelar.",
+                markup,
+                message_id=panel_message_id,
+                protect_content=True,
+                forzar_texto=True,
+            )
+            return
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_palabras_prohibidas(
+            message.chat.id,
+            dest_key,
+            message_id=panel_message_id,
+            aviso=(
+                "Palabra agregada."
+                if agregada
+                else "Esa palabra o frase ya estaba en la lista."
+            ),
+        )
+        return
     if paso=="esperando_datos_metodo_pago":
         metodo=state.get("metodo_pago")
         if not text or len(text)>3000:
-            eliminar_mensaje_seguro(message.chat.id,message.message_id); mostrar_admin_config_pagos(message.chat.id,message_id=state.get("panel_message_id"),aviso="Texto vacío o demasiado largo; vuelve a intentarlo."); return
-        guardar_metodo_pago(metodo,text); eliminar_mensaje_seguro(message.chat.id,message.message_id); admin_estado.pop(message.from_user.id,None)
-        mostrar_admin_config_pagos(message.chat.id,message_id=state.get("panel_message_id"),aviso="Método actualizado."); return
-    if paso=="esperando_reglas_destino":
-        cid=state.get("chat_id"); key=state.get("dest_key")
-        eliminar_mensaje_seguro(message.chat.id,message.message_id)
-        Config.upsert({"tipo":"reglamento","chat_id":str(cid),"valor.":text}, (User.tipo=="reglamento") & (User.chat_id==str(cid)))
-        admin_estado.pop(message.from_user.id,None)
-        editar_o_enviar_panel(message.chat.id,"✅ Reglamento guardado para el destino.",_markup_grupos_admin(),protect_content=True)
+            admin_estado.pop(message.from_user.id,None)
+            eliminar_mensaje_seguro(message.chat.id,message.message_id); mostrar_opciones_metodo_pago(message.chat.id,metodo,message_id=state.get("panel_message_id"),aviso="Texto vacío o demasiado largo; pulsa «Agregar otro pago» para reintentarlo."); return
+        indice_reemplazo = state.get("reemplazar_indice")
+        guardar_metodo_pago(metodo, text, indice_reemplazo)
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        admin_estado.pop(message.from_user.id, None)
+        aviso = (
+            f"Opción {indice_reemplazo + 1} actualizada."
+            if isinstance(indice_reemplazo, int)
+            else "Opción agregada."
+        )
+        mostrar_opciones_metodo_pago(
+            message.chat.id,
+            metodo,
+            message_id=state.get("panel_message_id"),
+            aviso=aviso,
+        )
         return
     if paso=="esperando_link_pago":
         if not text.startswith("https://"):
@@ -2684,6 +5553,70 @@ def admin_media_payment_fallback(message):
 @bot.chat_join_request_handler()
 def aprobar_solicitud_goldpass(req):
     if str(req.chat.id)!=str(CANAL_ID): return
+    invite = getattr(req, "invite_link", None)
+    invite_url = getattr(invite, "invite_link", None)
+    if invite_url:
+        with FREE_GOLDPASS_LOCK:
+            freepass = FreeGoldPasses.get(
+                FREE_GOLDPASS_QUERY.invite_link == invite_url
+            )
+        if freepass:
+            user_id = int(req.from_user.id)
+            estado_campana = free_goldpass_config()
+            duracion = int(freepass.get("duration_seconds", 0) or 0)
+            if (
+                int(freepass.get("id", 0)) != user_id
+                or freepass.get("status") != "pending"
+                or not estado_campana.get("active")
+                or freepass.get("campaign_id")
+                != estado_campana.get("campaign_id")
+                or duracion not in FREE_GOLDPASS_DURATIONS
+            ):
+                try:
+                    bot.decline_chat_join_request(req.chat.id, user_id)
+                except Exception:
+                    app.logger.exception(
+                        "No se pudo rechazar una solicitud de Free Gold Pass no válida."
+                    )
+                return
+            try:
+                bot.approve_chat_join_request(req.chat.id, user_id)
+                entrada = datetime.now().replace(microsecond=0)
+                vence = entrada + timedelta(seconds=duracion)
+                with FREE_GOLDPASS_LOCK:
+                    FreeGoldPasses.update(
+                        {
+                            "status": "active",
+                            "joined_at": entrada.strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            ),
+                            "vence": vence.strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                        FREE_GOLDPASS_QUERY.id == user_id,
+                    )
+                try:
+                    bot.revoke_chat_invite_link(req.chat.id, invite_url)
+                except Exception:
+                    app.logger.exception(
+                        "No se pudo revocar el enlace personal tras el ingreso."
+                    )
+                try:
+                    bot.send_message(
+                        user_id,
+                        "✅ Tu entrada a GoldPass fue aprobada. Disfruta tu pase; "
+                        f"el acceso vence el <b>{vence.strftime('%d/%m/%Y %H:%M:%S')}</b>.",
+                        parse_mode="HTML",
+                        protect_content=True,
+                    )
+                except Exception:
+                    app.logger.info(
+                        "No se pudo enviar el aviso de aprobación del pase."
+                    )
+            except Exception:
+                app.logger.exception(
+                    "No se pudo aprobar la solicitud personal de Free Gold Pass."
+                )
+            return
     rec=db.get(Query().id==req.from_user.id)
     if not rec or not rec.get("vence"): return
     try:
@@ -2714,11 +5647,79 @@ def guardian_autorizacion(update):
     except Exception: pass
 
 
-@bot.message_handler(commands=["menu"], func=lambda m: m.chat.type in ("group","supergroup") and es_grupo_autorizado(m.chat.id))
+def teclado_menu_miembro(chat_id=None):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    destino_id = chat_id if chat_id and int(chat_id) < 0 else _default_group_id()
+    markup.add(
+        types.InlineKeyboardButton(
+            "📢 Crear publicación",
+            callback_data="crear_promo",
+        ),
+        types.InlineKeyboardButton(
+            "🚩 Reportar usuario",
+            callback_data=f"menu_reportar_nombre|{destino_id}",
+        ),
+    )
+    return markup
+
+
+def editar_panel_miembro(chat_id, texto, reply_markup=None):
+    if int(chat_id) > 0:
+        return editar_o_enviar_panel(
+            chat_id,
+            texto,
+            reply_markup,
+            protect_content=True,
+            parse_mode=None,
+            forzar_texto=True,
+        )
+
+    key = str(chat_id)
+    previous_id = PANELES_GRUPO_MIEMBRO.get(key)
+    if previous_id:
+        try:
+            bot.edit_message_text(
+                texto,
+                chat_id,
+                previous_id,
+                parse_mode=None,
+                reply_markup=reply_markup,
+            )
+            return SimpleNamespace(message_id=previous_id)
+        except Exception:
+            try:
+                bot.delete_message(chat_id, previous_id)
+            except Exception:
+                pass
+
+    panel = bot.send_message(
+        chat_id,
+        texto,
+        parse_mode=None,
+        reply_markup=reply_markup,
+        protect_content=True,
+    )
+    PANELES_GRUPO_MIEMBRO[key] = panel.message_id
+    return panel
+
+
+def enviar_menu_miembro(chat_id):
+    return editar_panel_miembro(
+        chat_id,
+        "🏹 MENÚ DE LA COMUNIDAD\n\nElige una acción:",
+        teclado_menu_miembro(chat_id),
+    )
+
+
+@bot.message_handler(
+    commands=["menu"],
+    func=lambda m: m.chat.type == "private"
+    or (m.chat.type in ("group", "supergroup") and es_grupo_autorizado(m.chat.id)),
+)
 def group_menu_command(message):
-    if message.chat.type in ("group","supergroup") and es_grupo_autorizado(message.chat.id):
-        eliminar_mensaje_seguro(message.chat.id,message.message_id)
-        bot.send_message(message.chat.id,"🏹 Usa los accesos rápidos de la barra inferior.",reply_markup=obtener_teclado_cuadritos())
+    if message.chat.type in ("group", "supergroup"):
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+    enviar_menu_miembro(message.chat.id)
 
 
 def _default_group_id():
@@ -2731,7 +5732,7 @@ GRUPO_ID = _default_group_id()
 def motor_principal(message):
     global ULTIMOS_MSGS
     chat_id, uid = message.chat.id, message.from_user.id
-    print(f"📨 MENSAJE RECIBIDO — chat:{chat_id} uid:{uid} tipo:{message.content_type} texto:{message.text or '[media]'}")
+    print(f"📨 MENSAJE RECIBIDO — tipo:{message.content_type}")
     COMANDOS = ["/menu", "/compartir", "/reglas", "/vchat", "/admin", "/start", "/reportar"]
 
     # --- SEGURIDAD: BLOQUEAR GRUPOS NO AUTORIZADOS ---
@@ -2743,11 +5744,16 @@ def motor_principal(message):
         return
 
     # --- SEGURIDAD: BLACKLIST ---
-    if Blacklist.search(User.id == uid):
+    alcance_lista = (
+        chat_id
+        if message.chat.type in ("group", "supergroup", "channel")
+        else None
+    )
+    if _usuario_en_lista_negra(uid, alcance_lista):
         return
 
     # --- SEGURIDAD: ANTI-FLOOD ---
-    if str(uid) != str(ADMIN_ID) and es_flood(uid):
+    if str(uid) != str(ADMIN_ID) and uid != 1087968824 and es_flood(uid):
         try:
             bot.send_message(chat_id, "⚠️ Estás enviando mensajes muy rápido. Espera unos segundos.")
         except:
@@ -2764,50 +5770,75 @@ def motor_principal(message):
         if not es_comando and message.content_type == 'text':
             return
 
-    if uid == 1087968824:
-        if message.text:
-            bot_info = bot.get_me()
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            markup.add(types.InlineKeyboardButton(
-                "🏠 ABRIR MENÚ PRINCIPAL",
-                url=f"https://t.me/{bot_info.username}?start=payment"
-            ))
-            bot.send_message(
-                chat_id,
-                "🏹 Pulsa el botón para abrir el Menú del Templo en privado. 🔥",
-                reply_markup=markup
-            )
+    texto_anonimo = (message.text or "").strip().lower()
+    atajos_grupo_anonimos = (
+        "/start",
+        "🏠 /start",
+        "/menu",
+        "🏹 /menu",
+        "/reglas",
+        "📜 /reglas",
+        "/compartir",
+        "🚀 /compartir",
+        "/vchat",
+        "🔥 /vchat",
+        "/admin",
+        "👤 /admin",
+        "/reportar",
+    )
+    es_atajo_grupo_anonimo = any(
+        texto_anonimo == atajo
+        or texto_anonimo.startswith(f"{atajo}@")
+        or texto_anonimo.startswith(f"{atajo} ")
+        for atajo in atajos_grupo_anonimos
+    )
+    if uid == 1087968824 and not es_atajo_grupo_anonimo:
         return
 
     uname = (message.from_user.username or "anonimo").lower()
-    guardar_evidencia(message)
+    evidencia = guardar_evidencia(message)
     if es_grupo_autorizado(chat_id):
         registrar_actividad_stats(uid, uname)
+    if moderar_palabras_prohibidas(message, evidencia=evidencia):
+        return
     if not message.text:
         return
     texto = message.text.lower()
 
-    if texto.startswith("/reportar") or (texto.startswith("/start") and "reporte" in texto):
-        if not es_grupo_autorizado(chat_id):
+    if texto.startswith("/reportar"):
+        group_id = (
+            chat_id
+            if message.chat.type in ("group", "supergroup") and es_grupo_autorizado(chat_id)
+            else _grupo_reporte_seleccionado()
+        )
+        if message.chat.type == "private":
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(
-                types.InlineKeyboardButton("👤 REPORTAR USUARIO POR NOMBRE", callback_data="menu_reportar_nombre"),
-                types.InlineKeyboardButton("🖼️ REPORTAR MULTIMEDIA", callback_data="menu_reportar_multimedia")
+                types.InlineKeyboardButton(
+                    "👤 REPORTAR USUARIO POR NOMBRE",
+                    callback_data=f"menu_reportar_nombre|{group_id}",
+                ),
+                types.InlineKeyboardButton(
+                    "🖼️ REPORTAR MULTIMEDIA",
+                    callback_data=f"menu_reportar_multimedia|{group_id}",
+                ),
             )
-            bot.send_message(
+            editar_o_enviar_panel(
                 chat_id,
-                "🕵️ **CENTRO DE JUSTICIA — GRAN CACIQUE**\n\n"
-                "¿Qué tipo de denuncia quieres realizar?\n\n"
-                "👤 *Reportar por nombre* — envía una advertencia oficial al infractor en el grupo.\n"
-                "🖼️ *Reportar multimedia* — revisa las últimas publicaciones del usuario y denuncia contenido específico.",
-                reply_markup=markup
+                "🕵️ CENTRO DE REPORTES\n\nElige qué quieres reportar:",
+                markup,
+                protect_content=True,
+                forzar_texto=True,
             )
         else:
             eliminar_mensaje_seguro(chat_id, message.message_id)
             if ULTIMOS_MSGS['reportar']:
                 eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['reportar'])
             markup = types.InlineKeyboardMarkup().add(
-                types.InlineKeyboardButton("🚩 REPORTAR AQUÍ", url=f"https://t.me/{bot.get_me().username}?start=reporte")
+                types.InlineKeyboardButton(
+                    "🚩 REPORTAR AQUÍ",
+                    url=f"https://t.me/{bot.get_me().username}?start=reporte_{group_id}",
+                )
             )
             resp = bot.send_message(chat_id, f"👤 @{uname}, clica para denunciar.", reply_markup=markup)
             ULTIMOS_MSGS['reportar'] = resp.message_id
@@ -2815,55 +5846,26 @@ def motor_principal(message):
 
     # --- BLOQUE DE START ---
     if texto in ["/start", "🏠 /start"] or texto.startswith("/start@") or texto.startswith("/start "):
-        if not es_grupo_autorizado(chat_id):
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            btn_grupo = types.InlineKeyboardButton("🔥 ENTRAR AL GRUPO PRINCIPAL", url=LINK_GRUPO)
-            btn_invitar = types.InlineKeyboardButton("🚀 INVITAR A GUERREROS", url=LINK_SHARE)
-            btn_vip = types.InlineKeyboardButton("💎 SOLICITAR ACCESO VIP", callback_data="solicitar_vip")
-            btn_promo = types.InlineKeyboardButton("📢 CREAR MI PUBLICACIÓN", callback_data="crear_promo")
-            btn_canal = types.InlineKeyboardButton("📺 ENTRAR AL CANAL GRATUITO", callback_data="canal_gratuito")
-            markup.add(btn_grupo, btn_invitar, btn_vip, btn_promo, btn_canal)
-            if str(uid) == str(ADMIN_ID):
-                markup.add(types.InlineKeyboardButton("⚙️ CONFIGURACIÓN DEL CACIQUE", callback_data="admin_config_panel"))
-            bot.send_message(
-                chat_id,
-                "🏹 *¡BIENVENIDO AL TEMPLO DEL CACIQUE!*\n\nSelecciona una opción de combate:",
-                reply_markup=markup
-            )
-            bot.send_message(chat_id, "⚔️ Tus armas de guerrero están listas.", reply_markup=obtener_teclado_cuadritos())
-        else:
+        if message.chat.type in ("group", "supergroup") and es_grupo_autorizado(chat_id):
             eliminar_mensaje_seguro(chat_id, message.message_id)
-            if ULTIMOS_MSGS['start']:
-                eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['start'])
-            bot_info = bot.get_me()
-            markup = types.InlineKeyboardMarkup(row_width=1)
-            markup.add(types.InlineKeyboardButton(
-                "🏠 ABRIR MENÚ DEL CACIQUE",
-                url=f"https://t.me/{bot_info.username}?start=payment"
-            ))
-            aviso = bot.send_message(
-                chat_id,
-                f"🏹 @{uname}, pulsa el botón para abrir el Menú del Templo en privado. 🔥",
-                reply_markup=markup
-            )
-            ULTIMOS_MSGS['start'] = aviso.message_id
-        return
-
-    if "/menu" in texto:
-        nombre_display = message.from_user.first_name or f"@{uname}"
-        msg_menu = (
-            f"🔱 **¡{nombre_display}, tus herramientas están activas!** ⚔️⚔️\n\n"
-            f"Usa los botones de la barra de mensajes para dominar la tribu.\n"
-            f"💎 Todo el poder de la tribu está en tus manos. 🏹🔥"
-        )
-        if es_grupo_autorizado(chat_id):
-            eliminar_mensaje_seguro(chat_id, message.message_id)
-            if ULTIMOS_MSGS['menu']:
-                eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['menu'])
-            resp = bot.send_message(chat_id, msg_menu, reply_markup=obtener_teclado_cuadritos())
-            ULTIMOS_MSGS['menu'] = resp.message_id
+            enviar_aviso_acceso_grupo(chat_id)
         elif message.chat.type == "private":
             mostrar_metodos_pago(chat_id)
+            if str(uid) == str(ADMIN_ID):
+                bot.send_message(
+                    chat_id,
+                    "Atajos privados de administración.",
+                    reply_markup=teclado_admin_privado(),
+                    protect_content=True,
+                )
+        return
+
+    if texto in ("/menu", "🏹 /menu") or texto.startswith("/menu@"):
+        if message.chat.type in ("group", "supergroup") and es_grupo_autorizado(chat_id):
+            eliminar_mensaje_seguro(chat_id, message.message_id)
+        if message.chat.type == "private" or es_grupo_autorizado(chat_id):
+            enviar_menu_miembro(chat_id)
+        return
 
     elif "/compartir" in texto:
         if es_grupo_autorizado(chat_id):
@@ -2883,38 +5885,58 @@ def motor_principal(message):
             bot.send_message(chat_id, txt_compartir, reply_markup=markup)
 
     elif "/reglas" in texto:
-        reglas_cfg = Config.search((User.tipo == 'reglamento') & (User.chat_id == str(chat_id))) or Config.search(User.tipo == 'reglamento')
+        reglas_cfg = Config.search((User.tipo == 'reglamento') & (User.chat_id == str(chat_id)))
         saved_group = cargar_config().get("group_settings", {}).get(str(chat_id), {})
-        val = reglas_cfg[0]['valor.'] if reglas_cfg else saved_group.get("rules") or "Respeta al Cacique."
+        val = (
+            reglas_cfg[0].get("valor.")
+            if reglas_cfg
+            else saved_group.get("rules")
+        ) or DEFAULT_GROUP_RULES
         if es_grupo_autorizado(chat_id):
             eliminar_mensaje_seguro(chat_id, message.message_id)
-            if ULTIMOS_MSGS['reglas']:
-                eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['reglas'])
-            resp = bot.send_message(chat_id, f"📜 **REGLAMENTO SAGRADO**\n\n{val}", reply_markup=obtener_teclado_cuadritos())
+            resp = editar_panel_miembro(chat_id, val)
             ULTIMOS_MSGS['reglas'] = resp.message_id
         else:
-            bot.send_message(chat_id, f"📜 **REGLAMENTO SAGRADO**\n\n{val}", reply_markup=obtener_teclado_cuadritos())
+            editar_panel_miembro(chat_id, val)
 
     elif "/vchat" in texto:
         if es_grupo_autorizado(chat_id):
             eliminar_mensaje_seguro(chat_id, message.message_id)
             enviar_invitacion_vchat(chat_id)
+        elif message.chat.type == "private":
+            eliminar_mensaje_seguro(chat_id, message.message_id)
+            destino_id = _default_group_id()
+            if destino_id:
+                enviar_invitacion_vchat(chat_id, destino_chat_id=destino_id)
+            else:
+                bot.send_message(
+                    chat_id,
+                    "No hay un grupo configurado para mostrar la guía de videochat.",
+                )
 
     elif "/admin" in texto:
-        bot_info = bot.get_me()
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("👤 Contactar Cacique", url=f"https://t.me/{MY_USER}"),
-            types.InlineKeyboardButton("🚩 REPORTAR INFRACTOR", url=f"https://t.me/{bot_info.username}?start=reporte")
+        markup = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                "👤 Abrir chat privado con el administrador",
+                url=GROUP_ADMIN_CONTACT_URL,
+            )
         )
         if es_grupo_autorizado(chat_id):
             eliminar_mensaje_seguro(chat_id, message.message_id)
             if ULTIMOS_MSGS['admin']:
                 eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['admin'])
-            resp = bot.send_message(chat_id, "🚩 **CENTRO DE COMANDO**", reply_markup=markup)
+            resp = editar_panel_miembro(
+                chat_id,
+                "Para hablar directamente con el administrador, pulsa el botón y Telegram abrirá su chat privado.",
+                markup,
+            )
             ULTIMOS_MSGS['admin'] = resp.message_id
         else:
-            bot.send_message(chat_id, "🚩 **CENTRO DE COMANDO**", reply_markup=markup)
+            editar_panel_miembro(
+                chat_id,
+                "Pulsa el botón para abrir el chat privado del administrador.",
+                markup,
+            )
 
 
 # --- MANEJO DE CALLBACKS ---
@@ -2924,7 +5946,12 @@ def manejar_clics(call):
     u_name = call.from_user.first_name
     u_user = call.from_user.username or "SinUser"
 
-    if Blacklist.search(User.id == uid):
+    alcance_lista = (
+        call.message.chat.id
+        if call.message and call.message.chat.type in ("group", "supergroup", "channel")
+        else None
+    )
+    if _usuario_en_lista_negra(uid, alcance_lista):
         bot.answer_callback_query(call.id, "❌ Acceso denegado.")
         return
 
@@ -2965,21 +5992,30 @@ def manejar_clics(call):
         bot.send_message(ADMIN_ID, info_vip, reply_markup=m_vip)
 
     elif call.data == "canal_gratuito":
-        bot.answer_callback_query(call.id)
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(types.InlineKeyboardButton(
             "🔥 UNIRME AL TEMPLO DEL CACIQUE X",
             url=LINK_CANAL_GRATUITO
         ))
-        bot.send_message(
-            uid,
-            "🏹 **¿ESTÁS LISTO PARA UNIRTE AL TEMPLO DEL CACIQUE X?**\n\n"
-            "Este canal es completamente *gratuito* y está lleno de contenido exclusivo "
-            "de la comunidad más ardiente de Telegram. 🔥\n\n"
-            "🔱 Si quieres disfrutar del placer y apoyar al Cacique X, "
-            "pulsa el botón de abajo y sé parte de nuestra comunidad. ¡La tribu te espera! 💎⚔️",
-            reply_markup=markup
-        )
+        try:
+            editar_o_enviar_panel(
+                uid,
+                "🏹 **¿ESTÁS LISTO PARA UNIRTE AL TEMPLO DEL CACIQUE X?**\n\n"
+                "Este canal es completamente *gratuito* y está lleno de contenido exclusivo "
+                "de la comunidad más ardiente de Telegram. 🔥\n\n"
+                "🔱 Si quieres disfrutar del placer y apoyar al Cacique X, "
+                "pulsa el botón de abajo y sé parte de nuestra comunidad. ¡La tribu te espera! 💎⚔️",
+                markup,
+                protect_content=True,
+                forzar_texto=True,
+            )
+            bot.answer_callback_query(call.id)
+        except Exception:
+            bot.answer_callback_query(
+                call.id,
+                "Abre el bot en privado y pulsa /start antes de usar este botón.",
+                show_alert=True,
+            )
 
     elif call.data.startswith("vip_si_"):
         target_id = int(call.data.split("_")[2])
@@ -3001,8 +6037,16 @@ def manejar_clics(call):
         bot.send_message(target_id, "❌ **Tu solicitud VIP ha sido rechazada por el consejo.**")
 
     elif call.data == "crear_promo":
-        msg = bot.send_message(uid, "📸 Envía Foto o Video:")
-        bot.register_next_step_handler(msg, step_multimedia_promo)
+        try:
+            msg = bot.send_message(uid, "📸 Envía la foto o el video de tu publicación:")
+            bot.register_next_step_handler(msg, step_multimedia_promo)
+            bot.answer_callback_query(call.id)
+        except Exception:
+            bot.answer_callback_query(
+                call.id,
+                "Abre el bot en privado y pulsa /start antes de crear una publicación.",
+                show_alert=True,
+            )
 
     elif call.data == "add_link":
         msg = bot.send_message(uid, "🔗 Envía el siguiente enlace:")
@@ -3028,14 +6072,24 @@ def manejar_clics(call):
         target_uid = int(call.data.split("_")[1])
         d = user_data.get(target_uid)
         if d:
-            PromosAprobadas.insert(d)
             mk = types.InlineKeyboardMarkup()
             for b in d['botones']:
                 mk.add(types.InlineKeyboardButton(b['text'], url=b['url']))
             if d['is_video']:
-                bot.send_video(GRUPO_ID, d['file_id'], caption=d['desc'], reply_markup=mk)
+                publicado = bot.send_video(
+                    GRUPO_ID, d['file_id'], caption=d['desc'], reply_markup=mk
+                )
             else:
-                bot.send_photo(GRUPO_ID, d['file_id'], caption=d['desc'], reply_markup=mk)
+                publicado = bot.send_photo(
+                    GRUPO_ID, d['file_id'], caption=d['desc'], reply_markup=mk
+                )
+            registro_publicacion = dict(d)
+            registro_publicacion.update({
+                "chat_id": str(GRUPO_ID),
+                "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "published_message_id": publicado.message_id,
+            })
+            PromosAprobadas.insert(registro_publicacion)
             bot.edit_message_caption("🚀 **PUBLICADO**", ADMIN_ID, mid)
             bot.send_message(target_uid, "✅ **¡APROBADO!**")
             bot.answer_callback_query(call.id)
@@ -3046,17 +6100,30 @@ def manejar_clics(call):
         bot.edit_message_caption("❌ **RECHAZADA**", ADMIN_ID, mid)
         bot.send_message(target_uid, "❌ **Tu publicación no fue aprobada.**")
 
-    elif call.data == "menu_reportar_nombre":
-        bot.answer_callback_query(call.id)
-        msg = bot.send_message(
-            uid,
-            "👤 **REPORTAR USUARIO POR NOMBRE**\n\n"
-            "Escribe el @usuario del infractor que quieres denunciar:\n"
-            "_(Ejemplo: @NombreDelUsuario o NombreDelUsuario)_"
+    elif call.data.startswith("menu_reportar_nombre"):
+        group_id = _grupo_reporte_seleccionado(
+            call.data.split("|", 1)[1] if "|" in call.data else None
         )
-        bot.register_next_step_handler(msg, step_reporte_por_nombre)
+        try:
+            msg = bot.send_message(
+                uid,
+                "👤 **REPORTAR USUARIO POR NOMBRE**\n\n"
+                "Escribe el @usuario del infractor que quieres denunciar:\n"
+                "_(Ejemplo: @NombreDelUsuario o NombreDelUsuario)_"
+            )
+            bot.register_next_step_handler(msg, step_reporte_por_nombre, group_id)
+            bot.answer_callback_query(call.id)
+        except Exception:
+            bot.answer_callback_query(
+                call.id,
+                "Abre el bot en privado y pulsa /start antes de reportar.",
+                show_alert=True,
+            )
 
-    elif call.data == "menu_reportar_multimedia":
+    elif call.data.startswith("menu_reportar_multimedia"):
+        group_id = _grupo_reporte_seleccionado(
+            call.data.split("|", 1)[1] if "|" in call.data else None
+        )
         bot.answer_callback_query(call.id)
         msg = bot.send_message(
             uid,
@@ -3064,29 +6131,58 @@ def manejar_clics(call):
             "Escribe el @usuario del infractor cuyas publicaciones quieres revisar:\n"
             "_(Ejemplo: @NombreDelUsuario o NombreDelUsuario)_"
         )
-        bot.register_next_step_handler(msg, step_reporte_multimedia_buscar)
+        bot.register_next_step_handler(msg, step_reporte_multimedia_buscar, group_id)
+
+    elif call.data.startswith("rpt_media|"):
+        try:
+            _, group_id, target_id, report_message_id = call.data.split("|", 3)
+            group_id, target_id = int(group_id), int(target_id)
+        except (ValueError, TypeError):
+            bot.answer_callback_query(call.id, "El reporte no es válido.", show_alert=True)
+            return
+        registros = _registros_grupo(
+            RegistroActividad, group_id, legacy_principal=True
+        )
+        evidencia = next(
+            (
+                row for row in registros
+                if int(row.get("id", 0)) == target_id
+                and str(row.get("msg_id")) == str(report_message_id)
+            ),
+            None,
+        )
+        if not evidencia:
+            bot.answer_callback_query(call.id, "Ese contenido ya no está registrado.", show_alert=True)
+            return
+        aplicar_castigo(
+            group_id,
+            target_id,
+            evidencia.get("uname") or "sin_usuario",
+            reporter_id=uid,
+            evidence=evidencia,
+        )
+        bot.answer_callback_query(call.id, "Reporte registrado.")
 
     elif call.data.startswith("rpt_media_"):
         parts = call.data.split("_", 3)
         t_id = int(parts[2])
         t_name = parts[3]
-        bot.answer_callback_query(call.id, "⚠️ Reporte enviado")
-        aplicar_castigo(GRUPO_ID, t_id, t_name)
-        advertencias = Warnings.search(User.id == t_id)
-        count = advertencias[0]['count'] if advertencias else 1
-        bot.send_message(
-            uid,
-            f"✅ **REPORTE APLICADO**\n\n"
-            f"Advertencia {count}/3 enviada a @{t_name} en el grupo.\n"
-            f"Ha sido silenciado 35 minutos."
-        )
+        aplicar_castigo(GRUPO_ID, t_id, t_name, reporter_id=uid)
+        bot.answer_callback_query(call.id, "Reporte registrado.")
 
 
 # --- PASOS DE REPORTES ---
-def step_reporte_por_nombre(message):
+def step_reporte_por_nombre(message, group_id=None):
     uid = message.chat.id
     target = message.text.strip().lstrip("@").lower()
-    registros = RegistroActividad.search(Query().uname == target)
+    group_id = _grupo_reporte_seleccionado(group_id)
+    registros = [
+        registro
+        for registro in _registros_grupo(
+            RegistroActividad, group_id, legacy_principal=True
+        )
+        if str(registro.get("uname", "")).lower() == target
+    ]
     if not registros:
         bot.send_message(
             uid,
@@ -3094,24 +6190,28 @@ def step_reporte_por_nombre(message):
             "Verifica que el usuario haya participado recientemente y que el @usuario sea correcto."
         )
         return
-    t_id = registros[0]['id']
-    aplicar_castigo(GRUPO_ID, t_id, target)
-    advertencias = Warnings.search(User.id == t_id)
-    count = advertencias[0]['count'] if advertencias else 1
-    bot.send_message(
-        uid,
-        f"✅ **REPORTE ENVIADO**\n\n"
-        f"Se ha enviado advertencia oficial *{count}/3* a @{target} en el grupo.\n"
-        f"Ha sido silenciado durante 35 minutos.\n\n"
-        f"_A la tercera penalización será expulsado permanentemente._"
+    registro = max(registros, key=lambda item: str(item.get("date", "")))
+    aplicar_castigo(
+        group_id,
+        registro["id"],
+        target,
+        reporter_id=uid,
+        evidence=registro,
     )
 
-def step_reporte_multimedia_buscar(message):
+
+def step_reporte_multimedia_buscar(message, group_id=None):
     uid = message.chat.id
     target = message.text.strip().lstrip("@").lower()
-    todos = RegistroActividad.search(Query().uname == target)
-    media = [r for r in todos if r.get('type') in ('photo', 'video', 'text') or r.get('file_id')]
-    ultimos = media[-6:] if len(media) > 6 else media
+    group_id = _grupo_reporte_seleccionado(group_id)
+    todos = [
+        registro
+        for registro in _registros_grupo(
+            RegistroActividad, group_id, legacy_principal=True
+        )
+        if str(registro.get("uname", "")).lower() == target
+    ]
+    ultimos = sorted(todos, key=lambda item: str(item.get("date", "")), reverse=True)[:6]
     if not ultimos:
         bot.send_message(
             uid,
@@ -3124,10 +6224,12 @@ def step_reporte_multimedia_buscar(message):
         f"🔍 **Últimas publicaciones de @{target}**\n\n"
         f"Encontré *{len(ultimos)}* registro(s). Pulsa 🚩 REPORTAR en el que quieras denunciar:"
     )
-    t_id = ultimos[0]['id']
     for r in ultimos:
         markup = types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("🚩 REPORTAR ESTE CONTENIDO", callback_data=f"rpt_media_{t_id}_{target}")
+            types.InlineKeyboardButton(
+                "🚩 REPORTAR ESTE CONTENIDO",
+                callback_data=f"rpt_media|{group_id}|{r['id']}|{r['msg_id']}",
+            )
         )
         try:
             if r.get('type') == 'photo' and r.get('file_id'):
@@ -3218,6 +6320,11 @@ def proceso_obtener_usuario_reporte(message):
 
 if __name__ == "__main__":
     threading.Thread(target=revisar_vencimientos, name="vip-expiry", daemon=True).start()
+    threading.Thread(
+        target=revisar_vencimientos_free_goldpass,
+        name="free-goldpass-expiry",
+        daemon=True,
+    ).start()
     threading.Thread(target=bucle_repost_automatico, name="scheduled-reposts", daemon=True).start()
     threading.Thread(target=bucle_notificacion_menu, name="group-menu-reminder", daemon=True).start()
     # Preserve the deployed Render webhook; never replace it with a Replit dev URL.

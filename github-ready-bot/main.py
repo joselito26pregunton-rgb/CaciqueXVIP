@@ -745,14 +745,46 @@ def enviar_invitacion_vchat(chat_id, destino_chat_id=None):
 def bucle_notificacion_menu():
     while True:
         time.sleep(45 * 60)
+        # Mantener el alcance anterior: un solo destino principal, no canales.
+        grupos = _grupos_configurados()
+        if not grupos:
+            app.logger.warning("No se envió el recordatorio /start: no hay grupo configurado.")
+            continue
+        chat_id = grupos[0]
         try:
-            bot.send_message(
-                _grupos_configurados()[0],
-                "🔱 **¡GUERRERO!** ¿Ya tienes tus herramientas activas?\n\n"
-                "Presiona el botón 🏹 **/menu** de la barra de mensajes y desbloquea todo el poder de la tribu . 💎🔥"
+            _reenviar_recordatorio_start(chat_id)
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo reemplazar el recordatorio /start en el grupo (error=%s).",
+                type(error).__name__,
             )
-        except:
-            pass
+
+
+def _reenviar_recordatorio_start(chat_id):
+    texto = (
+        "🔱 **¡GUERRERO!** ¿Ya tienes tus herramientas activas?\n\n"
+        "Presiona el botón 🏹 **/start** de la barra de mensajes "
+        "y desbloquea todo el poder de la tribu. 💎🔥"
+    )
+    cfg = cargar_config()
+    recordatorios = cfg.get("group_start_reminder_message_ids", {})
+    anterior = recordatorios.get(str(chat_id)) if isinstance(recordatorios, dict) else None
+
+    # Publicar primero para no dejar el grupo sin aviso si Telegram rechaza
+    # el envío; después se elimina el aviso anterior.
+    nuevo = bot.send_message(chat_id, texto, parse_mode="Markdown")
+    if anterior:
+        eliminar_mensaje_seguro(chat_id, int(anterior))
+
+    with CONFIG_LOCK:
+        cfg = cargar_config()
+        recordatorios = cfg.setdefault("group_start_reminder_message_ids", {})
+        if not isinstance(recordatorios, dict):
+            recordatorios = {}
+            cfg["group_start_reminder_message_ids"] = recordatorios
+        recordatorios[str(chat_id)] = nuevo.message_id
+        guardar_config(cfg)
+    return nuevo
 
 def bucle_repost_automatico():
     while True:
@@ -5350,6 +5382,43 @@ def _grupo_reporte_seleccionado(valor=None):
     return int(GRUPO_ID or _default_group_id() or 0)
 
 
+def _limpiar_panel_inicio_privado(chat_id):
+    """Descarta el panel anterior para que /start siempre reconstruya el menú."""
+    try:
+        chat_key = str(int(chat_id))
+    except (TypeError, ValueError):
+        return
+    with PANEL_LOCK:
+        registro = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
+        PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == chat_key)
+    if registro and registro.get("message_id"):
+        try:
+            bot.delete_message(int(chat_id), int(registro["message_id"]))
+        except Exception:
+            # El usuario puede haber borrado el historial; el ID viejo ya no sirve.
+            pass
+
+
+def _mostrar_inicio_privado(chat_id):
+    _limpiar_panel_inicio_privado(chat_id)
+    app.logger.info("Se recibió /start en privado; se reconstruirá el panel de acceso.")
+    try:
+        return mostrar_metodos_pago(chat_id)
+    except Exception:
+        app.logger.exception("Falló la carga del panel de acceso para /start.")
+        try:
+            return bot.send_message(
+                chat_id,
+                "⚠️ No pude cargar las opciones de acceso en este momento. "
+                "Vuelve a pulsar /start en unos segundos.",
+                parse_mode=None,
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.exception("Tampoco se pudo enviar la respuesta de respaldo de /start.")
+            return None
+
+
 @bot.message_handler(commands=["start"])
 def start_payment(message):
     uid=message.from_user.id; chat_id=message.chat.id
@@ -5382,8 +5451,19 @@ def start_payment(message):
             forzar_texto=True,
         )
         return
-    mostrar_metodos_pago(chat_id)
-    if str(uid)==str(ADMIN_ID): bot.send_message(chat_id,"Atajos privados de administración.",reply_markup=teclado_admin_privado(),protect_content=True)
+    if message.chat.type != "private":
+        return
+    _mostrar_inicio_privado(chat_id)
+    if str(uid) == str(ADMIN_ID):
+        try:
+            bot.send_message(
+                chat_id,
+                "Atajos privados de administración.",
+                reply_markup=teclado_admin_privado(),
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.exception("No se pudieron restaurar los atajos del administrador tras /start.")
 
 @bot.message_handler(func=lambda m: m.chat.type=="private" and str(m.from_user.id)==str(ADMIN_ID) and bool(admin_estado.get(m.from_user.id, {}).get("paso")), content_types=["text"])
 def flujo_admin_pago(message):
@@ -5864,14 +5944,17 @@ def motor_principal(message):
             eliminar_mensaje_seguro(chat_id, message.message_id)
             enviar_aviso_acceso_grupo(chat_id)
         elif message.chat.type == "private":
-            mostrar_metodos_pago(chat_id)
+            _mostrar_inicio_privado(chat_id)
             if str(uid) == str(ADMIN_ID):
-                bot.send_message(
-                    chat_id,
-                    "Atajos privados de administración.",
-                    reply_markup=teclado_admin_privado(),
-                    protect_content=True,
-                )
+                try:
+                    bot.send_message(
+                        chat_id,
+                        "Atajos privados de administración.",
+                        reply_markup=teclado_admin_privado(),
+                        protect_content=True,
+                    )
+                except Exception:
+                    app.logger.exception("No se pudieron restaurar los atajos del administrador tras /start.")
         return
 
     if texto in ("/menu", "🏹 /menu") or texto.startswith("/menu@"):

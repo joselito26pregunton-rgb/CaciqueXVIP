@@ -1598,6 +1598,24 @@ def _guardar_archivo_suscripcion(
             "estado": estado,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+        fecha_entrada = (
+            registro.get("joined_at")
+            or registro.get("fecha_entrada")
+            or registro.get("fecha_ingreso")
+            or previo.get("joined_at")
+            or previo.get("fecha_entrada")
+            or previo.get("fecha_ingreso")
+        )
+        if fecha_entrada:
+            guardado["joined_at"] = str(fecha_entrada)
+        if "in_channel" in registro:
+            guardado["in_channel"] = bool(registro.get("in_channel"))
+        elif "in_channel" in previo:
+            guardado["in_channel"] = bool(previo.get("in_channel"))
+        if registro.get("left_at"):
+            guardado["left_at"] = str(registro["left_at"])
+        elif previo.get("left_at"):
+            guardado["left_at"] = str(previo["left_at"])
         if metodo:
             guardado["metodo_pago"] = str(metodo)
         if comprobante:
@@ -1612,9 +1630,11 @@ def _guardar_archivo_suscripcion(
 
 
 def _sincronizar_suscripciones_pagadas():
-    # Migra al archivo los accesos que ya existían antes de añadir el panel.
+    # La tabla principal de usuarios.json es la fuente de verdad de los accesos
+    # pagados; copiar todos los usuarios con ID evita ocultar registros antiguos
+    # que todavía no tengan fecha de vencimiento normalizada.
     for registro in db.all():
-        if isinstance(registro, dict) and registro.get("id") and registro.get("vence"):
+        if isinstance(registro, dict) and registro.get("id"):
             _guardar_archivo_suscripcion(registro)
 
 
@@ -1667,6 +1687,72 @@ def _obtener_suscripcion_admin(tipo, user_id):
     _sincronizar_suscripciones_pagadas()
     registro = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
     return dict(registro) if registro else None
+
+
+def _registrar_estado_miembro_goldpass(user_id, en_canal, username=None):
+    """Guarda entrada/salida solo para suscriptores ya registrados."""
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return
+    momento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    actual = db.get(Query().id == user_id)
+    with SUSCRIPCIONES_LOCK:
+        archivado = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
+    pase = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
+
+    if actual:
+        actual = dict(actual)
+        if en_canal:
+            entrada = (
+                actual.get("joined_at")
+                if actual.get("in_channel")
+                else momento
+            )
+            cambios = {"in_channel": True, "joined_at": entrada}
+        else:
+            cambios = {"in_channel": False, "left_at": momento}
+        if username:
+            cambios["username"] = str(username).lstrip("@")
+        db.update(cambios, Query().id == user_id)
+        actual.update(cambios)
+        # El archivador conserva el comprobante y método de pago existentes.
+        _guardar_archivo_suscripcion(actual)
+    elif archivado:
+        cambios = (
+            {
+                "in_channel": True,
+                "joined_at": (
+                    archivado.get("joined_at")
+                    if archivado.get("in_channel")
+                    else momento
+                ),
+            }
+            if en_canal
+            else {"in_channel": False, "left_at": momento}
+        )
+        if username:
+            cambios["username"] = str(username).lstrip("@")
+        with SUSCRIPCIONES_LOCK:
+            SUSCRIPCIONES_ARCHIVO.update(cambios, Query().id == user_id)
+
+    if pase:
+        cambios = (
+            {
+                "in_channel": True,
+                "joined_at": (
+                    pase.get("joined_at")
+                    if pase.get("in_channel")
+                    else momento
+                ),
+            }
+            if en_canal
+            else {"in_channel": False, "left_at": momento}
+        )
+        if username:
+            cambios["username"] = str(username).lstrip("@")
+        with FREE_GOLDPASS_LOCK:
+            FreeGoldPasses.update(cambios, FREE_GOLDPASS_QUERY.id == user_id)
 
 
 def _texto_tiempo_restante(vence):
@@ -1724,8 +1810,8 @@ def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
     if registros:
         texto = (
             f"👥 <b>Administrar suscripciones</b> · página {pagina + 1}/{paginas}\n\n"
-            f"Registros: <b>{len(registros)}</b>. Se muestran accesos pagados y Free Gold Pass; "
-            "pulsa un usuario para ver su ficha y comprobante."
+            f"Registros: <b>{len(registros)}</b>. Incluye usuarios de usuarios.json, "
+            "el historial pagado y Free Gold Pass. Pulsa un usuario para ver su ficha y comprobante."
         )
     else:
         texto = (
@@ -1773,17 +1859,30 @@ def mostrar_detalle_suscripcion(
         if registro.get("username")
         else "—"
     )
+    fecha_entrada = (
+        registro.get("joined_at")
+        or registro.get("fecha_entrada")
+        or registro.get("fecha_ingreso")
+        or "no registrada"
+    )
     nombre_tipo = "Free Gold Pass" if tipo == "free" else "GoldPass VIP"
     estado = registro.get("estado_panel") or registro.get("estado") or registro.get("status") or "registrado"
     if tipo == "paid":
         fecha = _parsear_fecha_suscripcion(registro.get("vence"))
         estado = "activo" if fecha and fecha > datetime.now() else "vencido"
     comprobante = registro.get("comprobante_file_id") or registro.get("receipt_file_id")
+    presencia_canal = (
+        "sí" if registro.get("in_channel") is True
+        else "no" if registro.get("in_channel") is False
+        else "sin dato"
+    )
     texto = (
         f"👤 <b>Suscripción · {html.escape(nombre_tipo)}</b>\n\n"
         f"🆔 ID: <code>{int(user_id)}</code>\n"
         f"📛 Usuario: {html.escape(username)}\n"
         f"📌 Estado: <b>{html.escape(str(estado))}</b>\n"
+        f"👥 En el canal: <b>{presencia_canal}</b>\n"
+        f"📥 Entrada al canal: <b>{html.escape(str(fecha_entrada))}</b>\n"
         f"⏳ {_texto_tiempo_restante(registro.get('vence'))}\n"
         f"📅 Vence: <b>{html.escape(str(registro.get('vence') or '—'))}</b>\n"
         f"🧾 Comprobante: <b>{'guardado' if comprobante else 'sin captura'}</b>"
@@ -2783,6 +2882,11 @@ def _enviar_publicacion_con_adjuntos(
         )
 
     validar_media_items(adjuntos)
+    tiene_botones = markup_tiene_botones(markup)
+    if tiene_botones and not texto.strip():
+        raise ValueError(
+            "Añade una descripción para mostrar los botones del álbum sin una burbuja vacía."
+        )
     clases_media = {
         "photo": types.InputMediaPhoto,
         "video": types.InputMediaVideo,
@@ -2797,42 +2901,24 @@ def _enviar_publicacion_con_adjuntos(
                 "Los GIF/animaciones solo se pueden añadir como archivo único."
             )
         opciones = {"media": adjunto["media_id"]}
-        if indice == 0 and texto:
+        # Con botones, la descripción pasa al mensaje que aloja el teclado:
+        # sendMediaGroup no admite reply_markup y así no hace falta una burbuja vacía.
+        if indice == 0 and texto and not tiene_botones:
             opciones.update(caption=texto, parse_mode="HTML")
         grupo.append(clase_media(**opciones))
 
     mensajes = bot.send_media_group(chat_id, grupo)
-    if markup_tiene_botones(markup):
-        try:
-            # sendMediaGroup no acepta reply_markup. Adjuntamos el teclado a
-            # la primera pieza del álbum después de enviar el grupo, evitando
-            # crear un mensaje adicional con el rótulo "Opciones:".
-            bot.edit_message_reply_markup(
+    if tiene_botones:
+        # Telegram no permite teclado en un álbum. El texto visible funciona
+        # como descripción del conjunto y lleva los botones debajo.
+        mensajes.append(
+            bot.send_message(
                 chat_id,
-                mensajes[0].message_id,
+                texto,
                 reply_markup=markup,
+                parse_mode="HTML",
             )
-        except Exception as error:
-            app.logger.info(
-                "Telegram no permitió adjuntar el teclado al álbum; "
-                "se usará un mensaje sin texto (error=%s).",
-                type(error).__name__,
-            )
-            try:
-                # Telegram exige texto en sendMessage. U+2063 es invisible,
-                # así los botones siguen disponibles sin mostrar "Opciones:".
-                mensajes.append(
-                    bot.send_message(
-                        chat_id,
-                        "\u2063",
-                        reply_markup=markup,
-                        parse_mode=None,
-                    )
-                )
-            except Exception:
-                app.logger.exception(
-                    "No se pudieron adjuntar los botones a la publicación multimedia."
-                )
+        )
     return mensajes
 
 def guardar_ultima_publicacion(canal_key, chat_id, mensaje, texto, media_id, media_type):
@@ -6897,6 +6983,7 @@ def aprobar_solicitud_goldpass(req):
                                 "%Y-%m-%d %H:%M:%S"
                             ),
                             "vence": vence.strftime("%Y-%m-%d %H:%M:%S"),
+                            "in_channel": True,
                         },
                         FREE_GOLDPASS_QUERY.id == user_id,
                     )
@@ -6927,9 +7014,45 @@ def aprobar_solicitud_goldpass(req):
     if not rec or not rec.get("vence"): return
     try:
         expiry=datetime.strptime(str(rec["vence"]),"%Y-%m-%d %H:%M:%S")
-        if expiry>datetime.now(): bot.approve_chat_join_request(req.chat.id,req.from_user.id)
+        if expiry>datetime.now():
+            bot.approve_chat_join_request(req.chat.id,req.from_user.id)
+            _registrar_estado_miembro_goldpass(
+                req.from_user.id,
+                True,
+                getattr(req.from_user, "username", None),
+            )
     except Exception:
         app.logger.exception("No se pudo procesar solicitud de ingreso al canal VIP.")
+
+
+@bot.chat_member_handler()
+def registrar_miembro_suscripcion_goldpass(update):
+    chat = getattr(update, "chat", None)
+    if not chat or str(getattr(chat, "id", "")) != str(CANAL_ID):
+        return
+    nuevo = getattr(update, "new_chat_member", None)
+    anterior = getattr(update, "old_chat_member", None)
+    usuario = getattr(nuevo, "user", None)
+    if not usuario or getattr(usuario, "is_bot", False):
+        return
+
+    def es_miembro(registro):
+        estado = getattr(registro, "status", "")
+        if estado in ("creator", "administrator", "member"):
+            return True
+        return estado == "restricted" and bool(
+            getattr(registro, "is_member", False)
+        )
+
+    antes, despues = es_miembro(anterior), es_miembro(nuevo)
+    if antes == despues:
+        return
+    _registrar_estado_miembro_goldpass(
+        usuario.id,
+        despues,
+        getattr(usuario, "username", None),
+    )
+
 
 @bot.my_chat_member_handler()
 def guardian_autorizacion(update):

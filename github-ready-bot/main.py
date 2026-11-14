@@ -44,6 +44,7 @@ _SEND_MESSAGE_ORIGINAL = bot.send_message
 
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 CONFIG_LOCK = threading.RLock()
+RECORDATORIO_START_LOCK = threading.RLock()
 PAYMENT_CONFIG_FILE = os.path.join(BASE_DIR, "payment_config.json")
 PAYMENT_CONFIG_LOCK = threading.RLock()
 db = TinyDB(os.path.join(BASE_DIR, "usuarios.json"))
@@ -770,25 +771,47 @@ def _reenviar_recordatorio_start(chat_id):
         "Presiona el botón 🏹 **/start** de la barra de mensajes "
         "y desbloquea todo el poder de la tribu. 💎🔥"
     )
-    cfg = cargar_config()
-    recordatorios = cfg.get("group_start_reminder_message_ids", {})
-    anterior = recordatorios.get(str(chat_id)) if isinstance(recordatorios, dict) else None
-
-    # Publicar primero para no dejar el grupo sin aviso si Telegram rechaza
-    # el envío; después se elimina el aviso anterior.
-    nuevo = bot.send_message(chat_id, texto, parse_mode="Markdown")
-    if anterior:
-        eliminar_mensaje_seguro(chat_id, int(anterior))
-
-    with CONFIG_LOCK:
+    with RECORDATORIO_START_LOCK:
         cfg = cargar_config()
-        recordatorios = cfg.setdefault("group_start_reminder_message_ids", {})
-        if not isinstance(recordatorios, dict):
-            recordatorios = {}
-            cfg["group_start_reminder_message_ids"] = recordatorios
-        recordatorios[str(chat_id)] = nuevo.message_id
-        guardar_config(cfg)
-    return nuevo
+        recordatorios = cfg.get("group_start_reminder_message_ids", {})
+        anterior = (
+            recordatorios.get(str(chat_id))
+            if isinstance(recordatorios, dict)
+            else None
+        )
+
+        if anterior:
+            try:
+                # El ID se guarda aunque haya mensajes de otras personas entre
+                # recordatorios; si no se puede borrar, no se manda otro para
+                # evitar que la notificación siga acumulándose.
+                bot.delete_message(chat_id, int(anterior))
+            except Exception as error:
+                detalle = str(error).lower()
+                if "message to delete not found" in detalle:
+                    app.logger.info(
+                        "El recordatorio anterior ya no existe en el grupo %s.",
+                        chat_id,
+                    )
+                else:
+                    app.logger.error(
+                        "No se envió un nuevo recordatorio /start en el grupo %s: "
+                        "Telegram no permitió borrar el anterior (%s).",
+                        chat_id,
+                        type(error).__name__,
+                    )
+                    return None
+
+        nuevo = bot.send_message(chat_id, texto, parse_mode="Markdown")
+        with CONFIG_LOCK:
+            cfg = cargar_config()
+            recordatorios = cfg.setdefault("group_start_reminder_message_ids", {})
+            if not isinstance(recordatorios, dict):
+                recordatorios = {}
+                cfg["group_start_reminder_message_ids"] = recordatorios
+            recordatorios[str(chat_id)] = nuevo.message_id
+            guardar_config(cfg)
+        return nuevo
 
 def bucle_repost_automatico():
     while True:

@@ -54,6 +54,7 @@ PANELES_PRIVADOS = db.table("paneles_privados")
 TECLADOS_PRIVADOS = db.table("teclados_privados")
 PANEL_QUERY = Query()
 PANEL_LOCK = threading.RLock()
+PUBLICATION_MEDIA_LOCK = threading.RLock()
 admin_estado = {}
 solicitudes_pendientes = {}
 solicitudes_info = {}
@@ -91,6 +92,9 @@ GroupBannedWords = TinyDB(os.path.join(BASE_DIR, "group_banned_words.json")).tab
 PromosAprobadas = TinyDB(os.path.join(BASE_DIR, "promos_aprobadas.json"))
 RegistroActividad = TinyDB(os.path.join(BASE_DIR, "registro_actividad.json"))
 Suscripciones = TinyDB(os.path.join(BASE_DIR, "suscripciones.json"))
+SUSCRIPCIONES_LOCK = threading.RLock()
+SUSCRIPCIONES_ARCHIVO = Suscripciones.table("suscripciones")
+COMPROBANTES_PENDIENTES = Suscripciones.table("comprobantes_pendientes")
 Estadisticas = TinyDB(os.path.join(BASE_DIR, "stats.json"))
 User = Query()
 
@@ -1085,7 +1089,7 @@ def obtener_datos_pago(metodo):
     if not opciones:
         return ""
     texto = "\n\n────────────\n\n".join(opciones)
-    if metodo not in METODOS_PAGO_POR_ENLACE and _AVISO.strip() not in texto:
+    if _AVISO.strip() not in texto and _AVISO_LINK.strip() not in texto:
         texto += _AVISO
     return texto
 
@@ -1143,6 +1147,52 @@ _AVISO_LINK = (
     "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines "
     "de procesar tu pedido para obtener el GoldPass."
 )
+
+
+def texto_pago_con_aviso(texto):
+    """Devuelve los datos junto con el aviso que debe copiarse al usuario."""
+    texto = str(texto or "").strip()
+    if not texto:
+        return _AVISO.strip()
+    if _AVISO.strip() in texto or _AVISO_LINK.strip() in texto:
+        return texto
+    return texto + _AVISO
+
+
+def fragmentos_para_boton_copiar(texto, limite=256):
+    """Divide el texto sin perder caracteres y respetando el límite de Telegram."""
+    fragmentos = []
+    actual = []
+    unidades = 0
+    for caracter in texto:
+        unidades_caracter = len(caracter.encode("utf-16-le")) // 2
+        if actual and unidades + unidades_caracter > limite:
+            fragmentos.append("".join(actual))
+            actual = []
+            unidades = 0
+        actual.append(caracter)
+        unidades += unidades_caracter
+    if actual:
+        fragmentos.append("".join(actual))
+    return fragmentos
+
+
+def agregar_botones_copiar(markup, texto, etiqueta):
+    """Agrega botones de copia completos; textos largos se dividen en partes."""
+    fragmentos = fragmentos_para_boton_copiar(texto)
+    total = len(fragmentos)
+    for indice, fragmento in enumerate(fragmentos, start=1):
+        nombre = (
+            etiqueta
+            if total == 1
+            else f"{etiqueta} · {indice}/{total}"
+        )
+        markup.add(types.InlineKeyboardButton(
+            nombre,
+            copy_text=types.CopyTextButton(text=fragmento),
+        ))
+    return total
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 PASE_EXPRES_URL = "https://t.me/+xjHnFXb_QTY0NGEx"
@@ -1444,6 +1494,10 @@ def markup_admin_config_pagos():
             callback_data="admin_free_goldpass",
         ),
         types.InlineKeyboardButton(
+            "👥 Administrar suscripciones",
+            callback_data="admin_suscripciones|0",
+        ),
+        types.InlineKeyboardButton(
             "🔙 Volver al panel",
             callback_data="admin_pagos_volver",
         ),
@@ -1505,6 +1559,248 @@ def markup_opciones_metodo_pago(metodo):
         ),
     )
     return markup
+
+
+def _parsear_fecha_suscripcion(valor):
+    if not valor:
+        return None
+    try:
+        return datetime.strptime(str(valor), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _guardar_archivo_suscripcion(
+    registro, comprobante=None, metodo=None, estado_forzado=None
+):
+    """Conserva historial y comprobantes sin depender del registro activo."""
+    try:
+        user_id = int(registro.get("id"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    with SUSCRIPCIONES_LOCK:
+        previo = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id) or {}
+        guardado = dict(previo)
+        estado = (
+            estado_forzado
+            or (
+                "active"
+                if (_parsear_fecha_suscripcion(registro.get("vence")) or datetime.min)
+                > datetime.now()
+                else "expired"
+            )
+        )
+        guardado.update({
+            "id": user_id,
+            "username": str(registro.get("username") or previo.get("username") or ""),
+            "vence": str(registro.get("vence") or previo.get("vence") or ""),
+            "tipo": "paid",
+            "estado": estado,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        if metodo:
+            guardado["metodo_pago"] = str(metodo)
+        if comprobante:
+            guardado.update({
+                "comprobante_file_id": comprobante.get("file_id"),
+                "comprobante_tipo": comprobante.get("file_type", "photo"),
+                "comprobante_fecha": comprobante.get("received_at")
+                or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        SUSCRIPCIONES_ARCHIVO.upsert(guardado, Query().id == user_id)
+        return guardado
+
+
+def _sincronizar_suscripciones_pagadas():
+    # Migra al archivo los accesos que ya existían antes de añadir el panel.
+    for registro in db.all():
+        if isinstance(registro, dict) and registro.get("id") and registro.get("vence"):
+            _guardar_archivo_suscripcion(registro)
+
+
+def _lista_suscripciones_admin():
+    _sincronizar_suscripciones_pagadas()
+    registros = []
+    for registro in SUSCRIPCIONES_ARCHIVO.all():
+        actual = dict(registro)
+        actual["tipo"] = "paid"
+        registros.append(actual)
+    for registro in FreeGoldPasses.all():
+        if registro.get("status") not in (
+            "active", "expired", "expiring", "kick_pending", "expiry_pending"
+        ):
+            continue
+        actual = dict(registro)
+        actual["tipo"] = "free"
+        actual["vence"] = actual.get("vence") or ""
+        registros.append(actual)
+
+    ahora = datetime.now()
+    for registro in registros:
+        vence = _parsear_fecha_suscripcion(registro.get("vence"))
+        estado_original = registro.get("status") or registro.get("estado")
+        if estado_original in ("kick_pending", "expiry_pending", "expiring"):
+            registro["estado_panel"] = "expirando"
+        elif vence and vence > ahora:
+            registro["estado_panel"] = "activo"
+        else:
+            registro["estado_panel"] = "vencido"
+        registro["_vence_dt"] = vence or datetime.min
+    registros.sort(
+        key=lambda item: (
+            item.get("estado_panel") != "activo",
+            item.get("_vence_dt") or datetime.min,
+            item.get("tipo", ""),
+            int(item.get("id", 0) or 0),
+        )
+    )
+    return registros
+
+
+def _obtener_suscripcion_admin(tipo, user_id):
+    user_id = int(user_id)
+    if tipo == "free":
+        registro = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
+        return dict(registro) if registro else None
+    if tipo != "paid":
+        return None
+    _sincronizar_suscripciones_pagadas()
+    registro = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
+    return dict(registro) if registro else None
+
+
+def _texto_tiempo_restante(vence):
+    fecha = _parsear_fecha_suscripcion(vence)
+    if not fecha:
+        return "vencimiento no registrado"
+    restante = fecha - datetime.now()
+    if restante.total_seconds() <= 0:
+        return f"venció el {fecha.strftime('%d/%m/%Y %H:%M')}"
+    dias, resto = divmod(int(restante.total_seconds()), 86400)
+    horas, resto = divmod(resto, 3600)
+    minutos = resto // 60
+    if dias:
+        return f"le quedan {dias} d {horas} h"
+    if horas:
+        return f"le quedan {horas} h {minutos} min"
+    return f"le quedan {max(1, minutos)} min"
+
+
+def markup_lista_suscripciones(registros, pagina, tamano=8):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    inicio = pagina * tamano
+    for registro in registros[inicio:inicio + tamano]:
+        user_id = int(registro.get("id", 0) or 0)
+        tipo = registro.get("tipo", "paid")
+        icono = "✅" if registro.get("estado_panel") == "activo" else "⌛"
+        nombre = ("@" + str(registro["username"]).lstrip("@")) if registro.get("username") else f"ID {user_id}"
+        etiqueta = f"{icono} {nombre} · {_texto_tiempo_restante(registro.get('vence'))}"
+        markup.add(types.InlineKeyboardButton(
+            etiqueta[:60],
+            callback_data=f"admin_suscripcion_ver|{tipo}|{user_id}|{pagina}",
+        ))
+    navegacion = []
+    if pagina > 0:
+        navegacion.append(types.InlineKeyboardButton(
+            "⬅️ Anterior", callback_data=f"admin_suscripciones|{pagina - 1}"
+        ))
+    if inicio + tamano < len(registros):
+        navegacion.append(types.InlineKeyboardButton(
+            "Siguiente ➡️", callback_data=f"admin_suscripciones|{pagina + 1}"
+        ))
+    if navegacion:
+        markup.row(*navegacion)
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a métodos de pago", callback_data="admin_pagos_metodos_volver"
+    ))
+    return markup
+
+
+def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
+    registros = _lista_suscripciones_admin()
+    tamano = 8
+    paginas = max(1, (len(registros) + tamano - 1) // tamano)
+    pagina = max(0, min(int(pagina), paginas - 1))
+    if registros:
+        texto = (
+            f"👥 <b>Administrar suscripciones</b> · página {pagina + 1}/{paginas}\n\n"
+            f"Registros: <b>{len(registros)}</b>. Se muestran accesos pagados y Free Gold Pass; "
+            "pulsa un usuario para ver su ficha y comprobante."
+        )
+    else:
+        texto = (
+            "👥 <b>Administrar suscripciones</b>\n\n"
+            "Aún no hay suscripciones registradas."
+        )
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup_lista_suscripciones(registros, pagina, tamano),
+        message=message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def markup_detalle_suscripcion(tipo, user_id, pagina, tiene_comprobante):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if tiene_comprobante:
+        markup.add(types.InlineKeyboardButton(
+            "🧾 Ver comprobante",
+            callback_data=f"admin_suscripcion_ver_comprobante|{tipo}|{user_id}|{pagina}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "📎 Adjuntar o reemplazar captura",
+        callback_data=f"admin_suscripcion_adjuntar|{tipo}|{user_id}|{pagina}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a la lista",
+        callback_data=f"admin_suscripciones|{pagina}",
+    ))
+    return markup
+
+
+def mostrar_detalle_suscripcion(
+    chat_id, tipo, user_id, pagina, message=None, message_id=None, aviso=None
+):
+    registro = _obtener_suscripcion_admin(tipo, user_id)
+    if not registro:
+        return mostrar_lista_suscripciones(
+            chat_id, pagina, message=message
+        )
+    username = (
+        "@" + str(registro.get("username", "")).lstrip("@")
+        if registro.get("username")
+        else "—"
+    )
+    nombre_tipo = "Free Gold Pass" if tipo == "free" else "GoldPass VIP"
+    estado = registro.get("estado_panel") or registro.get("estado") or registro.get("status") or "registrado"
+    if tipo == "paid":
+        fecha = _parsear_fecha_suscripcion(registro.get("vence"))
+        estado = "activo" if fecha and fecha > datetime.now() else "vencido"
+    comprobante = registro.get("comprobante_file_id") or registro.get("receipt_file_id")
+    texto = (
+        f"👤 <b>Suscripción · {html.escape(nombre_tipo)}</b>\n\n"
+        f"🆔 ID: <code>{int(user_id)}</code>\n"
+        f"📛 Usuario: {html.escape(username)}\n"
+        f"📌 Estado: <b>{html.escape(str(estado))}</b>\n"
+        f"⏳ {_texto_tiempo_restante(registro.get('vence'))}\n"
+        f"📅 Vence: <b>{html.escape(str(registro.get('vence') or '—'))}</b>\n"
+        f"🧾 Comprobante: <b>{'guardado' if comprobante else 'sin captura'}</b>"
+    )
+    if registro.get("metodo_pago"):
+        texto += f"\n💳 Método: {html.escape(str(registro['metodo_pago']))}"
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup_detalle_suscripcion(tipo, user_id, pagina, bool(comprobante)),
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
 
 
 def mostrar_admin_config_pagos(
@@ -2117,6 +2413,176 @@ def admin_pagos_volver_panel(call):
     )
 
 
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripciones|")
+)
+def admin_abrir_suscripciones(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    try:
+        pagina = int(call.data.split("|", 1)[1])
+    except (IndexError, ValueError):
+        pagina = 0
+    bot.answer_callback_query(call.id)
+    mostrar_lista_suscripciones(
+        call.message.chat.id,
+        pagina,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripcion_ver|")
+)
+def admin_ver_suscripcion(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, tipo, raw_user_id, raw_pagina = call.data.split("|", 3)
+        user_id, pagina = int(raw_user_id), int(raw_pagina)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Ficha no válida.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_detalle_suscripcion(
+        call.message.chat.id,
+        tipo,
+        user_id,
+        pagina,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripcion_ver_comprobante|")
+)
+def admin_ver_comprobante_suscripcion(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, tipo, raw_user_id, raw_pagina = call.data.split("|", 3)
+        user_id, pagina = int(raw_user_id), int(raw_pagina)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Comprobante no válido.")
+        return
+    registro = _obtener_suscripcion_admin(tipo, user_id)
+    file_id = (
+        registro.get("comprobante_file_id") or registro.get("receipt_file_id")
+        if registro
+        else None
+    )
+    if not file_id:
+        bot.answer_callback_query(call.id, "No hay comprobante guardado.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    regresar = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+        "🔙 Volver a la ficha",
+        callback_data=f"admin_suscripcion_ver|{tipo}|{user_id}|{pagina}",
+    ))
+    caption = (
+        f"🧾 <b>Comprobante de suscripción</b>\n"
+        f"ID: <code>{user_id}</code>\n"
+        f"Usuario: @{html.escape(str((registro or {}).get('username') or '—'))}"
+    )
+    try:
+        if registro.get("comprobante_tipo") == "document":
+            bot.send_document(
+                call.message.chat.id, file_id, caption=caption,
+                parse_mode="HTML", reply_markup=regresar, protect_content=True,
+            )
+        else:
+            bot.send_photo(
+                call.message.chat.id, file_id, caption=caption,
+                parse_mode="HTML", reply_markup=regresar, protect_content=True,
+            )
+    except Exception:
+        app.logger.exception("No se pudo mostrar un comprobante archivado.")
+        bot.send_message(
+            call.message.chat.id,
+            "⚠️ No pude abrir esta captura. Puedes adjuntar otra desde la ficha.",
+            reply_markup=regresar,
+            protect_content=True,
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripcion_adjuntar|")
+)
+def admin_adjuntar_comprobante_suscripcion(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, tipo, raw_user_id, raw_pagina = call.data.split("|", 3)
+        user_id, pagina = int(raw_user_id), int(raw_pagina)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Ficha no válida.")
+        return
+    if not _obtener_suscripcion_admin(tipo, user_id):
+        bot.answer_callback_query(call.id, "No encontré esa suscripción.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_comprobante_suscriptor",
+        "suscripcion_tipo": tipo,
+        "suscripcion_user_id": user_id,
+        "suscripcion_pagina": pagina,
+        "panel_message_id": call.message.message_id,
+    }
+    markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+        "🔙 Cancelar",
+        callback_data=f"admin_suscripcion_ver|{tipo}|{user_id}|{pagina}",
+    ))
+    editar_o_enviar_panel(
+        call.message.chat.id,
+        "📎 <b>Adjuntar comprobante</b>\n\n"
+        f"Envía aquí la captura de pago del usuario <code>{user_id}</code>. "
+        "Se guardará en su ficha privada y reemplazará la captura anterior, si había una.",
+        markup,
+        message=call.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripcion_cancelar_comprobante|")
+)
+def admin_cancelar_comprobante_aprobacion(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        user_id = int(call.data.split("|", 1)[1])
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Solicitud no válida.")
+        return
+    admin_estado.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "No se aprobó la solicitud.")
+    if user_id in solicitudes_info:
+        info = solicitudes_info[user_id]
+        datos_id = info.get("datos_msg_id")
+        if datos_id:
+            markup = types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
+                types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
+            )
+            try:
+                bot.edit_message_reply_markup(
+                    int(ADMIN_ID), datos_id, reply_markup=markup
+                )
+            except Exception:
+                pass
+    bot.send_message(
+        call.message.chat.id,
+        "Solicitud pendiente; no se concedió el acceso.",
+        protect_content=True,
+    )
+
+
 def borrar_mensaje_luego(chat_id, message_id, demora):
     time.sleep(demora)
     try:
@@ -2177,6 +2643,87 @@ def media_items_de_publicacion(publicacion):
         publicacion.get("media_type"),
         publicacion.get("media_items"),
     )
+
+
+def media_items_de_estado_publicacion(estado):
+    return normalizar_media_items(
+        estado.get("media_id"),
+        estado.get("media_type"),
+        estado.get("media_items"),
+    )
+
+
+def anexar_media_a_publicacion(estado, media_type, media_id, group_id, message_id):
+    """Añade un elemento de álbum de forma segura ante mensajes concurrentes."""
+    with PUBLICATION_MEDIA_LOCK:
+        vistos = estado.setdefault("media_message_ids", [])
+        if message_id in vistos:
+            return "duplicate", ""
+
+        paso = estado.get("paso")
+        modo_media = estado.get("modo_media")
+        adjuntos = media_items_de_estado_publicacion(estado)
+        es_continuacion_album = (
+            paso == "esperando_descripcion_dest_publicacion"
+            and group_id
+            and group_id == estado.get("media_group_id")
+        )
+        if modo_media in ("append", "replace"):
+            puede_recibir = paso in (
+                "anadiendo_media_dest_publicacion",
+                "esperando_media_dest_publicacion",
+            )
+        else:
+            puede_recibir = (
+                paso == "esperando_media_dest_publicacion"
+                or es_continuacion_album
+            )
+        if not puede_recibir:
+            return (
+                "error",
+                "Para añadir otra foto o video, pulsa primero "
+                "«➕ Añadir foto/video» en el panel.",
+            )
+        if len(adjuntos) >= 3:
+            return (
+                "error",
+                "Esta publicación admite hasta 3 archivos. Usa «Modificar» "
+                "para reemplazar la multimedia.",
+            )
+
+        nuevos_adjuntos = adjuntos + [
+            {"media_id": media_id, "media_type": media_type}
+        ]
+        try:
+            validar_media_items(nuevos_adjuntos)
+        except ValueError as error:
+            return (
+                "error",
+                f"{error} Añade fotos/videos compatibles o reemplaza la multimedia.",
+            )
+
+        vistos.append(message_id)
+        estado["media_items"] = nuevos_adjuntos
+        estado["media_id"] = nuevos_adjuntos[0]["media_id"]
+        estado["media_type"] = nuevos_adjuntos[0]["media_type"]
+        if group_id and not estado.get("media_group_id"):
+            estado["media_group_id"] = group_id
+        if modo_media not in ("append", "replace"):
+            estado["paso"] = "esperando_descripcion_dest_publicacion"
+
+        if modo_media in ("append", "replace"):
+            return (
+                "added",
+                f"✅ Multimedia recibida: {len(nuevos_adjuntos)}/3.\n\n"
+                "Envía más fotos o videos si quieres y pulsa "
+                "«Listo, ver vista previa» cuando termines.",
+            )
+        return (
+            "added",
+            f"✅ Multimedia recibida: {len(nuevos_adjuntos)}/3.\n\n"
+            "Si enviaste un álbum, espera a que se reciban todas las piezas. "
+            "Después envía la descripción (máximo 900 caracteres).",
+        )
 
 
 def markup_tiene_botones(markup):
@@ -2388,7 +2935,14 @@ def expulsar_usuario_vencido(user_id):
     """Expulsa a un usuario del canal VIP, le notifica opciones de renovación
     y lo elimina de la base de datos. Usado tanto por la revisión automática
     de vencimientos como por el comando manual /expulsar (pruebas).
-    El db.remove() se ejecuta SIEMPRE aunque el ban o el mensaje fallen."""
+    El historial se conserva aunque el acceso activo se retire."""
+    registro = db.get(Query().id == int(user_id))
+    if registro and registro.get("vence"):
+        registro_archivo = dict(registro)
+        _guardar_archivo_suscripcion(
+            registro_archivo,
+            estado_forzado="expired",
+        )
     # 1. Expulsar del canal (si ya salió, el ban puede fallar — no importa)
     try:
         bot.ban_chat_member(CANAL_ID, user_id)
@@ -3000,6 +3554,14 @@ def admin_aprobar_pase_expres(call):
         },
         Query().id == user_id,
     )
+    _guardar_archivo_suscripcion(
+        {
+            "id": user_id,
+            "vence": vencimiento,
+            "username": username,
+        },
+        metodo="pase_expres",
+    )
 
     # Mantener la solicitud en el mismo panel; el primer botón confirma la
     # acción dentro del bot y luego entrega el enlace real del canal.
@@ -3050,6 +3612,8 @@ def admin_rechazar_pase_expres(call):
 
     user_id = int(call.data.split("_")[1])
     info    = solicitudes_info.pop(user_id, {})
+    with SUSCRIPCIONES_LOCK:
+        COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
 
     # Actualizar el panel privado del usuario y notificarle.
     try:
@@ -3161,6 +3725,7 @@ def _procesar_solicitud_link(call, metodo):
 
     solicitudes_info[user_id] = {
         'metodo': metodo, 'username': username,
+        'request_id': uuid.uuid4().hex,
         'notif_msg_id': notif_msg_id, 'datos_msg_id': None,
         'usuario_chat_id': call.message.chat.id,
         'usuario_msg_id': msg_usuario.message_id,
@@ -3251,6 +3816,7 @@ def solicitud_pago(call):
     solicitudes_info[user_id] = {
         'metodo':         metodo,
         'username':       username,
+        'request_id':     uuid.uuid4().hex,
         'notif_msg_id':   notif_msg_id,
         'datos_msg_id':   None,
         'usuario_chat_id': call.message.chat.id,
@@ -3399,27 +3965,31 @@ def admin_ver_datos(call):
     # el límite de Telegram. Todos los mensajes llevan protección de contenido.
     ids_mensajes = []
     for indice, opcion in enumerate(opciones, start=1):
-        datos = opcion
-        if metodo not in METODOS_PAGO_POR_ENLACE and _AVISO.strip() not in datos:
-            datos += _AVISO
-        datos_sin_aviso = datos.replace(_AVISO, "").strip()
+        datos = texto_pago_con_aviso(opcion)
         markup = types.InlineKeyboardMarkup(row_width=1)
         try:
-            markup.add(types.InlineKeyboardButton(
+            partes_copia = agregar_botones_copiar(
+                markup,
+                datos,
                 f"📋 Copiar opción {indice}",
-                copy_text=types.CopyTextButton(text=datos_sin_aviso[:256]),
-            ))
+            )
         except Exception:
-            pass
+            partes_copia = 0
         markup.add(
             types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
             types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
+        )
+        aviso_copia = (
+            "\n\n<i>El texto excede el límite de copia de Telegram; "
+            "copia cada parte y pégala en orden para conservar el texto completo.</i>"
+            if partes_copia > 1
+            else ""
         )
         datos_msg = bot.send_message(
             int(ADMIN_ID),
             f"📋 <b>DATOS — {html.escape(nombre_metodo)} "
             f"({indice}/{len(opciones)})</b>\n\n"
-            f"<code>{html.escape(datos)}</code>",
+            f"<code>{html.escape(datos)}</code>{aviso_copia}",
             parse_mode="HTML",
             reply_markup=markup,
             protect_content=True,
@@ -3455,10 +4025,50 @@ def admin_aprobar(call):
     if str(call.from_user.id) != str(ADMIN_ID):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
-    bot.answer_callback_query(call.id)
-
     user_id = int(call.data.split("_")[1])
-    info    = solicitudes_info.pop(user_id, {})
+    info = solicitudes_info.get(user_id)
+    if not info:
+        bot.answer_callback_query(
+            call.id,
+            "La solicitud ya no está disponible. Pide al usuario que vuelva a solicitar acceso.",
+            show_alert=True,
+        )
+        return
+    comprobante = COMPROBANTES_PENDIENTES.get(Query().id == user_id)
+    comprobante = dict(comprobante) if comprobante else None
+    if comprobante and (
+        not info.get("request_id")
+        or comprobante.get("request_id") != info.get("request_id")
+    ):
+        comprobante = None
+    if comprobante:
+        info["comprobante_file_id"] = comprobante.get("file_id")
+        info["comprobante_tipo"] = comprobante.get("file_type", "photo")
+        info["comprobante_fecha"] = comprobante.get("received_at")
+    if not info.get("comprobante_file_id"):
+        bot.answer_callback_query(call.id, "Falta la captura de pago.")
+        admin_estado[call.from_user.id] = {
+            "paso": "esperando_comprobante_aprobacion",
+            "user_id_comprobante": user_id,
+            "request_id": info.get("request_id"),
+        }
+        markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
+            "Cancelar",
+            callback_data=f"admin_suscripcion_cancelar_comprobante|{user_id}",
+        ))
+        bot.send_message(
+            int(ADMIN_ID),
+            "🧾 <b>Falta el comprobante</b>\n\n"
+            f"Envía aquí la captura de pago correspondiente al usuario "
+            f"<code>{user_id}</code>. Después podrás revisar la imagen y confirmar la aprobación.",
+            parse_mode="HTML",
+            reply_markup=markup,
+            protect_content=True,
+        )
+        return
+
+    bot.answer_callback_query(call.id)
+    info = solicitudes_info.pop(user_id, {})
 
     # Registrar suscripción VIP (30 días). El usuario confirma el acceso en
     # el bot y después recibe el enlace de invitación del canal.
@@ -3475,6 +4085,21 @@ def admin_aprobar(call):
         },
         Query().id == user_id,
     )
+    _guardar_archivo_suscripcion(
+        {
+            "id": user_id,
+            "vence": vencimiento,
+            "username": username,
+        },
+        comprobante={
+            "file_id": info.get("comprobante_file_id"),
+            "file_type": info.get("comprobante_tipo", "photo"),
+            "received_at": info.get("comprobante_fecha"),
+        },
+        metodo=info.get("metodo"),
+    )
+    with SUSCRIPCIONES_LOCK:
+        COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
 
     user_chat_id = info.get("usuario_chat_id") or user_id
     try:
@@ -3501,6 +4126,10 @@ def admin_aprobar(call):
 
     # Borrar todos los mensajes con opciones de pago del chat del admin.
     borrar_mensajes_datos_pago(info)
+    try:
+        bot.delete_message(int(ADMIN_ID), call.message.message_id)
+    except Exception:
+        pass
 
     # Borrar notificación original (en el chat del admin)
     notif_id = info.get('notif_msg_id')
@@ -3526,6 +4155,8 @@ def admin_rechazar_datos(call):
 
     user_id = int(call.data.split("_")[1])
     info    = solicitudes_info.pop(user_id, {})
+    with SUSCRIPCIONES_LOCK:
+        COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
 
     # Mensaje de rechazo al usuario
     try:
@@ -3541,6 +4172,10 @@ def admin_rechazar_datos(call):
 
     # Borrar todos los mensajes con opciones de pago del chat del admin.
     borrar_mensajes_datos_pago(info)
+    try:
+        bot.delete_message(int(ADMIN_ID), call.message.message_id)
+    except Exception:
+        pass
 
     # Borrar notificación original (en el chat del admin)
     notif_id = info.get('notif_msg_id')
@@ -3574,6 +4209,8 @@ def admin_rechazar_notif(call):
     bot.answer_callback_query(call.id)
     user_id = int(call.data.split("_")[2])
     solicitudes_info.pop(user_id, None)
+    with SUSCRIPCIONES_LOCK:
+        COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
     try:
         bot.send_message(
             user_id,
@@ -3615,6 +4252,14 @@ def aprobar(message):
             'vip_access_sent': False,
         },
         Query().id == user_id,
+    )
+    _guardar_archivo_suscripcion(
+        {
+            "id": user_id,
+            "vence": vencimiento,
+            "username": "",
+        },
+        metodo="registro_manual",
     )
 
     try:
@@ -3708,6 +4353,10 @@ def registrar_manual(message):
     username = partes[2].lstrip('@') if len(partes) >= 3 else ""
     vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
     db.upsert({'id': user_id, 'vence': vencimiento, 'username': username}, Query().id == user_id)
+    _guardar_archivo_suscripcion(
+        {"id": user_id, "vence": vencimiento, "username": username},
+        metodo="registro_manual",
+    )
     uname_txt = f"@{username}" if username else "—"
     bot.send_message(int(ADMIN_ID),
         f"✅ <b>Usuario registrado manualmente.</b>\n\n"
@@ -4249,20 +4898,51 @@ def markup_publicacion_goldpass():
     return markup
 
 
-def markup_flujo_publicacion_destino(dest_key):
-    return types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton(
-            "❌ Cancelar",
-            callback_data=f"destpub_cancel|{dest_key}",
-        )
+def markup_flujo_publicacion_destino(dest_key, estado=None):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    media_items = (
+        media_items_de_estado_publicacion(estado)
+        if estado
+        else []
     )
+    puede_anadir = (
+        len(media_items) < 3
+        and all(item["media_type"] in ("photo", "video") for item in media_items)
+    )
+    if (
+        estado
+        and estado.get("paso") == "esperando_descripcion_dest_publicacion"
+        and puede_anadir
+    ):
+        markup.add(types.InlineKeyboardButton(
+            "➕ Añadir foto/video",
+            callback_data=f"destpub_add_media|{dest_key}",
+        ))
+    if (
+        estado
+        and estado.get("paso") in (
+            "anadiendo_media_dest_publicacion",
+            "esperando_media_dest_publicacion",
+        )
+        and estado.get("modo_media") in ("append", "replace")
+        and media_items_de_estado_publicacion(estado)
+    ):
+        markup.add(types.InlineKeyboardButton(
+            "✅ Listo, ver vista previa",
+            callback_data=f"destpub_finish_media|{dest_key}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Cancelar",
+        callback_data=f"destpub_cancel|{dest_key}",
+    ))
+    return markup
 
 
 def mostrar_paso_publicacion_destino(chat_id, estado, texto, message=None):
     panel = editar_o_enviar_panel(
         chat_id,
         texto,
-        markup_flujo_publicacion_destino(estado["dest_key"]),
+        markup_flujo_publicacion_destino(estado["dest_key"], estado),
         message=message,
         message_id=estado.get("panel_message_id"),
         protect_content=True,
@@ -4272,10 +4952,39 @@ def mostrar_paso_publicacion_destino(chat_id, estado, texto, message=None):
     return panel
 
 
+def eliminar_previa_album_publicacion(chat_id, estado):
+    for message_id in estado.pop("preview_media_message_ids", []):
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            app.logger.info("No se pudo borrar un elemento de la vista previa del álbum.")
+
+
+def _construir_album_publicacion(media_items, caption):
+    clases = {
+        "photo": types.InputMediaPhoto,
+        "video": types.InputMediaVideo,
+    }
+    album = []
+    for indice, item in enumerate(media_items):
+        clase = clases.get(item["media_type"])
+        if not clase:
+            raise ValueError("Las publicaciones con varias piezas solo admiten fotos y videos.")
+        opciones = {"media": item["media_id"]}
+        if indice == 0 and caption:
+            opciones.update(caption=caption, parse_mode="HTML")
+        album.append(clase(**opciones))
+    return album
+
+
 def mostrar_previa_publicacion_destino(chat_id, estado):
     destino = _destino_por_key(estado.get("dest_key", ""))
     if not destino:
         raise ValueError("El canal elegido ya no está guardado.")
+    media_items = media_items_de_estado_publicacion(estado)
+    if not media_items:
+        raise ValueError("Añade una foto o video antes de preparar la vista previa.")
+    validar_media_items(media_items)
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton(
@@ -4287,19 +4996,112 @@ def mostrar_previa_publicacion_destino(chat_id, estado):
             callback_data=f"destpub_modify|{estado['dest_key']}",
         ),
     )
-    caption = (
-        f"👁️ <b>Vista previa · "
-        f"{html.escape(str(destino.get('nombre') or 'Canal'))}</b>\n\n"
-        f"{html.escape(str(estado.get('descripcion') or ''))}"
-    )
-    panel = enviar_media_panel_publicacion(
-        chat_id,
-        estado["media_type"],
-        estado["media_id"],
-        caption,
-        markup,
-    )
+    caption = html.escape(str(estado.get("descripcion") or ""))
+    eliminar_previa_album_publicacion(chat_id, estado)
+    if len(media_items) == 1:
+        adjunto = media_items[0]
+        caption_previa = (
+            f"👁️ <b>Vista previa · "
+            f"{html.escape(str(destino.get('nombre') or 'Canal'))}</b>\n\n"
+            f"{caption}"
+        )
+        panel = enviar_media_panel_publicacion(
+            chat_id,
+            adjunto["media_type"],
+            adjunto["media_id"],
+            caption_previa,
+            markup,
+        )
+        estado["preview_media_message_ids"] = []
+    else:
+        # Telegram no permite adjuntar botones al álbum; se muestran en un
+        # mensaje de control inmediatamente debajo de la vista previa.
+        previo = None
+        if int(chat_id) > 0:
+            with PANEL_LOCK:
+                previo = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == str(chat_id))
+        if previo:
+            try:
+                bot.delete_message(chat_id, previo.get("message_id"))
+            except Exception:
+                pass
+            with PANEL_LOCK:
+                PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == str(chat_id))
+        album = _construir_album_publicacion(media_items, caption)
+        mensajes_album = bot.send_media_group(chat_id, album)
+        try:
+            panel = bot.send_message(
+                chat_id,
+                f"👁️ <b>Vista previa · "
+                f"{html.escape(str(destino.get('nombre') or 'Canal'))}</b>\n\n"
+                "El álbum está arriba. ¿Quieres aceptar o modificar la publicación?",
+                parse_mode="HTML",
+                reply_markup=markup,
+                protect_content=True,
+            )
+        except Exception:
+            for mensaje_album in mensajes_album:
+                try:
+                    bot.delete_message(chat_id, mensaje_album.message_id)
+                except Exception:
+                    pass
+            raise
+        estado["preview_media_message_ids"] = [
+            mensaje.message_id for mensaje in mensajes_album
+        ]
+        if int(chat_id) > 0:
+            with PANEL_LOCK:
+                PANELES_PRIVADOS.upsert(
+                    {
+                        "chat_id": str(chat_id),
+                        "message_id": panel.message_id,
+                        "tipo": "texto",
+                        "protect_content": True,
+                    },
+                    PANEL_QUERY.chat_id == str(chat_id),
+                )
     estado["paso"] = "revision_publicacion_destino"
+    estado["panel_message_id"] = panel.message_id
+    return panel
+
+
+def mostrar_menu_modificar_publicacion(chat_id, estado, message=None):
+    dest_key = estado["dest_key"]
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Añadir foto o video",
+            callback_data=f"destpub_add_media|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "🔄 Reemplazar multimedia",
+            callback_data=f"destpub_replace_media|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "✏️ Editar descripción",
+            callback_data=f"destpub_edit_desc|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "👁️ Volver a la vista previa",
+            callback_data=f"destpub_show_preview|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "❌ Cancelar publicación",
+            callback_data=f"destpub_cancel|{dest_key}",
+        ),
+    )
+    panel = editar_o_enviar_panel(
+        chat_id,
+        "✏️ <b>Modificar publicación</b>\n\n"
+        f"Multimedia actual: <b>{len(media_items_de_estado_publicacion(estado))}/3</b>\n"
+        "Elige si quieres añadir, reemplazar o editar solo la descripción.",
+        markup,
+        message=message,
+        message_id=estado.get("panel_message_id"),
+        protect_content=True,
+        forzar_texto=True,
+    )
+    estado["paso"] = "menu_modificacion_publicacion_destino"
     estado["panel_message_id"] = panel.message_id
     return panel
 
@@ -4695,6 +5497,8 @@ def cb_destpub_start(c):
         "paso": "esperando_media_dest_publicacion",
         "dest_key": dest_key,
         "panel_message_id": c.message.message_id,
+        "media_items": [],
+        "media_message_ids": [],
     }
     admin_estado[uid] = estado
     bot.answer_callback_query(c.id)
@@ -4703,8 +5507,9 @@ def cb_destpub_start(c):
         estado,
         "📣 <b>Nueva publicación</b>\n\n"
         f"Canal: <b>{html.escape(str(destino.get('nombre') or ''))}</b>\n"
-        "Envía una foto, video, documento, audio o animación. "
-        "Después añadirás la descripción y podrás revisar la vista previa.",
+        "Envía hasta 3 fotos o videos juntos como álbum. También puedes enviar "
+        "un documento, audio o animación como archivo único. Después añadirás "
+        "la descripción y revisarás la vista previa.",
         message=c.message,
     )
 
@@ -4722,7 +5527,10 @@ def cb_destpub_cancel(c):
         estado.get("paso", "")
     ).startswith(("esperando_media_dest_publicacion",
                   "esperando_descripcion_dest_publicacion",
+                  "anadiendo_media_dest_publicacion",
+                  "menu_modificacion_publicacion_destino",
                   "revision_publicacion_destino")):
+        eliminar_previa_album_publicacion(c.message.chat.id, estado)
         admin_estado.pop(c.from_user.id, None)
     destino = _destino_por_key(dest_key)
     bot.answer_callback_query(c.id, "Edición cancelada.")
@@ -4763,19 +5571,164 @@ def cb_destpub_modify(c):
         bot.answer_callback_query(c.id, "La vista previa ya no está disponible.")
         return
 
-    estado["paso"] = "esperando_media_dest_publicacion"
-    estado.pop("media_id", None)
-    estado.pop("media_type", None)
-    estado.pop("descripcion", None)
+    eliminar_previa_album_publicacion(c.message.chat.id, estado)
+    bot.answer_callback_query(c.id)
+    mostrar_menu_modificar_publicacion(
+        c.message.chat.id,
+        estado,
+        message=c.message,
+    )
+
+
+def _obtener_estado_revision_publicacion(call):
+    dest_key = call.data.split("|", 1)[1]
+    estado = admin_estado.get(call.from_user.id, {})
+    destino = _destino_por_key(dest_key)
+    if (
+        not destino
+        or estado.get("dest_key") != dest_key
+        or estado.get("paso") != "menu_modificacion_publicacion_destino"
+    ):
+        return dest_key, None, None
+    return dest_key, estado, destino
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_add_media|")
+)
+def cb_destpub_add_media(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    media_items = media_items_de_estado_publicacion(estado)
+    if len(media_items) >= 3:
+        bot.answer_callback_query(c.id, "El máximo para esta publicación es 3 fotos o videos.")
+        return
+    if any(item["media_type"] not in ("photo", "video") for item in media_items):
+        bot.answer_callback_query(
+            c.id,
+            "Para añadir archivos juntos, la publicación debe usar fotos y videos.",
+            show_alert=True,
+        )
+        return
+    estado["paso"] = "anadiendo_media_dest_publicacion"
+    estado["modo_media"] = "append"
+    estado["media_group_id"] = None
     bot.answer_callback_query(c.id)
     mostrar_paso_publicacion_destino(
         c.message.chat.id,
         estado,
-        "✏️ <b>Modificar publicación</b>\n\n"
-        "Envía de nuevo la foto, video u otro archivo multimedia. "
-        "Después podrás escribir la descripción actualizada.",
+        "➕ <b>Añadir multimedia</b>\n\n"
+        "Envía hasta completar 3 fotos o videos en total. Puedes mandarlos juntos "
+        "como álbum; cuando termines, pulsa «Listo, ver vista previa». "
+        "La descripción actual se conservará.",
         message=c.message,
     )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_replace_media|")
+)
+def cb_destpub_replace_media(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    estado["media_items"] = []
+    estado["media_message_ids"] = []
+    estado.pop("media_id", None)
+    estado.pop("media_type", None)
+    estado["media_group_id"] = None
+    estado["modo_media"] = "replace"
+    estado["paso"] = "esperando_media_dest_publicacion"
+    bot.answer_callback_query(c.id)
+    mostrar_paso_publicacion_destino(
+        c.message.chat.id,
+        estado,
+        "🔄 <b>Reemplazar multimedia</b>\n\n"
+        "Envía hasta 3 fotos o videos, juntos como álbum o uno por uno. "
+        "Después pulsa «Listo, ver vista previa». La descripción se conservará.",
+        message=c.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_edit_desc|")
+)
+def cb_destpub_edit_desc(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    estado["paso"] = "esperando_descripcion_dest_publicacion"
+    bot.answer_callback_query(c.id)
+    mostrar_paso_publicacion_destino(
+        c.message.chat.id,
+        estado,
+        "✏️ <b>Editar descripción</b>\n\n"
+        "Envía la nueva descripción (máximo 900 caracteres). "
+        "La multimedia actual se conservará.",
+        message=c.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_show_preview|")
+)
+def cb_destpub_show_preview(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    try:
+        mostrar_previa_publicacion_destino(c.message.chat.id, estado)
+    except Exception as error:
+        bot.answer_callback_query(c.id, str(error)[:180], show_alert=True)
+        return
+    bot.answer_callback_query(c.id)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_finish_media|")
+)
+def cb_destpub_finish_media(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    estado = admin_estado.get(c.from_user.id, {})
+    if (
+        estado.get("dest_key") != dest_key
+        or estado.get("paso") not in (
+            "anadiendo_media_dest_publicacion",
+            "esperando_media_dest_publicacion",
+        )
+    ):
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    if not media_items_de_estado_publicacion(estado):
+        bot.answer_callback_query(c.id, "Envía al menos una foto o video.", show_alert=True)
+        return
+    try:
+        mostrar_previa_publicacion_destino(c.message.chat.id, estado)
+    except Exception as error:
+        bot.answer_callback_query(c.id, str(error)[:180], show_alert=True)
+        return
+    estado.pop("modo_media", None)
+    bot.answer_callback_query(c.id, "Vista previa actualizada.")
 
 
 @bot.callback_query_handler(
@@ -4802,8 +5755,7 @@ def cb_destpub_accept(c):
             destino["chat_id"],
             html.escape(str(estado.get("descripcion") or "")),
             markup,
-            media_id=estado.get("media_id"),
-            media_type=estado.get("media_type"),
+            media_items=media_items_de_estado_publicacion(estado),
         )
     except Exception:
         app.logger.exception(
@@ -4816,6 +5768,7 @@ def cb_destpub_accept(c):
         )
         return
 
+    eliminar_previa_album_publicacion(c.message.chat.id, estado)
     admin_estado.pop(c.from_user.id, None)
     bot.answer_callback_query(c.id, "Publicación enviada.")
     mostrar_panel_control_grupo(
@@ -5285,7 +6238,7 @@ def recibir_chat_compartido(message):
         in (
             "esperando_media_dest_publicacion",
             "esperando_descripcion_dest_publicacion",
-            "revision_publicacion_destino",
+            "anadiendo_media_dest_publicacion",
         )
     ),
     content_types=["photo", "video", "document", "audio", "animation"],
@@ -5305,17 +6258,18 @@ def recibir_media_publicacion_destino(message):
     else:
         return
 
-    estado["media_type"] = media_type
-    estado["media_id"] = media_id
-    estado["paso"] = "esperando_descripcion_dest_publicacion"
-    eliminar_mensaje_seguro(message.chat.id, message.message_id)
-    mostrar_paso_publicacion_destino(
-        message.chat.id,
+    grupo_id = getattr(message, "media_group_id", None)
+    resultado, prompt = anexar_media_a_publicacion(
         estado,
-        "✅ Multimedia recibida.\n\n"
-        "Ahora envía la descripción de la publicación "
-        "(máximo 900 caracteres).",
+        media_type,
+        media_id,
+        grupo_id,
+        message.message_id,
     )
+    if resultado == "duplicate":
+        return
+    eliminar_mensaje_seguro(message.chat.id, message.message_id)
+    mostrar_paso_publicacion_destino(message.chat.id, estado, prompt)
 
 
 @bot.message_handler(content_types=["users_shared"])
@@ -5476,8 +6430,11 @@ def flujo_admin_pago(message):
         if paso in (
             "esperando_media_dest_publicacion",
             "esperando_descripcion_dest_publicacion",
+            "anadiendo_media_dest_publicacion",
+            "menu_modificacion_publicacion_destino",
             "revision_publicacion_destino",
         ):
+            eliminar_previa_album_publicacion(message.chat.id, state)
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
             destino = _destino_por_key(state.get("dest_key", ""))
@@ -5517,8 +6474,26 @@ def flujo_admin_pago(message):
             message.chat.id,
             state,
             "📣 <b>Nueva publicación</b>\n\n"
-            "Envía una foto, video, documento, audio o animación. "
+            "Envía hasta 3 fotos o videos juntos como álbum. También puedes "
+            "enviar un documento, audio o animación como archivo único. "
             "Después añadirás la descripción.",
+        )
+        return
+    if paso == "anadiendo_media_dest_publicacion":
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_paso_publicacion_destino(
+            message.chat.id,
+            state,
+            "Envía las fotos o videos que quieras añadir y pulsa "
+            "«Listo, ver vista previa» cuando termines.",
+        )
+        return
+    if paso == "menu_modificacion_publicacion_destino":
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_menu_modificar_publicacion(
+            message.chat.id,
+            state,
+            message_id=state.get("panel_message_id"),
         )
         return
     if paso == "esperando_descripcion_dest_publicacion":
@@ -5618,31 +6593,245 @@ def flujo_admin_pago(message):
             eliminar_mensaje_seguro(message.chat.id,message.message_id); bot.send_message(message.chat.id,"El enlace debe comenzar con https://. Inténtalo de nuevo.",protect_content=True); return
         target=state.get("user_id_pago"); method=state.get("metodo_link","pago_usa_link"); admin_estado.pop(message.from_user.id,None); eliminar_mensaje_seguro(message.chat.id,message.message_id)
         markup=types.InlineKeyboardMarkup(row_width=2)
-        try: markup.add(types.InlineKeyboardButton("📋 Copiar enlace",copy_text=types.CopyTextButton(text=text)))
+        datos_pago = texto_pago_con_aviso(text)
+        partes_copia = 0
+        try:
+            partes_copia = agregar_botones_copiar(markup, datos_pago, "📋 Copiar enlace")
         except Exception: pass
-        markup.add(types.InlineKeyboardButton("✅ Aprobado",callback_data=f"adap_{target}"),types.InlineKeyboardButton("❌ Rechazado",callback_data=f"adrec_{target}"))
-        msg=bot.send_message(int(ADMIN_ID),f"🔗 <b>PAGO POR LINK</b>\n\n{html.escape(text)}{_AVISO_LINK}",parse_mode="HTML",reply_markup=markup,protect_content=True)
+        markup.add(
+            types.InlineKeyboardButton("✅ Aprobado",callback_data=f"adap_{target}"),
+            types.InlineKeyboardButton("❌ Rechazado",callback_data=f"adrec_{target}"),
+        )
+        aviso_copia = (
+            "\n\n<i>El texto excede el límite de copia de Telegram; "
+            "copia cada parte y pégala en orden para conservar el texto completo.</i>"
+            if partes_copia > 1
+            else ""
+        )
+        msg=bot.send_message(int(ADMIN_ID),f"🔗 <b>PAGO POR LINK</b>\n\n{html.escape(datos_pago)}{aviso_copia}",parse_mode="HTML",reply_markup=markup,protect_content=True)
         info=solicitudes_info.setdefault(target,{"metodo":method,"username":"sin_usuario","notif_msg_id":None})
         info["datos_msg_id"]=msg.message_id
 
 @bot.message_handler(func=lambda m: m.chat.type=="private", content_types=["photo"])
 def recibir_foto_pago(message):
-    if message.chat.type!="private": return
-    uid=message.from_user.id
-    if str(uid)==str(ADMIN_ID) and guardar_foto_menu_pagos(message,message.photo[-1].file_id): return
-    if str(uid)==str(ADMIN_ID): return
+    if message.chat.type != "private":
+        return
+    uid = message.from_user.id
+    file_id = message.photo[-1].file_id
+    if str(uid) == str(ADMIN_ID):
+        estado = admin_estado.get(uid, {})
+        if estado.get("paso") in (
+            "esperando_comprobante_aprobacion",
+            "esperando_comprobante_suscriptor",
+        ):
+            procesar_comprobante_admin(message, file_id, "photo")
+            return
+        if guardar_foto_menu_pagos(message, file_id):
+            return
+        return
+
+    info = solicitudes_info.get(uid)
+    if info:
+        comprobante = {
+            "id": int(uid),
+            "file_id": file_id,
+            "file_type": "photo",
+            "username": info.get("username") or "",
+            "metodo_pago": info.get("metodo") or "",
+            "request_id": info.get("request_id"),
+            "received_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with SUSCRIPCIONES_LOCK:
+            COMPROBANTES_PENDIENTES.upsert(
+                comprobante, Query().id == int(uid)
+            )
+        info.update({
+            "comprobante_file_id": file_id,
+            "comprobante_tipo": "photo",
+            "comprobante_fecha": comprobante["received_at"],
+        })
     try:
-        bot.forward_message(int(ADMIN_ID),message.chat.id,message.message_id)
-        bot.send_message(int(ADMIN_ID),f"💰 COMPROBANTE\nID: <code>{uid}</code>",parse_mode="HTML",_force_new_message=True)
+        contexto = (
+            f"\nMétodo: {html.escape(str(info.get('metodo') or '—'))}"
+            if info
+            else ""
+        )
+        bot.send_photo(
+            int(ADMIN_ID),
+            file_id,
+            caption=(
+                f"💰 <b>COMPROBANTE</b>\n"
+                f"ID: <code>{uid}</code>"
+                f"{contexto}"
+            ),
+            parse_mode="HTML",
+            protect_content=True,
+        )
         eliminar_mensaje_disparador(message)
-        bot.send_message(message.chat.id,"✅ Comprobante recibido. En breve verificamos tu pago.",protect_content=True)
+        bot.send_message(
+            message.chat.id,
+            "✅ Comprobante recibido. En breve verificamos tu pago.",
+            protect_content=True,
+        )
     except Exception:
         app.logger.exception("No se pudo reenviar un comprobante de pago.")
 
-@bot.message_handler(func=lambda m: m.chat.type=="private" and str(m.from_user.id)==str(ADMIN_ID) and admin_estado.get(m.from_user.id, {}).get("paso") in ("esperando_foto_metodos_pago","esperando_datos_metodo_pago"), content_types=["document","video","audio","animation"])
+
+def procesar_comprobante_admin(message, file_id, file_type):
+    estado = admin_estado.get(message.from_user.id, {})
+    paso = estado.get("paso")
+    momento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if paso == "esperando_comprobante_aprobacion":
+        try:
+            user_id = int(estado["user_id_comprobante"])
+        except (KeyError, TypeError, ValueError):
+            admin_estado.pop(message.from_user.id, None)
+            bot.send_message(message.chat.id, "No pude identificar la solicitud a la que pertenece la captura.")
+            return
+        info = solicitudes_info.get(user_id)
+        if not info:
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_disparador(message)
+            bot.send_message(
+                message.chat.id,
+                f"⚠️ La solicitud de <code>{user_id}</code> ya no está abierta; "
+                "no asocié la captura.",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+            return
+        comprobante = {
+            "id": user_id,
+            "file_id": file_id,
+            "file_type": file_type,
+            "username": info.get("username") or "",
+            "metodo_pago": info.get("metodo") or "",
+            "request_id": info.get("request_id"),
+            "received_at": momento,
+        }
+        with SUSCRIPCIONES_LOCK:
+            COMPROBANTES_PENDIENTES.upsert(
+                comprobante, Query().id == user_id
+            )
+        info.update({
+            "comprobante_file_id": file_id,
+            "comprobante_tipo": file_type,
+            "comprobante_fecha": momento,
+        })
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_disparador(message)
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            types.InlineKeyboardButton("✅ Aprobar acceso", callback_data=f"adap_{user_id}"),
+            types.InlineKeyboardButton("❌ Rechazar", callback_data=f"adrec_{user_id}"),
+        )
+        caption = (
+            "🧾 <b>Comprobante archivado para revisión</b>\n"
+            f"ID: <code>{user_id}</code>\n"
+            f"Usuario: @{html.escape(str(info.get('username') or '—'))}\n"
+            f"Método: {html.escape(str(info.get('metodo') or '—'))}\n\n"
+            "Verifica la captura y elige una acción."
+        )
+        try:
+            if file_type == "document":
+                bot.send_document(
+                    int(ADMIN_ID), file_id, caption=caption, parse_mode="HTML",
+                    reply_markup=markup, protect_content=True,
+                )
+            else:
+                bot.send_photo(
+                    int(ADMIN_ID), file_id, caption=caption, parse_mode="HTML",
+                    reply_markup=markup, protect_content=True,
+                )
+        except Exception:
+            app.logger.exception("No se pudo mostrar la captura para aprobar el pago.")
+            bot.send_message(
+                int(ADMIN_ID),
+                f"✅ Captura guardada para <code>{user_id}</code>. "
+                "Vuelve a pulsar «Aprobado» en los datos de pago.",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+        return
+
+    if paso == "esperando_comprobante_suscriptor":
+        try:
+            tipo = estado["suscripcion_tipo"]
+            user_id = int(estado["suscripcion_user_id"])
+        except (KeyError, TypeError, ValueError):
+            admin_estado.pop(message.from_user.id, None)
+            bot.send_message(message.chat.id, "No pude identificar la ficha de suscripción.")
+            return
+        registro = _obtener_suscripcion_admin(tipo, user_id)
+        if not registro:
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_disparador(message)
+            bot.send_message(message.chat.id, "La suscripción ya no está disponible.")
+            return
+        if tipo == "paid":
+            _guardar_archivo_suscripcion(
+                registro,
+                comprobante={
+                    "file_id": file_id,
+                    "file_type": file_type,
+                    "received_at": momento,
+                },
+            )
+        else:
+            with SUSCRIPCIONES_LOCK:
+                FreeGoldPasses.update(
+                    {
+                        "comprobante_file_id": file_id,
+                        "comprobante_tipo": file_type,
+                        "comprobante_fecha": momento,
+                    },
+                    FREE_GOLDPASS_QUERY.id == user_id,
+                )
+        pagina = int(estado.get("suscripcion_pagina", 0))
+        panel_message_id = estado.get("panel_message_id")
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_disparador(message)
+        mostrar_detalle_suscripcion(
+            message.chat.id,
+            tipo,
+            user_id,
+            pagina,
+            message_id=panel_message_id,
+            aviso="Captura archivada en la ficha.",
+        )
+
+
+@bot.message_handler(
+    func=lambda m: m.chat.type=="private"
+    and str(m.from_user.id)==str(ADMIN_ID)
+    and admin_estado.get(m.from_user.id, {}).get("paso") in (
+        "esperando_foto_metodos_pago",
+        "esperando_datos_metodo_pago",
+        "esperando_comprobante_aprobacion",
+        "esperando_comprobante_suscriptor",
+    ),
+    content_types=["document","video","audio","animation"],
+)
 def admin_media_payment_fallback(message):
-    if str(message.from_user.id)==str(ADMIN_ID) and message.chat.type=="private":
-        if rechazar_archivo_foto_pagos(message) or rechazar_media_metodo_pago(message): return
+    estado = admin_estado.get(message.from_user.id, {})
+    if estado.get("paso") in (
+        "esperando_comprobante_aprobacion",
+        "esperando_comprobante_suscriptor",
+    ):
+        documento = getattr(message, "document", None)
+        mime = getattr(documento, "mime_type", "") or ""
+        if mime.startswith("image/") and documento:
+            procesar_comprobante_admin(message, documento.file_id, "document")
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Envía la captura como foto o como un archivo de imagen.",
+                protect_content=True,
+            )
+        return
+    if str(message.from_user.id) == str(ADMIN_ID) and message.chat.type == "private":
+        if rechazar_archivo_foto_pagos(message) or rechazar_media_metodo_pago(message):
+            return
 
 @bot.chat_join_request_handler()
 def aprobar_solicitud_goldpass(req):

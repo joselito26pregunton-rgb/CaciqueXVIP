@@ -29,7 +29,7 @@ En Render configura `TELEGRAM_TOKEN`, `GEMINI_API_KEY` y `RENDER_EXTERNAL_URL` (
 
 La llamada a Gemini espera hasta 30 segundos. Puedes cambiarlo en Render con `GEMINI_TIMEOUT_SECONDS` (se limita a 10–60 segundos). Para respuestas más rápidas, puedes configurar `GEMINI_MODEL=gemini-3.5-flash-lite`; el modelo predeterminado es `gemini-3.8-flash`. Si Gemini devuelve `503 UNAVAILABLE`, el bot reintenta hasta dos veces con espera progresiva antes de usar el saludo de respaldo.
 
-La respuesta contextual usa solo el primer mensaje o pie de foto de cada persona; no conserva el texto ni envía el historial. Gemini genera una frase breve y el bot añade la invitación fija, la foto y los botones.
+La respuesta contextual usa solo el primer mensaje o pie de foto de cada persona; no conserva el texto ni envía el historial. Gemini responde con tono casual al mensaje e integra una invitación variada al canal gratuito; la foto y los botones de redes se mantienen. Si Gemini no responde, se usa el saludo estático de respaldo.
 
 Después del despliegue, el administrador puede enviar `/gemini_test` al bot para probar la conexión desde Render. Solo responde al `ADMIN_ID` configurado y hace una solicitud normal a Gemini, facturada según la cuenta de Google. El comando no se ejecuta automáticamente. Un error `TimeoutError` significa que no llegó respuesta dentro del tiempo configurado; no demuestra que la clave sea incorrecta. Si continúa con 30–60 segundos, revisa el acceso de red saliente de Render y el estado del proyecto/cuota en AI Studio.
 

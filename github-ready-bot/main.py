@@ -42,6 +42,31 @@ def _send_compat(*args, **kwargs):
 bot.send_message = _send_compat
 _SEND_MESSAGE_ORIGINAL = bot.send_message
 
+
+def _editar_compat(original):
+    def editar(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except Exception as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+            message_id = kwargs.get("message_id")
+            if message_id is None:
+                positional_index = 1 if "reply_markup" in original.__name__ else 2
+                if len(args) > positional_index:
+                    message_id = args[positional_index]
+            app.logger.debug(
+                "Telegram no necesitó editar el mensaje %s: el contenido ya era igual.",
+                message_id,
+            )
+            return SimpleNamespace(message_id=message_id)
+    return editar
+
+
+bot.edit_message_text = _editar_compat(bot.edit_message_text)
+bot.edit_message_caption = _editar_compat(bot.edit_message_caption)
+bot.edit_message_reply_markup = _editar_compat(bot.edit_message_reply_markup)
+
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 CONFIG_LOCK = threading.RLock()
 RECORDATORIO_START_LOCK = threading.RLock()
@@ -368,9 +393,21 @@ def _generar_respuesta_inicial_business(mensaje_entrante):
         with urllib.request.urlopen(request, timeout=12) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"Gemini devolvió HTTP {error.code}") from None
+        api_status = "API_ERROR"
+        try:
+            error_body = json.loads(error.read().decode("utf-8"))
+            api_status = (
+                error_body.get("error", {}).get("status") or api_status
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+        raise RuntimeError(
+            f"Gemini HTTP {error.code} ({api_status})"
+        ) from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Gemini no respondió ({type(error).__name__})") from None
+        reason = getattr(error, "reason", None)
+        error_kind = type(reason).__name__ if reason is not None else type(error).__name__
+        raise RuntimeError(f"Gemini conexión ({error_kind})") from None
 
     candidates = result.get("candidates") or []
     parts = (
@@ -397,10 +434,16 @@ def _mensaje_bienvenida_business(message):
     try:
         respuesta = _generar_respuesta_inicial_business(texto_entrante)
     except Exception as error:
+        detalle = (
+            str(error)[:120]
+            if isinstance(error, RuntimeError)
+            else type(error).__name__
+        )
         app.logger.warning(
             "Se usó el saludo de respaldo; Gemini no generó respuesta "
-            "(error=%s).",
+            "(error=%s, detalle=%s).",
             type(error).__name__,
+            detalle,
         )
         respuesta = WELCOME_MESSAGE
 

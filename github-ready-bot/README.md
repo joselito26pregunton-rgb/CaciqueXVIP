@@ -23,12 +23,14 @@ Las publicaciones recurrentes y los destinos adicionales se guardan en `config.j
 
 ## Instalación y webhook
 
-Usa Python 3.11 o posterior y ejecuta `uv sync --locked` desde esta carpeta.
+Usa Python 3.11 o posterior y ejecuta `uv sync --locked` desde esta carpeta. El comando de inicio es `uv run main.py`.
 
-El bot necesita `TELEGRAM_TOKEN` y una URL pública configurada como `RENDER_EXTERNAL_URL` o `WEBHOOK_URL`. No guardes el token en GitHub; configúralo como secreto en el servicio que ejecuta el bot.
+En Render configura `TELEGRAM_TOKEN`, `GEMINI_API_KEY` y `RENDER_EXTERNAL_URL` (o `WEBHOOK_URL`) como variables de entorno del servicio. `GEMINI_API_KEY` debe contener únicamente la clave completa de Google AI Studio; no se necesita el nombre ni el número del proyecto. No guardes claves en GitHub. Sin la clave de Gemini, el bot conserva el saludo de texto de respaldo en vez de personalizarlo.
+
+La respuesta contextual usa solo el primer mensaje o pie de foto de cada persona; no conserva el texto ni envía el historial. Gemini genera una frase breve y el bot añade la invitación fija, la foto y los botones.
 
 **No ejecutes esta copia con el token activo si quieres conservar el webhook actual.** Al arrancar, el código llama a `set_webhook` con la URL configurada y Telegram reemplaza la URL previa para ese token. Este ZIP solo prepara los archivos: no inicia el bot, no registra un webhook nuevo ni cambia la configuración activa.
 
 ## Datos locales
 
-`config.json`, `usuarios.json`, `business_welcome_users.json` y las bases de datos locales se crean o modifican durante la ejecución y están excluidos de Git. Mantén el repositorio privado porque el código contiene la configuración y los enlaces actuales del bot.
+`config.json`, `payment_config.json`, `usuarios.json`, `business_welcome_users.json` y las bases de datos locales se crean o modifican durante la ejecución y están excluidos del ZIP. Conserva las copias del servicio de Render: pueden contener destinos, pagos, suscripciones y registros que no deben reemplazarse al subir este código. Mantén el repositorio privado porque el código contiene enlaces actuales del bot.

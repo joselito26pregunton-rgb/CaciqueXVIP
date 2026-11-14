@@ -109,6 +109,12 @@ WELCOME_MESSAGE = (
     f"{WELCOME_INVITATION}"
 )
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+try:
+    GEMINI_TIMEOUT_SECONDS = max(
+        10, min(int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "30")), 60)
+    )
+except ValueError:
+    GEMINI_TIMEOUT_SECONDS = 30
 
 # Separate ZIP moderation data from the live payment/subscription database and config.json.
 group_db = TinyDB(os.path.join(BASE_DIR, "database.json"))
@@ -390,7 +396,9 @@ def _generar_respuesta_inicial_business(mensaje_entrante):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=12) as response:
+        with urllib.request.urlopen(
+            request, timeout=GEMINI_TIMEOUT_SECONDS
+        ) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         api_status = "API_ERROR"

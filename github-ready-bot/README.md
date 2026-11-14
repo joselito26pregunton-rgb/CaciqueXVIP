@@ -27,9 +27,11 @@ Usa Python 3.11 o posterior y ejecuta `uv sync --locked` desde esta carpeta. El 
 
 En Render configura `TELEGRAM_TOKEN`, `GEMINI_API_KEY` y `RENDER_EXTERNAL_URL` (o `WEBHOOK_URL`) como variables de entorno del servicio. `GEMINI_API_KEY` debe contener únicamente la clave completa de Google AI Studio; no se necesita el nombre ni el número del proyecto. No guardes claves en GitHub. Sin la clave de Gemini, el bot conserva el saludo de texto de respaldo en vez de personalizarlo.
 
+La llamada a Gemini espera hasta 30 segundos. Puedes cambiarlo en Render con `GEMINI_TIMEOUT_SECONDS` (se limita a 10–60 segundos). Para respuestas más rápidas, puedes configurar `GEMINI_MODEL=gemini-3.5-flash-lite`; el modelo predeterminado es `gemini-3.8-flash`.
+
 La respuesta contextual usa solo el primer mensaje o pie de foto de cada persona; no conserva el texto ni envía el historial. Gemini genera una frase breve y el bot añade la invitación fija, la foto y los botones.
 
-Después del despliegue, el administrador puede enviar `/gemini_test` al bot para probar la conexión desde Render. Solo responde al `ADMIN_ID` configurado y hace una solicitud normal a Gemini, facturada según la cuenta de Google. El comando no se ejecuta automáticamente.
+Después del despliegue, el administrador puede enviar `/gemini_test` al bot para probar la conexión desde Render. Solo responde al `ADMIN_ID` configurado y hace una solicitud normal a Gemini, facturada según la cuenta de Google. El comando no se ejecuta automáticamente. Un error `TimeoutError` significa que no llegó respuesta dentro del tiempo configurado; no demuestra que la clave sea incorrecta. Si continúa con 30–60 segundos, revisa el acceso de red saliente de Render y el estado del proyecto/cuota en AI Studio.
 
 **No ejecutes esta copia con el token activo si quieres conservar el webhook actual.** Al arrancar, el código llama a `set_webhook` con la URL configurada y Telegram reemplaza la URL previa para ese token. Este ZIP solo prepara los archivos: no inicia el bot, no registra un webhook nuevo ni cambia la configuración activa.
 

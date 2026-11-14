@@ -354,7 +354,7 @@ def _generar_respuesta_inicial_business(mensaje_entrante):
 
     texto = (mensaje_entrante or "").strip()
     if not texto:
-        return WELCOME_MESSAGE
+        raise RuntimeError("mensaje inicial sin texto para personalizar")
 
     system_instruction = (
         "Eres el asistente personal de una persona en Telegram. Responde en español "
@@ -450,6 +450,39 @@ def _mensaje_bienvenida_business(message):
     if respuesta == WELCOME_MESSAGE:
         return respuesta
     return f"{respuesta}\n\n{WELCOME_INVITATION}"
+
+
+@bot.message_handler(commands=["gemini_test"])
+def probar_conexion_gemini(message):
+    if (
+        getattr(getattr(message, "chat", None), "type", None) != "private"
+        or str(getattr(getattr(message, "from_user", None), "id", "")) != str(ADMIN_ID)
+    ):
+        return
+
+    try:
+        respuesta = _generar_respuesta_inicial_business(
+            "Responde brevemente confirmando que Gemini está conectado."
+        )
+    except Exception as error:
+        detalle = (
+            str(error)[:160]
+            if isinstance(error, RuntimeError)
+            else type(error).__name__
+        )
+        app.logger.warning("Prueba manual de Gemini falló (detalle=%s).", detalle)
+        bot.send_message(
+            message.chat.id,
+            f"❌ Gemini no respondió.\nDiagnóstico: {detalle}",
+            parse_mode=None,
+        )
+        return
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Gemini respondió correctamente:\n{respuesta}",
+        parse_mode=None,
+    )
 
 
 @bot.business_message_handler(
@@ -7949,6 +7982,11 @@ def proceso_obtener_usuario_reporte(message):
 
 
 if __name__ == "__main__":
+    app.logger.info(
+        "Gemini contextual: clave %s; modelo=%s.",
+        "detectada" if os.environ.get("GEMINI_API_KEY", "").strip() else "no detectada",
+        GEMINI_MODEL,
+    )
     print(
         "📬 Saludo Business listo para "
         f"{len(_perfiles_business_autorizados())} perfil(es) autorizado(s)."

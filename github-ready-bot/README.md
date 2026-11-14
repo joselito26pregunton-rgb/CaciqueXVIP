@@ -29,6 +29,8 @@ En Render configura `TELEGRAM_TOKEN`, `GEMINI_API_KEY` y `RENDER_EXTERNAL_URL` (
 
 La respuesta contextual usa solo el primer mensaje o pie de foto de cada persona; no conserva el texto ni envía el historial. Gemini genera una frase breve y el bot añade la invitación fija, la foto y los botones.
 
+Después del despliegue, el administrador puede enviar `/gemini_test` al bot para probar la conexión desde Render. Solo responde al `ADMIN_ID` configurado y hace una solicitud normal a Gemini, facturada según la cuenta de Google. El comando no se ejecuta automáticamente.
+
 **No ejecutes esta copia con el token activo si quieres conservar el webhook actual.** Al arrancar, el código llama a `set_webhook` con la URL configurada y Telegram reemplaza la URL previa para ese token. Este ZIP solo prepara los archivos: no inicia el bot, no registra un webhook nuevo ni cambia la configuración activa.
 
 ## Datos locales

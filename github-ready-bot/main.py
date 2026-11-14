@@ -2803,13 +2803,36 @@ def _enviar_publicacion_con_adjuntos(
 
     mensajes = bot.send_media_group(chat_id, grupo)
     if markup_tiene_botones(markup):
-        mensajes.append(
-            bot.send_message(
+        try:
+            # sendMediaGroup no acepta reply_markup. Adjuntamos el teclado a
+            # la primera pieza del álbum después de enviar el grupo, evitando
+            # crear un mensaje adicional con el rótulo "Opciones:".
+            bot.edit_message_reply_markup(
                 chat_id,
-                "Opciones:",
+                mensajes[0].message_id,
                 reply_markup=markup,
             )
-        )
+        except Exception as error:
+            app.logger.info(
+                "Telegram no permitió adjuntar el teclado al álbum; "
+                "se usará un mensaje sin texto (error=%s).",
+                type(error).__name__,
+            )
+            try:
+                # Telegram exige texto en sendMessage. U+2063 es invisible,
+                # así los botones siguen disponibles sin mostrar "Opciones:".
+                mensajes.append(
+                    bot.send_message(
+                        chat_id,
+                        "\u2063",
+                        reply_markup=markup,
+                        parse_mode=None,
+                    )
+                )
+            except Exception:
+                app.logger.exception(
+                    "No se pudieron adjuntar los botones a la publicación multimedia."
+                )
     return mensajes
 
 def guardar_ultima_publicacion(canal_key, chat_id, mensaje, texto, media_id, media_type):

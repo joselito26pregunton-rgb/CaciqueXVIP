@@ -26,7 +26,7 @@
       "💳 PAGO POR LINK (Visa/Mastercard)\n→ Genera el enlace de cobro personalizado para este usuario.\n→ Recuerda informar la comisión adicional: 5.3% + 0.8% sobre el monto."
     ],
     "pago_iban": [
-      "💶 CUENTA CON EUROS (IBAN)\nTitular: Bridge Building Sp. Z.o.o.\nIBAN: LU424080000044042028\nBIC: BCIRLULL\nBanco: Banking Circle S.A.\nDirección: 2 Boulevard de la Foire, L-1528 Luxembourg\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines de procesar tu pedido para obtener el GoldPass."
+      "💶 Transferencia bancaria SEPA (EUR)\nTitular: Jose Alejandro Gonzalez Hernandez\nIBAN: LU424080000044042028\nBIC/SWIFT: BCIRLULL\nBanco: Banking Circle S.A.\nDirección del beneficiario o del banco: 2 Boulevard de la Foire, L-1528 Luxembourg\nMoneda: EUR"
     ],
     "pago_mex": [
       "🇲🇽 CUENTA MÉXICO\nTitular: JOSE ALEJANDRO GONZALEZ\nCLABE: 646180546701126005\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines de procesar tu pedido para obtener el GoldPass."

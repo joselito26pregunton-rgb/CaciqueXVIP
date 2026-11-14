@@ -395,27 +395,42 @@ def _generar_respuesta_inicial_business(mensaje_entrante):
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(
-            request, timeout=GEMINI_TIMEOUT_SECONDS
-        ) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        api_status = "API_ERROR"
+    for intento in range(3):
         try:
-            error_body = json.loads(error.read().decode("utf-8"))
-            api_status = (
-                error_body.get("error", {}).get("status") or api_status
+            with urllib.request.urlopen(
+                request, timeout=GEMINI_TIMEOUT_SECONDS
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            api_status = "API_ERROR"
+            try:
+                error_body = json.loads(error.read().decode("utf-8"))
+                api_status = (
+                    error_body.get("error", {}).get("status") or api_status
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                pass
+
+            if error.code == 503 and intento < 2:
+                espera = 2 ** intento
+                app.logger.warning(
+                    "Gemini respondió 503; reintento %s/2 en %s s.",
+                    intento + 1,
+                    espera,
+                )
+                time.sleep(espera)
+                continue
+
+            raise RuntimeError(
+                f"Gemini HTTP {error.code} ({api_status})"
+            ) from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            reason = getattr(error, "reason", None)
+            error_kind = (
+                type(reason).__name__ if reason is not None else type(error).__name__
             )
-        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
-            pass
-        raise RuntimeError(
-            f"Gemini HTTP {error.code} ({api_status})"
-        ) from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        reason = getattr(error, "reason", None)
-        error_kind = type(reason).__name__ if reason is not None else type(error).__name__
-        raise RuntimeError(f"Gemini conexión ({error_kind})") from None
+            raise RuntimeError(f"Gemini conexión ({error_kind})") from None
 
     candidates = result.get("candidates") or []
     parts = (

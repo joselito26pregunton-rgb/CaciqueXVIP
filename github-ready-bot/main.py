@@ -283,7 +283,7 @@ def _business_saludo_key(profile_id, recipient_id):
     return f"{profile_key}:{recipient_key}"
 
 
-def _marcar_business_saludo_enviado(profile_id, recipient_id):
+def _marcar_estado_business_saludo(profile_id, recipient_id, photo_sent):
     with BUSINESS_WELCOME_LOCK:
         try:
             with open(BUSINESS_WELCOME_FILE, "r", encoding="utf-8") as file:
@@ -297,7 +297,8 @@ def _marcar_business_saludo_enviado(profile_id, recipient_id):
             sent = {}
             data["sent"] = sent
         sent[_business_saludo_key(profile_id, recipient_id)] = {
-            "sent_at": datetime.now(timezone.utc).isoformat()
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "photo_sent": bool(photo_sent),
         }
         temporary = BUSINESS_WELCOME_FILE + ".tmp"
         with open(temporary, "w", encoding="utf-8") as file:
@@ -305,15 +306,16 @@ def _marcar_business_saludo_enviado(profile_id, recipient_id):
         os.replace(temporary, BUSINESS_WELCOME_FILE)
 
 
-def _business_saludo_ya_enviado(profile_id, recipient_id):
+def _business_saludo_estado(profile_id, recipient_id):
     with BUSINESS_WELCOME_LOCK:
         try:
             with open(BUSINESS_WELCOME_FILE, "r", encoding="utf-8") as file:
                 data = json.load(file)
         except (FileNotFoundError, json.JSONDecodeError):
-            return False
+            return None
         sent = data.get("sent", {}) if isinstance(data, dict) else {}
-        return _business_saludo_key(profile_id, recipient_id) in sent
+        record = sent.get(_business_saludo_key(profile_id, recipient_id))
+        return record if isinstance(record, dict) else None
 
 
 @bot.business_message_handler(
@@ -365,11 +367,42 @@ def responder_primer_contacto_business(message):
     # Serializar primera respuesta para evitar dobles saludos si llegan mensajes
     # simultáneos mientras Telegram reintenta la entrega del webhook.
     with BUSINESS_WELCOME_LOCK:
-        if _business_saludo_ya_enviado(profile_id, recipient_id):
+        markup = _markup_bienvenida_business()
+        previous = _business_saludo_estado(profile_id, recipient_id)
+        if previous:
+            # Algunos registros antiguos no guardaban si se entregó la foto.
+            # Se intenta una sola vez como envío de foto y botones, sin repetir
+            # el texto del saludo que el usuario ya recibió.
+            if previous.get("photo_sent") is True:
+                return
+            if not os.path.isfile(WELCOME_PHOTO_PATH):
+                app.logger.warning(
+                    "No se encontró la foto pendiente del saludo Business."
+                )
+                return
+            try:
+                with open(WELCOME_PHOTO_PATH, "rb") as photo:
+                    bot.send_photo(
+                        chat_id,
+                        photo,
+                        parse_mode=None,
+                        reply_markup=markup,
+                        business_connection_id=connection_id,
+                    )
+                _marcar_estado_business_saludo(
+                    profile_id, recipient_id, photo_sent=True
+                )
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo completar la foto pendiente del saludo Business "
+                    "(error=%s, telegram_code=%s).",
+                    type(error).__name__,
+                    getattr(error, "error_code", None),
+                )
             return
 
-        markup = _markup_bienvenida_business()
         enviado = False
+        photo_sent = False
         if os.path.isfile(WELCOME_PHOTO_PATH):
             try:
                 with open(WELCOME_PHOTO_PATH, "rb") as photo:
@@ -382,6 +415,7 @@ def responder_primer_contacto_business(message):
                         business_connection_id=connection_id,
                     )
                 enviado = True
+                photo_sent = True
             except Exception as error:
                 app.logger.warning(
                     "Falló la foto del saludo Business; se intentará enviar el texto "
@@ -389,6 +423,10 @@ def responder_primer_contacto_business(message):
                     type(error).__name__,
                     getattr(error, "error_code", None),
                 )
+        else:
+            app.logger.warning(
+                "No se encontró la foto del saludo Business; se intentará enviar el texto."
+            )
 
         if not enviado:
             try:
@@ -410,7 +448,9 @@ def responder_primer_contacto_business(message):
 
         if enviado:
             try:
-                _marcar_business_saludo_enviado(profile_id, recipient_id)
+                _marcar_estado_business_saludo(
+                    profile_id, recipient_id, photo_sent=photo_sent
+                )
             except Exception:
                 app.logger.exception("No se pudo guardar el registro del saludo Business.")
 

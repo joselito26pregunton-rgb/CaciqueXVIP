@@ -418,7 +418,177 @@ def _business_saludo_estado(profile_id, recipient_id):
         return record if isinstance(record, dict) else None
 
 
-def _generar_respuesta_inicial_business(mensaje_entrante):
+BUSINESS_LANGUAGE_NAMES = {
+    "es": "español",
+    "en": "inglés",
+    "pt": "portugués brasileño",
+    "it": "italiano",
+    "fr": "francés",
+    "de": "alemán",
+    "nl": "neerlandés",
+    "tr": "turco",
+    "pl": "polaco",
+    "ro": "rumano",
+    "ru": "ruso",
+    "uk": "ucraniano",
+    "bg": "búlgaro",
+    "sr": "serbio",
+    "ja": "japonés",
+    "ko": "coreano",
+    "zh": "chino",
+    "ar": "árabe",
+    "he": "hebreo",
+    "el": "griego",
+    "hi": "hindi",
+    "th": "tailandés",
+}
+BUSINESS_LANGUAGE_WORDS = {
+    "es": set(
+        "hola epa chamo pana que tal estas como gracias amigo amiga buenos buenas "
+        "dias noches haces quieres eres bien quiero tienes encantado encantada "
+        "genial guapo guapa gusto saludos oye dime estas haciendo"
+    .split()),
+    "en": set(
+        "hello hi hey how are you doing what thanks thank good morning evening "
+        "friend buddy dude please where great nice whats sup howdy tell today "
+        "hows going"
+    .split()),
+    "pt": set(
+        "oi ola tudo voce voces obrigado obrigada valeu beleza legal prazer bora "
+        "saudade nao bom boa dia noite fala querido querida tranquilo tranqui "
+        "como vai"
+    .split()),
+    "it": set(
+        "ciao buongiorno buonasera buonanotte grazie stai tutto bene amico amica "
+        "piacere cosa fai sei vuoi bella bello giornata oggi parlare caro cara "
+        "fantastico salve"
+    .split()),
+    "fr": set(
+        "bonjour salut coucou merci comment vas allez quoi bonsoir ami amie "
+        "ca va enchanté enchantee monjour"
+    .split()),
+    "de": set(
+        "hallo guten tag danke wie geht dir freund freunde gutenmorgen gutenabend "
+        "bitte schön schoen machst"
+    .split()),
+    "nl": set(
+        "hoi hallo bedankt dankjewel hoe gaat goed vriend vrienden lekker "
+        "alsjeblieft"
+    .split()),
+    "tr": set(
+        "merhaba nasilsin nasılsın tesekkur teşekkür tesekkür iyiyim selam "
+        "gunaydin günaydın arkadas arkadaş"
+    .split()),
+    "pl": set(
+        "czesc cześć hej dziekuje dziękuję jak masz dobrze przyjaciel przyjaciol "
+        "przyjaciół"
+    .split()),
+    "ro": set(
+        "salut buna buna ziua multumesc mulțumesc ce faci bine prieten prietena"
+    .split()),
+}
+BUSINESS_WELCOME_FALLBACKS = {
+    "es": WELCOME_MESSAGE,
+    "en": (
+        "Hey, how's it going? Thanks for reaching out.\n\n"
+        "If you'd like to get to know me a little better, check out my free "
+        "Telegram channel—no pressure. You can also find me on my socials:"
+    ),
+    "pt": (
+        "Oi, tudo bem? Valeu por me chamar.\n\n"
+        "Se quiser me conhecer um pouco melhor, dá uma olhada no meu canal "
+        "gratuito do Telegram, sem compromisso. Também estou nas minhas redes:"
+    ),
+    "it": (
+        "Ehi, come va? Grazie per avermi scritto.\n\n"
+        "Se ti va di conoscermi un po' meglio, dai un'occhiata al mio canale "
+        "Telegram gratuito, senza impegno. Mi trovi anche sui social:"
+    ),
+    "fr": (
+        "Salut, ça va ? Merci pour ton message.\n\n"
+        "Si tu veux apprendre à me connaître un peu mieux, tu peux découvrir "
+        "mon canal Telegram gratuit, sans pression. Tu me trouveras aussi sur mes réseaux :"
+    ),
+    "de": (
+        "Hey, wie geht's? Danke für deine Nachricht.\n\n"
+        "Wenn du mich ein bisschen besser kennenlernen möchtest, schau gern "
+        "auf meinem kostenlosen Telegram-Kanal vorbei. Du findest mich auch in meinen Netzwerken:"
+    ),
+}
+
+
+def _codigo_idioma_business(language_hint):
+    codigo = str(language_hint or "").strip().replace("_", "-").split("-", 1)[0].lower()
+    return codigo if len(codigo) in (2, 3) else None
+
+
+def _detectar_idioma_business(mensaje, language_hint=None):
+    texto = str(mensaje or "")
+    normalizado = unicodedata.normalize("NFKD", texto.casefold())
+    normalizado = "".join(
+        caracter
+        for caracter in normalizado
+        if not unicodedata.combining(caracter)
+    )
+    tokens = re.findall(r"[^\W\d_]+", normalizado, flags=re.UNICODE)
+    idioma_preferido = _codigo_idioma_business(language_hint)
+    if not tokens:
+        return idioma_preferido
+
+    puntuaciones = {}
+    primeras_posiciones = {}
+    for posicion, token in enumerate(tokens):
+        for idioma, palabras in BUSINESS_LANGUAGE_WORDS.items():
+            if token in palabras:
+                puntuaciones[idioma] = puntuaciones.get(idioma, 0) + 1
+                primeras_posiciones.setdefault(idioma, posicion)
+
+    script_patterns = (
+        ("ja", r"[\u3040-\u30ff]"),
+        ("ko", r"[\uac00-\ud7af]"),
+        ("zh", r"[\u4e00-\u9fff]"),
+        ("ar", r"[\u0600-\u06ff]"),
+        ("he", r"[\u0590-\u05ff]"),
+        ("el", r"[\u0370-\u03ff]"),
+        ("hi", r"[\u0900-\u097f]"),
+        ("th", r"[\u0e00-\u0e7f]"),
+    )
+    for idioma, patron in script_patterns:
+        coincidencias = list(re.finditer(patron, texto))
+        if coincidencias:
+            puntuaciones[idioma] = max(
+                puntuaciones.get(idioma, 0),
+                max(1, sum(len(item.group()) for item in coincidencias) // 5),
+            )
+            primeras_posiciones.setdefault(idioma, coincidencias[0].start())
+
+    letras_cirilicas = list(re.finditer(r"[\u0400-\u04ff]", texto))
+    if letras_cirilicas:
+        tokens_cirilicos = set(re.findall(r"[\u0400-\u04ff]+", texto.casefold()))
+        if tokens_cirilicos.intersection({"привіт", "дякую", "будь", "ласка", "справи"}):
+            idioma_cirilico = "uk"
+        elif idioma_preferido in {"ru", "uk", "bg", "sr"}:
+            idioma_cirilico = idioma_preferido
+        else:
+            idioma_cirilico = "ru"
+        puntuaciones[idioma_cirilico] = max(
+            puntuaciones.get(idioma_cirilico, 0),
+            max(1, len(letras_cirilicas) // 5),
+        )
+        primeras_posiciones.setdefault(idioma_cirilico, letras_cirilicas[0].start())
+
+    if not puntuaciones:
+        return None
+    puntuacion_maxima = max(puntuaciones.values())
+    candidatos = [
+        idioma
+        for idioma, puntuacion in puntuaciones.items()
+        if puntuacion == puntuacion_maxima
+    ]
+    return min(candidatos, key=lambda idioma: primeras_posiciones.get(idioma, 10**9))
+
+
+def _generar_respuesta_inicial_business(mensaje_entrante, language_hint=None):
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("falta GEMINI_API_KEY")
@@ -427,14 +597,31 @@ def _generar_respuesta_inicial_business(mensaje_entrante):
     if not texto:
         raise RuntimeError("mensaje inicial sin texto para personalizar")
 
+    idioma_objetivo = _detectar_idioma_business(texto, language_hint)
+    if idioma_objetivo:
+        nombre_idioma = BUSINESS_LANGUAGE_NAMES.get(
+            idioma_objetivo,
+            f"el idioma con código {idioma_objetivo}",
+        )
+        instruccion_idioma = (
+            f"El idioma principal detectado en el mensaje es {nombre_idioma} "
+            f"(código {idioma_objetivo}). Responde exclusivamente en ese idioma. "
+            "Si el mensaje mezcla idiomas, prioriza el que aparece primero cuando "
+            "estén equilibrados; si uno predomina, usa ese."
+        )
+    else:
+        instruccion_idioma = (
+            "Detecta el idioma principal directamente del mensaje y responde en ese "
+            "mismo idioma. Si mezcla idiomas, sigue el que más usa; si están "
+            "equilibrados, prioriza el idioma de la primera frase."
+        )
+
     system_instruction = (
         "Redactas únicamente el primer saludo automático del dueño de esta cuenta. "
         "PERSONALIDAD: joven, relajado, carismático, cercano y con buena vibra; "
         "suena como una persona, no como una empresa. "
-        "IDIOMA: detecta el idioma principal del primer mensaje y responde en ese mismo "
-        "idioma. Esto incluye español, inglés, portugués brasileño, italiano y cualquier "
-        "otro idioma que puedas reconocer. Si mezcla idiomas, sigue principalmente el "
-        "idioma que más usa. Si no se puede identificar, usa español natural. La respuesta "
+        f"IDIOMA: {instruccion_idioma} Esto incluye español, inglés, portugués "
+        "brasileño, italiano y cualquier otro idioma que puedas reconocer. La respuesta "
         "y la invitación al canal deben estar en ese idioma; no cambies al español solo "
         "porque el dueño sea venezolano. "
         "ESTILO: usa lenguaje coloquial y slang que suene auténtico para el idioma y la "
@@ -542,6 +729,13 @@ def _generar_respuesta_inicial_business(mensaje_entrante):
     ).strip()
     if not respuesta:
         raise RuntimeError("Gemini no devolvió una respuesta de texto")
+    idioma_respuesta = _detectar_idioma_business(respuesta)
+    if (
+        idioma_objetivo
+        and idioma_respuesta
+        and idioma_respuesta != idioma_objetivo
+    ):
+        raise RuntimeError("Gemini respondió en un idioma distinto al mensaje")
     return respuesta[:400]
 
 
@@ -790,8 +984,14 @@ def _mensaje_bienvenida_business(message):
         or getattr(message, "caption", None)
         or ""
     )
+    remitente = getattr(message, "from_user", None)
+    language_hint = getattr(remitente, "language_code", None)
+    idioma_objetivo = _detectar_idioma_business(texto_entrante, language_hint)
     try:
-        respuesta = _generar_respuesta_inicial_business(texto_entrante)
+        respuesta = _generar_respuesta_inicial_business(
+            texto_entrante,
+            language_hint=language_hint,
+        )
     except Exception as error:
         detalle = (
             str(error)[:120]
@@ -800,11 +1000,15 @@ def _mensaje_bienvenida_business(message):
         )
         app.logger.warning(
             "Se usó el saludo de respaldo; Gemini no generó respuesta "
-            "(error=%s, detalle=%s).",
+            "(idioma=%s, error=%s, detalle=%s).",
+            idioma_objetivo or "auto",
             type(error).__name__,
             detalle,
         )
-        respuesta = WELCOME_MESSAGE
+        respuesta = BUSINESS_WELCOME_FALLBACKS.get(
+            idioma_objetivo,
+            WELCOME_MESSAGE,
+        )
 
     return respuesta
 
@@ -2649,17 +2853,25 @@ def _limpiar_compartidos_asistente_expirados():
                 PENDING_ASSISTANT_SHARES.pop(share_id, None)
 
 
-def _markup_preview_compartir_asistente(share_id):
+def _markup_preview_compartir_asistente(share_id, inline_ready=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(
             "🤖 Iniciar conversación",
             url=ASSISTANT_PAYMENT_URL,
-        ),
-        types.InlineKeyboardButton(
+        )
+    )
+    if inline_ready is False:
+        markup.add(types.InlineKeyboardButton(
+            "⚙️ Activar compartir con contactos",
+            callback_data="assistant_share_inline_help",
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
             "📤 Compartir con un contacto",
-            switch_inline_query="compartir",
-        ),
+            switch_inline_query=f"compartir {share_id}",
+        ))
+    markup.add(
         types.InlineKeyboardButton(
             "🔄 Generar otro texto",
             callback_data=f"assistant_share_regenerate|{share_id}",
@@ -2694,12 +2906,26 @@ def _mostrar_preview_compartir_asistente(
     if not share_id:
         share_id = uuid.uuid4().hex[:16]
 
+    inline_ready = False
+    inline_username = None
+    inline_status_checked = False
+    try:
+        bot_identity = bot.get_me()
+        inline_ready = bool(
+            getattr(bot_identity, "supports_inline_queries", False)
+        )
+        inline_username = getattr(bot_identity, "username", None)
+        inline_status_checked = True
+    except Exception:
+        app.logger.warning(
+            "No se pudo verificar si el bot tiene habilitado el modo inline."
+        )
+
     foto_id = config.get("assistant_share_photo_file_id")
     if not foto_id:
         foto_id = WELCOME_PHOTO_PATH if os.path.isfile(WELCOME_PHOTO_PATH) else os.path.join(
             BASE_DIR, "portada.jpg"
         )
-    markup = _markup_preview_compartir_asistente(share_id)
     try:
         _limpiar_panel_inicio_privado(chat_id)
         if isinstance(foto_id, str) and os.path.isfile(foto_id):
@@ -2709,7 +2935,6 @@ def _mostrar_preview_compartir_asistente(
                     photo,
                     caption=html.escape(texto),
                     parse_mode="HTML",
-                    reply_markup=markup,
                     protect_content=True,
                 )
         else:
@@ -2718,7 +2943,6 @@ def _mostrar_preview_compartir_asistente(
                 foto_id,
                 caption=html.escape(texto),
                 parse_mode="HTML",
-                reply_markup=markup,
                 protect_content=True,
             )
     except Exception:
@@ -2729,11 +2953,19 @@ def _mostrar_preview_compartir_asistente(
             protect_content=True,
         )
 
-    foto_id_telegram = (
-        preview.photo[-1].file_id
-        if getattr(preview, "photo", None)
-        else foto_id
-    )
+    fotos_preview = getattr(preview, "photo", None)
+    if fotos_preview:
+        foto_id_telegram = fotos_preview[-1].file_id
+    elif isinstance(foto_id, str) and not os.path.isfile(foto_id):
+        foto_id_telegram = foto_id
+    else:
+        eliminar_mensaje_seguro(chat_id, preview.message_id)
+        return bot.send_message(
+            chat_id,
+            "Telegram no devolvió un identificador reutilizable para la foto. "
+            "Vuelve a cargar la imagen antes de compartir.",
+            protect_content=True,
+        )
     _limpiar_compartidos_asistente_expirados()
     with ASSISTANT_SHARE_LOCK:
         PENDING_ASSISTANT_SHARES[share_id] = {
@@ -2744,6 +2976,33 @@ def _mostrar_preview_compartir_asistente(
             "admin_id": int(ADMIN_ID),
         }
         ACTIVE_ASSISTANT_SHARE_ID = share_id
+    try:
+        # La tarjeta de compartir solo se habilita después de guardar el file_id
+        # y el borrador; así una pulsación rápida no consulta un estado vacío.
+        bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=preview.message_id,
+            caption=html.escape(texto),
+            parse_mode="HTML",
+            reply_markup=_markup_preview_compartir_asistente(
+                share_id,
+                inline_ready=inline_ready,
+            ),
+        )
+    except Exception:
+        app.logger.exception(
+            "No se pudieron activar los botones de la invitación para compartir."
+        )
+        with ASSISTANT_SHARE_LOCK:
+            PENDING_ASSISTANT_SHARES.pop(share_id, None)
+            if ACTIVE_ASSISTANT_SHARE_ID == share_id:
+                ACTIVE_ASSISTANT_SHARE_ID = None
+        eliminar_mensaje_seguro(chat_id, preview.message_id)
+        return bot.send_message(
+            chat_id,
+            "No pude preparar la tarjeta para compartir. Inténtalo otra vez.",
+            protect_content=True,
+        )
     with PANEL_LOCK:
         PANELES_PRIVADOS.upsert(
             {
@@ -2756,15 +3015,33 @@ def _mostrar_preview_compartir_asistente(
         )
     if es_nueva_vista:
         _eliminar_ayuda_compartir_asistente(chat_id)
+        nombre_bot = f"@{inline_username}" if inline_username else "este bot"
+        if not inline_ready:
+            aviso_inline = (
+                "Telegram confirmó que el modo inline está desactivado."
+                if inline_status_checked
+                else "No pude confirmar que el modo inline esté activo."
+            )
+            ayuda_texto = (
+                f"⚠️ {aviso_inline} para {nombre_bot}.\n"
+                "En @BotFather envía /setinline, selecciona este mismo bot y "
+                "define un texto de ejemplo. Después vuelve a crear la vista previa.\n\n"
+            )
+        else:
+            ayuda_texto = ""
+        ayuda_texto += (
+            "Para enviarlo correctamente:\n"
+            "1. Pulsa «Compartir con un contacto» y elige a la persona.\n"
+            "2. En el chat elegido, toca la tarjeta con la foto que aparece arriba del teclado.\n\n"
+            "Telegram no envía automáticamente la tarjeta al elegir el contacto: "
+            "hay que tocar la tarjeta. No pulses Enviar sobre «@bot compartir»; "
+            "eso manda solo ese texto. Si no aparece la tarjeta, activa /setinline "
+            "en el bot que ejecuta este servicio."
+        )
         try:
             ayuda = bot.send_message(
                 chat_id,
-                "Para enviarlo correctamente:\n"
-                "1. Pulsa «Compartir con un contacto» y elige a la persona.\n"
-                "2. En el chat elegido, toca la tarjeta con la foto para enviar la invitación.\n\n"
-                "Si ves «@bot compartir» escrito en la caja, no pulses Enviar sobre eso: "
-                "selecciona primero la tarjeta. Si no aparece ninguna tarjeta, activa "
-                "/setinline en BotFather para el bot que ejecuta este servicio en Render.",
+                ayuda_texto,
                 parse_mode=None,
                 protect_content=True,
             )
@@ -3515,6 +3792,25 @@ def admin_editar_foto_compartir_asistente(call):
 
 
 @bot.callback_query_handler(
+    func=lambda call: call.data == "assistant_share_inline_help"
+)
+def admin_ayuda_modo_inline_compartir(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        username = getattr(bot.get_me(), "username", None)
+    except Exception:
+        username = None
+    bot.answer_callback_query(
+        call.id,
+        "En @BotFather envía /setinline y selecciona "
+        f"@{username or 'el bot de TELEGRAM_TOKEN'}. Luego vuelve a crear la vista previa.",
+        show_alert=True,
+    )
+
+
+@bot.callback_query_handler(
     func=lambda call: call.data == "assistant_share_cancel_photo"
 )
 def admin_cancelar_edicion_foto_compartir(call):
@@ -3558,7 +3854,13 @@ def admin_volver_desde_compartir_asistente(call):
 
 
 @bot.inline_handler(
-    func=lambda query: query.query.strip().casefold() == "compartir"
+    func=lambda query: bool(
+        re.fullmatch(
+            r"compartir(?:\s+[a-f0-9]{16})?",
+            query.query.strip(),
+            flags=re.I,
+        )
+    )
 )
 def compartir_invitacion_asistente_inline(query):
     if str(query.from_user.id) != str(ADMIN_ID):
@@ -3567,9 +3869,14 @@ def compartir_invitacion_asistente_inline(query):
         )
         return
     _limpiar_compartidos_asistente_expirados()
+    partes = query.query.strip().split()
+    share_id = partes[1] if len(partes) == 2 else None
     with ASSISTANT_SHARE_LOCK:
-        share_id = ACTIVE_ASSISTANT_SHARE_ID
-        payload = PENDING_ASSISTANT_SHARES.get(share_id)
+        if share_id:
+            payload = PENDING_ASSISTANT_SHARES.get(share_id)
+        else:
+            share_id = ACTIVE_ASSISTANT_SHARE_ID
+            payload = PENDING_ASSISTANT_SHARES.get(share_id)
         if payload:
             payload = dict(payload)
     if (

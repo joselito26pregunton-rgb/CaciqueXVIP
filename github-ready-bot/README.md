@@ -44,3 +44,16 @@ Después del despliegue, el administrador puede enviar `/gemini_test` al bot par
 ## Datos locales
 
 `config.json`, `payment_config.json`, `usuarios.json`, `business_welcome_users.json` y las bases de datos locales se crean o modifican durante la ejecución y están excluidos del ZIP. Conserva las copias del servicio de Render: pueden contener destinos, pagos, suscripciones y registros que no deben reemplazarse al subir este código. Mantén el repositorio privado porque el código contiene enlaces actuales del bot.
+
+### Guardar las imágenes con Supabase en Render
+
+El identificador de la foto del menú de pagos, el de la bienvenida de `/start` y las instrucciones de esa bienvenida se guardan en Supabase cuando se configuran las variables siguientes en **Render → servicio → Environment**:
+
+- `SUPABASE_URL`: URL del proyecto de Supabase.
+- `SUPABASE_SECRET_KEY`: clave secreta del proyecto (normalmente empieza con `sb_secret_`). Si tu proyecto solo muestra la clave antigua `service_role`, el bot también la acepta mediante `SUPABASE_SERVICE_ROLE_KEY`. No pongas ninguna clave en GitHub ni la compartas por chat.
+
+Antes del primer uso, abre el **SQL Editor** del proyecto Supabase, ejecuta el contenido de `supabase/schema.sql` una sola vez y despliega el bot. Si los antiguos archivos `config.json` o `payment_config.json` siguen presentes al iniciar, el bot copia de ellos las referencias de fotos a Supabase cuando la tabla todavía no tiene ajustes. Luego Supabase es la fuente persistente de esas referencias.
+
+En la sección de fotos del panel de administración, el bot indica si Supabase respondió o si falta configurarlo. Si Supabase no responde al guardar una foto, el bot debe avisarlo y no confirmar el cambio como guardado. El plan gratuito de Supabase puede pausar un proyecto tras siete días con poca actividad; su documentación indica que se puede reanudar con sus datos y configuración durante un año. Tras una pausa, puede ser necesario reanudar el proyecto desde su panel.
+
+Esta conexión persiste únicamente las referencias de las dos fotos y las instrucciones de bienvenida de `/start`. Los métodos de pago, destinos, suscripciones y otros archivos siguen usando los archivos locales indicados arriba; para conservar también esos datos al volver a desplegar, hace falta configurar por separado el almacenamiento persistente de esos registros.

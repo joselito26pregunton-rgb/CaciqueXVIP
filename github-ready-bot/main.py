@@ -1,4 +1,4 @@
-import os, threading, time, json, hashlib, hmac, html, random, re, uuid, urllib.parse, urllib.request, urllib.error, unicodedata
+import os, shutil, threading, time, json, hashlib, hmac, html, random, re, uuid, urllib.parse, urllib.request, urllib.error, unicodedata
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import telebot
@@ -7,6 +7,42 @@ from tinydb import TinyDB, Query
 from flask import Flask, jsonify, request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BOT_DATA_DIR = os.path.abspath(os.environ.get("BOT_DATA_DIR", BASE_DIR))
+os.makedirs(BOT_DATA_DIR, exist_ok=True)
+
+def _state_path(filename):
+    """Use Render's mounted data directory and migrate legacy local state once."""
+    destination = os.path.join(BOT_DATA_DIR, filename)
+    if os.path.normcase(destination) == os.path.normcase(
+        os.path.join(BASE_DIR, filename)
+    ):
+        return destination
+    legacy = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(destination) and os.path.isfile(legacy):
+        shutil.copy2(legacy, destination)
+        app.logger.info(
+            "Se migró el archivo local de estado %s al almacenamiento configurado.",
+            filename,
+        )
+    return destination
+
+
+def _sync_parent_directory(path):
+    try:
+        descriptor = os.open(
+            os.path.dirname(path),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID = "7827130679"
 CANAL_ID = "-1003914257220"
@@ -68,12 +104,30 @@ bot.edit_message_text = _editar_compat(bot.edit_message_text)
 bot.edit_message_caption = _editar_compat(bot.edit_message_caption)
 bot.edit_message_reply_markup = _editar_compat(bot.edit_message_reply_markup)
 
-CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+CONFIG_FILE = _state_path("config.json")
 CONFIG_LOCK = threading.RLock()
 RECORDATORIO_START_LOCK = threading.RLock()
-PAYMENT_CONFIG_FILE = os.path.join(BASE_DIR, "payment_config.json")
+PAYMENT_CONFIG_FILE = _state_path("payment_config.json")
 PAYMENT_CONFIG_LOCK = threading.RLock()
-db = TinyDB(os.path.join(BASE_DIR, "usuarios.json"))
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get(
+    "SUPABASE_SECRET_KEY",
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+).strip()
+SUPABASE_SETTINGS_TABLE = "bot_persistent_settings"
+SUPABASE_SETTINGS_ROW_KEY = "visual_settings"
+SUPABASE_SETTINGS_CACHE_TTL_SECONDS = 15
+SUPABASE_SETTINGS_LOCK = threading.RLock()
+SUPABASE_SETTINGS_CACHE = None
+SUPABASE_SETTINGS_CACHE_AT = 0.0
+SUPABASE_SETTINGS_STATUS = "not_checked"
+SUPABASE_SETTINGS_SEED_ATTEMPTED = False
+SUPABASE_START_CONFIG_KEYS = (
+    "payment_start_photo_file_id",
+    "payment_start_welcome_instructions",
+)
+SUPABASE_PAYMENT_CONFIG_KEY = "payment_menu_photo_file_id"
+db = TinyDB(_state_path("usuarios.json"))
 FreeGoldPasses = db.table("free_goldpass")
 FREE_GOLDPASS_QUERY = Query()
 FREE_GOLDPASS_LOCK = threading.RLock()
@@ -95,7 +149,7 @@ ID_ULTIMA_INVITACION = {}
 ULTIMOS_MSGS = {'reglas': None, 'admin': None, 'menu': None, 'compartir': None, 'start': None, 'reportar': None, 'anon': None}
 PANELES_GRUPO_MIEMBRO = {}
 reporte_msgs = {}
-BUSINESS_WELCOME_FILE = os.path.join(BASE_DIR, "business_welcome_users.json")
+BUSINESS_WELCOME_FILE = _state_path("business_welcome_users.json")
 BUSINESS_WELCOME_LOCK = threading.RLock()
 
 # Saludo automático para perfiles conectados mediante Telegram Chat Automation
@@ -181,22 +235,22 @@ PAYMENT_CHAT_SESSION_TTL_SECONDS = 30 * 60
 PAYMENT_CHAT_HISTORY_LIMIT = 10
 
 # Separate ZIP moderation data from the live payment/subscription database and config.json.
-group_db = TinyDB(os.path.join(BASE_DIR, "database.json"))
-Config = TinyDB(os.path.join(BASE_DIR, "group_rules.json"))
-Blacklist = TinyDB(os.path.join(BASE_DIR, "blacklist.json"))
-UltimaPromo = TinyDB(os.path.join(BASE_DIR, "ultima_promo.json"))
-Warnings = TinyDB(os.path.join(BASE_DIR, "warnings.json"))
-GroupReports = TinyDB(os.path.join(BASE_DIR, "group_reports.json"))
-GroupModerationLog = TinyDB(os.path.join(BASE_DIR, "group_moderation_log.json"))
-GroupBannedWords = TinyDB(os.path.join(BASE_DIR, "group_banned_words.json")).table("words")
-PromosAprobadas = TinyDB(os.path.join(BASE_DIR, "promos_aprobadas.json"))
-RegistroActividad = TinyDB(os.path.join(BASE_DIR, "registro_actividad.json"))
-Suscripciones = TinyDB(os.path.join(BASE_DIR, "suscripciones.json"))
+group_db = TinyDB(_state_path("database.json"))
+Config = TinyDB(_state_path("group_rules.json"))
+Blacklist = TinyDB(_state_path("blacklist.json"))
+UltimaPromo = TinyDB(_state_path("ultima_promo.json"))
+Warnings = TinyDB(_state_path("warnings.json"))
+GroupReports = TinyDB(_state_path("group_reports.json"))
+GroupModerationLog = TinyDB(_state_path("group_moderation_log.json"))
+GroupBannedWords = TinyDB(_state_path("group_banned_words.json")).table("words")
+PromosAprobadas = TinyDB(_state_path("promos_aprobadas.json"))
+RegistroActividad = TinyDB(_state_path("registro_actividad.json"))
+Suscripciones = TinyDB(_state_path("suscripciones.json"))
 SUSCRIPCIONES_LOCK = threading.RLock()
 PAID_ACCESS_LOCK = threading.RLock()
 SUSCRIPCIONES_ARCHIVO = Suscripciones.table("suscripciones")
 COMPROBANTES_PENDIENTES = Suscripciones.table("comprobantes_pendientes")
-Estadisticas = TinyDB(os.path.join(BASE_DIR, "stats.json"))
+Estadisticas = TinyDB(_state_path("stats.json"))
 User = Query()
 
 DEFAULT_PROHIBITED_WORD_GROUPS = (
@@ -248,25 +302,242 @@ def telegram_webhook():
     bot.process_new_updates([update])
     return "OK", 200
 
+
+def _supabase_configurado():
+    return bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+
+
+def _supabase_pedir(method, payload=None):
+    if not _supabase_configurado():
+        raise RuntimeError("Faltan las variables de conexión de Supabase.")
+    query_parameters = (
+        {
+            "key": f"eq.{SUPABASE_SETTINGS_ROW_KEY}",
+            "select": "settings",
+        }
+        if method == "GET"
+        else {"on_conflict": "key"}
+    )
+    query = urllib.parse.urlencode(query_parameters)
+    endpoint = f"{SUPABASE_URL}/rest/v1/{SUPABASE_SETTINGS_TABLE}?{query}"
+    body = (
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if payload is not None
+        else None
+    )
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Accept": "application/json",
+    }
+    if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SECRET_KEY}"
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers=headers,
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=12) as response:
+        raw = response.read()
+    return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _supabase_sembrar_desde_archivos(config_local=None, settings_actuales=None):
+    global SUPABASE_SETTINGS_SEED_ATTEMPTED
+    global SUPABASE_SETTINGS_CACHE, SUPABASE_SETTINGS_CACHE_AT
+    if SUPABASE_SETTINGS_SEED_ATTEMPTED:
+        return
+    if not isinstance(config_local, dict) or not config_local:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as archivo:
+                config_local = json.load(archivo)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            config_local = {}
+    if not isinstance(config_local, dict):
+        config_local = {}
+    inicial = {}
+    for key in SUPABASE_START_CONFIG_KEYS:
+        value = config_local.get(key)
+        if value not in (None, ""):
+            inicial[key] = value
+    try:
+        with open(PAYMENT_CONFIG_FILE, "r", encoding="utf-8") as archivo:
+            pagos_locales = json.load(archivo)
+        if isinstance(pagos_locales, dict):
+            value = pagos_locales.get("portada_file_id")
+            if value not in (None, ""):
+                inicial[SUPABASE_PAYMENT_CONFIG_KEY] = value
+    except FileNotFoundError:
+        pass
+    except (OSError, json.JSONDecodeError):
+        app.logger.warning(
+            "No se pudieron leer los ajustes locales al inicializar Supabase."
+        )
+    actuales = dict(settings_actuales or {})
+    faltantes = {
+        key: value for key, value in inicial.items() if key not in actuales
+    }
+    if not faltantes:
+        SUPABASE_SETTINGS_SEED_ATTEMPTED = True
+        SUPABASE_SETTINGS_CACHE = actuales
+        SUPABASE_SETTINGS_CACHE_AT = time.monotonic()
+        return
+    actuales.update(faltantes)
+    payload = {
+        "key": SUPABASE_SETTINGS_ROW_KEY,
+        "settings": actuales,
+    }
+    _supabase_pedir("POST", payload)
+    SUPABASE_SETTINGS_SEED_ATTEMPTED = True
+    SUPABASE_SETTINGS_CACHE = actuales
+    SUPABASE_SETTINGS_CACHE_AT = time.monotonic()
+
+
+def _supabase_cargar_ajustes(config_local=None, force=False):
+    global SUPABASE_SETTINGS_CACHE, SUPABASE_SETTINGS_CACHE_AT
+    global SUPABASE_SETTINGS_STATUS
+    if not SUPABASE_URL and not SUPABASE_SECRET_KEY:
+        SUPABASE_SETTINGS_STATUS = "not_configured"
+        return {}
+    if not _supabase_configurado():
+        SUPABASE_SETTINGS_STATUS = "incomplete"
+        app.logger.warning(
+            "La conexión con Supabase está incompleta; configura SUPABASE_URL "
+            "y SUPABASE_SECRET_KEY."
+        )
+        return {}
+    with SUPABASE_SETTINGS_LOCK:
+        ahora = time.monotonic()
+        if (
+            not force
+            and SUPABASE_SETTINGS_CACHE is not None
+            and ahora - SUPABASE_SETTINGS_CACHE_AT
+            < SUPABASE_SETTINGS_CACHE_TTL_SECONDS
+        ):
+            return dict(SUPABASE_SETTINGS_CACHE)
+        try:
+            rows = _supabase_pedir("GET")
+            if not isinstance(rows, list):
+                raise ValueError("Supabase devolvió un formato de ajustes inválido.")
+            settings = {}
+            if rows:
+                row = rows[0]
+                if isinstance(row, dict) and isinstance(row.get("settings"), dict):
+                    settings = dict(row["settings"])
+            SUPABASE_SETTINGS_STATUS = "connected"
+            SUPABASE_SETTINGS_CACHE = settings
+            SUPABASE_SETTINGS_CACHE_AT = time.monotonic()
+            if not SUPABASE_SETTINGS_SEED_ATTEMPTED:
+                try:
+                    _supabase_sembrar_desde_archivos(
+                        config_local,
+                        settings_actuales=settings,
+                    )
+                    settings = dict(SUPABASE_SETTINGS_CACHE or {})
+                except Exception as error:
+                    SUPABASE_SETTINGS_STATUS = "error"
+                    app.logger.warning(
+                        "No se pudieron inicializar los ajustes visuales en Supabase "
+                        "(error=%s).",
+                        type(error).__name__,
+                    )
+            return settings
+        except Exception as error:
+            SUPABASE_SETTINGS_STATUS = "error"
+            app.logger.warning(
+                "No se pudieron cargar los ajustes visuales de Supabase (error=%s).",
+                type(error).__name__,
+            )
+            return dict(SUPABASE_SETTINGS_CACHE or {})
+
+
+def _supabase_guardar_ajustes(changes):
+    global SUPABASE_SETTINGS_CACHE, SUPABASE_SETTINGS_CACHE_AT
+    global SUPABASE_SETTINGS_STATUS
+    if not changes:
+        return False
+    if not SUPABASE_URL and not SUPABASE_SECRET_KEY:
+        SUPABASE_SETTINGS_STATUS = "not_configured"
+        return False
+    if not _supabase_configurado():
+        SUPABASE_SETTINGS_STATUS = "incomplete"
+        raise RuntimeError("Configura ambas variables de conexión de Supabase.")
+    with SUPABASE_SETTINGS_LOCK:
+        current = _supabase_cargar_ajustes(force=True)
+        if SUPABASE_SETTINGS_STATUS != "connected":
+            raise RuntimeError("No pude leer los ajustes actuales de Supabase.")
+        current.update(changes)
+        try:
+            _supabase_pedir(
+                "POST",
+                {
+                    "key": SUPABASE_SETTINGS_ROW_KEY,
+                    "settings": current,
+                },
+            )
+        except Exception as error:
+            SUPABASE_SETTINGS_STATUS = "error"
+            app.logger.warning(
+                "No se pudieron guardar los ajustes visuales en Supabase "
+                "(error=%s).",
+                type(error).__name__,
+            )
+            raise RuntimeError("No se pudieron guardar los ajustes en Supabase.") from error
+        SUPABASE_SETTINGS_CACHE = current
+        SUPABASE_SETTINGS_CACHE_AT = time.monotonic()
+        SUPABASE_SETTINGS_STATUS = "connected"
+    return True
+
+
 def cargar_config():
     with CONFIG_LOCK:
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+                config = json.load(f)
+        except FileNotFoundError:
+            config = {}
+        except json.JSONDecodeError as error:
+            app.logger.exception(
+                "El archivo de configuración no es JSON válido; se conserva sin sobrescribir."
+            )
+            raise ValueError("La configuración guardada está dañada.") from error
+        if not isinstance(config, dict):
+            raise ValueError("La configuración guardada debe ser un objeto JSON.")
+        visuales = _supabase_cargar_ajustes(config)
+        for key in SUPABASE_START_CONFIG_KEYS:
+            if key in visuales:
+                config[key] = visuales[key]
+        return config
 
 def guardar_config(cfg):
     with CONFIG_LOCK:
         temporal = CONFIG_FILE + ".tmp"
         with open(temporal, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(temporal, CONFIG_FILE)
+        _sync_parent_directory(CONFIG_FILE)
 
 def actualizar_config(actualizar):
     with CONFIG_LOCK:
         cfg = cargar_config()
+        previous = {
+            key: (key in cfg, cfg.get(key))
+            for key in SUPABASE_START_CONFIG_KEYS
+        }
         actualizar(cfg)
+        changed = {
+            key: cfg.get(key)
+            for key in SUPABASE_START_CONFIG_KEYS
+            if previous[key] != (key in cfg, cfg.get(key))
+        }
+        if changed:
+            _supabase_guardar_ajustes(changed)
         guardar_config(cfg)
         _PROHIBITED_WORDS_DESTINATION_CACHE.clear()
         _PROHIBITED_WORDS_READY.clear()
@@ -1814,7 +2085,7 @@ def cargar_config_pagos():
             with open(PAYMENT_CONFIG_FILE, "r", encoding="utf-8") as archivo:
                 datos = json.load(archivo)
         except FileNotFoundError:
-            return {"metodos": {}, "mensajes_link": {}, "portada_file_id": None}
+            datos = {"metodos": {}, "mensajes_link": {}, "portada_file_id": None}
         except json.JSONDecodeError as error:
             app.logger.error(
                 "La configuración privada de pagos contiene JSON inválido: %s",
@@ -1847,6 +2118,12 @@ def cargar_config_pagos():
             datos.get("portada_file_id"), str
         ):
             raise ValueError("La referencia privada de la foto no tiene el formato esperado.")
+        visuales = _supabase_cargar_ajustes()
+        if SUPABASE_PAYMENT_CONFIG_KEY in visuales:
+            portada = visuales[SUPABASE_PAYMENT_CONFIG_KEY]
+            if portada is not None and not isinstance(portada, str):
+                raise ValueError("La referencia persistida de la foto no es válida.")
+            datos["portada_file_id"] = portada
         return datos
 
 
@@ -1863,12 +2140,27 @@ def guardar_config_pagos(datos):
             os.fsync(archivo.fileno())
         os.replace(temporal, PAYMENT_CONFIG_FILE)
         os.chmod(PAYMENT_CONFIG_FILE, 0o600)
+        _sync_parent_directory(PAYMENT_CONFIG_FILE)
 
 
 def actualizar_config_pagos(actualizar):
     with PAYMENT_CONFIG_LOCK:
         datos = cargar_config_pagos()
+        portada_anterior = (
+            "portada_file_id" in datos,
+            datos.get("portada_file_id"),
+        )
         actualizar(datos)
+        portada_nueva = (
+            "portada_file_id" in datos,
+            datos.get("portada_file_id"),
+        )
+        if portada_nueva != portada_anterior:
+            _supabase_guardar_ajustes(
+                {
+                    SUPABASE_PAYMENT_CONFIG_KEY: datos.get("portada_file_id")
+                }
+            )
         guardar_config_pagos(datos)
         return datos
 
@@ -2452,7 +2744,8 @@ def _lista_suscripciones_admin():
         registros.append(actual)
     for registro in FreeGoldPasses.all():
         if registro.get("status") not in (
-            "active", "expired", "expiring", "kick_pending", "expiry_pending"
+            "active", "expired", "expiring", "kick_pending", "expiry_pending",
+            "pending",
         ):
             continue
         actual = dict(registro)
@@ -2464,16 +2757,27 @@ def _lista_suscripciones_admin():
     for registro in registros:
         vence = _parsear_fecha_suscripcion(registro.get("vence"))
         estado_original = registro.get("status") or registro.get("estado")
-        if estado_original in ("kick_pending", "expiry_pending", "expiring"):
+        if estado_original == "pending":
+            registro["estado_panel"] = "pendiente"
+        elif estado_original in ("kick_pending", "expiry_pending", "expiring"):
             registro["estado_panel"] = "expirando"
+        elif not vence:
+            registro["estado_panel"] = "sin_fecha"
         elif vence and vence > ahora:
             registro["estado_panel"] = "activo"
         else:
             registro["estado_panel"] = "vencido"
         registro["_vence_dt"] = vence or datetime.min
+    prioridad_estado = {
+        "activo": 0,
+        "pendiente": 1,
+        "expirando": 2,
+        "sin_fecha": 3,
+        "vencido": 4,
+    }
     registros.sort(
         key=lambda item: (
-            item.get("estado_panel") != "activo",
+            prioridad_estado.get(item.get("estado_panel"), 5),
             item.get("_vence_dt") or datetime.min,
             item.get("tipo", ""),
             int(item.get("id", 0) or 0),
@@ -2583,9 +2887,24 @@ def markup_lista_suscripciones(registros, pagina, tamano=8):
     for registro in registros[inicio:inicio + tamano]:
         user_id = int(registro.get("id", 0) or 0)
         tipo = registro.get("tipo", "paid")
-        icono = "✅" if registro.get("estado_panel") == "activo" else "⌛"
+        estado = registro.get("estado_panel")
+        iconos = {
+            "activo": "✅",
+            "pendiente": "🟡",
+            "expirando": "⚠️",
+            "sin_fecha": "❔",
+            "vencido": "⌛",
+        }
+        icono = iconos.get(estado, "❔")
         nombre = ("@" + str(registro["username"]).lstrip("@")) if registro.get("username") else f"ID {user_id}"
-        etiqueta = f"{icono} {nombre} · {_texto_tiempo_restante(registro.get('vence'))}"
+        restante = (
+            "pendiente de unirse"
+            if estado == "pendiente"
+            else "sin vencimiento"
+            if estado == "sin_fecha"
+            else _texto_tiempo_restante(registro.get("vence"))
+        )
+        etiqueta = f"{icono} {nombre} · {restante}"
         markup.add(types.InlineKeyboardButton(
             etiqueta[:60],
             callback_data=f"admin_suscripcion_ver|{tipo}|{user_id}|{pagina}",
@@ -2613,10 +2932,17 @@ def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
     paginas = max(1, (len(registros) + tamano - 1) // tamano)
     pagina = max(0, min(int(pagina), paginas - 1))
     if registros:
+        conteos = {
+            estado: sum(1 for r in registros if r.get("estado_panel") == estado)
+            for estado in ("activo", "pendiente", "expirando", "sin_fecha", "vencido")
+        }
         texto = (
             f"👥 <b>Administrar suscripciones</b> · página {pagina + 1}/{paginas}\n\n"
             f"Registros: <b>{len(registros)}</b>. Incluye usuarios de usuarios.json, "
-            "el historial pagado y Free Gold Pass. Pulsa un usuario para ver su ficha y comprobante."
+            "el historial pagado y Free Gold Pass.\n"
+            f"✅ Activas: {conteos['activo']} · ⌛ Vencidas: {conteos['vencido']} · "
+            f"🟡 Pendientes: {conteos['pendiente']} · ❔ Sin vencimiento: {conteos['sin_fecha']}\n\n"
+            "Pulsa un usuario para ver su ficha y comprobante."
         )
     else:
         texto = (
@@ -2672,10 +2998,26 @@ def mostrar_detalle_suscripcion(
     )
     nombre_tipo = "Free Gold Pass" if tipo == "free" else "GoldPass VIP"
     estado = registro.get("estado_panel") or registro.get("estado") or registro.get("status") or "registrado"
-    if tipo == "paid":
+    fecha = _parsear_fecha_suscripcion(registro.get("vence"))
+    estado_original = registro.get("status") or registro.get("estado")
+    if estado_original == "pending":
+        estado = "pendiente de unirse"
+    elif estado_original in ("kick_pending", "expiry_pending", "expiring"):
+        estado = "expulsión pendiente"
+    elif not fecha:
+        estado = "sin vencimiento registrado"
+    elif tipo == "paid":
         fecha = _parsear_fecha_suscripcion(registro.get("vence"))
-        estado = "activo" if fecha and fecha > datetime.now() else "vencido"
+        estado = "activo" if fecha > datetime.now() else "vencido"
+    else:
+        estado = "activo" if fecha > datetime.now() else "vencido"
     comprobante = registro.get("comprobante_file_id") or registro.get("receipt_file_id")
+    fecha_registro = (
+        registro.get("issued_at")
+        or registro.get("created_at")
+        or registro.get("requested_at")
+        or "no registrada"
+    )
     presencia_canal = (
         "sí" if registro.get("in_channel") is True
         else "no" if registro.get("in_channel") is False
@@ -2686,6 +3028,7 @@ def mostrar_detalle_suscripcion(
         f"🆔 ID: <code>{int(user_id)}</code>\n"
         f"📛 Usuario: {html.escape(username)}\n"
         f"📌 Estado: <b>{html.escape(str(estado))}</b>\n"
+        f"🗂️ Registro creado: <b>{html.escape(str(fecha_registro))}</b>\n"
         f"👥 En el canal: <b>{presencia_canal}</b>\n"
         f"📥 Entrada al canal: <b>{html.escape(str(fecha_entrada))}</b>\n"
         f"⏳ {_texto_tiempo_restante(registro.get('vence'))}\n"
@@ -3255,12 +3598,44 @@ def mostrar_opciones_metodo_pago(
     )
 
 
+def _estado_persistencia_admin():
+    if _supabase_configurado():
+        if SUPABASE_SETTINGS_STATUS == "connected":
+            return (
+                "✅ Supabase respondió correctamente; las referencias de fotos "
+                "y las instrucciones se guardan allí."
+            )
+        if SUPABASE_SETTINGS_STATUS == "error":
+            return (
+                "⚠️ Supabase no respondió. Revisa el proyecto y sus variables "
+                "en Render antes de cambiar imágenes."
+            )
+        return (
+            "💾 Supabase está configurado; la conexión se comprobará al cargar "
+            "o guardar los ajustes."
+        )
+    if SUPABASE_SETTINGS_STATUS == "incomplete":
+        return (
+            "⚠️ Faltan SUPABASE_URL o SUPABASE_SECRET_KEY en Render."
+        )
+    if os.environ.get("BOT_DATA_DIR", "").strip():
+        return (
+            "💾 Ruta de disco configurada. Confirma que Render tenga un "
+            "Persistent Disk montado en esa ruta."
+        )
+    return (
+        "⚠️ Sin Supabase ni disco persistente: los cambios pueden perderse "
+        "al volver a desplegar."
+    )
+
+
 def mostrar_foto_pago_actual(chat_id, message=None, message_id=None, aviso=None):
     config_pagos = cargar_config_pagos()
     texto = (
         "🖼️ <b>Cambiar la foto del menú de pago</b>\n\n"
         "Esta es la foto que verán los usuarios al elegir cómo pagar. "
-        "Pulsa «Agregar foto» para enviar la nueva imagen; se guardará como foto."
+        "Pulsa «Agregar foto» para enviar la nueva imagen; se guardará como foto.\n\n"
+        f"{html.escape(_estado_persistencia_admin())}"
     )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n" + texto
@@ -3386,7 +3761,8 @@ def mostrar_admin_bienvenida_inicio_pago(
             f"Foto: <b>{estado_foto}</b>.\n"
             f"Texto de Gemini: <b>{estado_texto}</b>.\n"
             "La respuesta se adapta al idioma elegido y menciona el botón para ver "
-            "los métodos; el precio y el flujo de pago se mantienen fijos."
+            "los métodos; el precio y el flujo de pago se mantienen fijos.\n\n"
+            f"{html.escape(_estado_persistencia_admin())}"
         )
         if instrucciones:
             caption += (
@@ -3679,7 +4055,7 @@ def admin_volver_bienvenida_inicio_pago(call):
     if estado.get("paso") == "esperando_instrucciones_bienvenida_pago":
         admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "Edición cancelada.")
-    mostrar_admin_bienvenida_inicio_pago(
+    mostrar_admin_config_pagos(
         call.message.chat.id,
         message=call.message,
     )
@@ -4997,11 +5373,13 @@ def guardar_foto_bienvenida_pago(message, foto_id):
         return False
     panel_message_id = estado.get("panel_message_id")
     try:
-        actualizar_config(
+        guardada = actualizar_config(
             lambda config: config.update(
                 {"payment_start_photo_file_id": foto_id}
             )
         )
+        if guardada.get("payment_start_photo_file_id") != foto_id:
+            raise RuntimeError("La referencia de la foto no quedó guardada.")
     except Exception:
         app.logger.exception("No se pudo guardar la foto de bienvenida de /start.")
         eliminar_mensaje_disparador(message)
@@ -5064,9 +5442,11 @@ def guardar_foto_menu_pagos(message, foto_id):
         return False
     panel_message_id = estado.get("panel_message_id")
     try:
-        actualizar_config_pagos(
+        guardada = actualizar_config_pagos(
             lambda datos: datos.update({"portada_file_id": foto_id})
         )
+        if guardada.get("portada_file_id") != foto_id:
+            raise RuntimeError("La referencia de la portada no quedó guardada.")
     except Exception:
         app.logger.exception("No se pudo guardar la nueva portada de pagos.")
         eliminar_mensaje_disparador(message)
@@ -7084,7 +7464,7 @@ def enviar_media_panel_publicacion(chat_id, media_type, file_id, caption, markup
 
 
 def botones_fijos_publicacion_goldpass():
-    ruta = os.path.join(BASE_DIR, "botones_goldpass.json")
+    ruta = _state_path("botones_goldpass.json")
     try:
         with open(ruta, "r", encoding="utf-8") as archivo:
             guardados = json.load(archivo)
@@ -10408,6 +10788,25 @@ def proceso_obtener_usuario_reporte(message):
 
 
 if __name__ == "__main__":
+    if _supabase_configurado():
+        app.logger.info(
+            "Supabase está configurado para conservar los ajustes de fotos "
+            "y la bienvenida de /start."
+        )
+    elif SUPABASE_URL or SUPABASE_SECRET_KEY:
+        app.logger.warning(
+            "La configuración de Supabase está incompleta; faltan variables de entorno."
+        )
+    elif os.environ.get("BOT_DATA_DIR", "").strip():
+        app.logger.info(
+            "Almacenamiento persistente solicitado mediante BOT_DATA_DIR; "
+            "confirma que el disco de Render esté montado en esa ruta."
+        )
+    else:
+        app.logger.warning(
+            "BOT_DATA_DIR no está configurado. Si el disco del servicio es "
+            "efímero, los cambios y registros locales pueden perderse al desplegar."
+        )
     app.logger.info(
         "Gemini contextual: clave %s; modelo=%s.",
         "detectada" if os.environ.get("GEMINI_API_KEY", "").strip() else "no detectada",

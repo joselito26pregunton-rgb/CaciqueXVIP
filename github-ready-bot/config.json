@@ -101,7 +101,7 @@
     }
   },
   "free_goldpass": {
-    "active": true,
+    "active": false,
     "duration_seconds": 86400,
     "campaign_id": "15470f7953924414b557c6190a022b03",
     "promo_chat_id": "-1003561176552",

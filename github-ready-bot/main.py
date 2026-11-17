@@ -1,4 +1,4 @@
-import os, shutil, threading, time, json, hashlib, hmac, html, random, re, uuid, urllib.parse, urllib.request, urllib.error, unicodedata
+import os, shutil, threading, time, json, hashlib, hmac, html, random, re, uuid, urllib.parse, urllib.request, urllib.error, unicodedata, copy
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 import telebot
@@ -73,12 +73,65 @@ WEBHOOK_ALLOWED_UPDATES = [
 ]
 app = Flask(__name__)
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown", skip_pending=False)
+GOLDPASS_DISPLAY_NAME = "🏆🎟GoldPass"
 _send_original = bot.send_message
 _send_photo_original = bot.send_photo
 _send_video_original = bot.send_video
 _send_document_original = bot.send_document
 _send_audio_original = bot.send_audio
 _send_animation_original = bot.send_animation
+_send_media_group_original = bot.send_media_group
+
+
+def _normalizar_marca_goldpass(texto):
+    if not isinstance(texto, str):
+        return texto
+    return re.sub(
+        r"(?i)(free\s*)?(?:🏆🎟)?gold\s*pass",
+        lambda match: f"{match.group(1) or ''}{GOLDPASS_DISPLAY_NAME}",
+        texto,
+    )
+
+
+def _normalizar_markup_goldpass(reply_markup):
+    if reply_markup is None:
+        return None
+    try:
+        markup = copy.deepcopy(reply_markup)
+    except Exception:
+        markup = reply_markup
+    for row in getattr(markup, "keyboard", []) or []:
+        for button in row:
+            label = getattr(button, "text", None)
+            if isinstance(label, str):
+                try:
+                    button.text = _normalizar_marca_goldpass(label)
+                except Exception:
+                    pass
+    return markup
+
+
+def _normalizar_resultados_inline_goldpass(results):
+    try:
+        normalized = copy.deepcopy(results)
+    except Exception:
+        normalized = results
+    for result in normalized or []:
+        for field in ("title", "description", "caption", "message_text"):
+            value = getattr(result, field, None)
+            if isinstance(value, str):
+                try:
+                    setattr(result, field, _normalizar_marca_goldpass(value))
+                except Exception:
+                    pass
+        if getattr(result, "reply_markup", None) is not None:
+            try:
+                result.reply_markup = _normalizar_markup_goldpass(
+                    result.reply_markup
+                )
+            except Exception:
+                pass
+    return normalized
 
 
 def _chat_privado_panelizable(chat_id, kwargs):
@@ -94,6 +147,15 @@ def _chat_privado_panelizable(chat_id, kwargs):
 def _send_compat(*args, **kwargs):
     """Mantiene las respuestas privadas de texto en el panel activo del chat."""
     kwargs.pop("_force_new_message", None)
+    args = list(args)
+    if len(args) > 1:
+        args[1] = _normalizar_marca_goldpass(args[1])
+    elif "text" in kwargs:
+        kwargs["text"] = _normalizar_marca_goldpass(kwargs["text"])
+    if "reply_markup" in kwargs:
+        kwargs["reply_markup"] = _normalizar_markup_goldpass(
+            kwargs["reply_markup"]
+        )
     chat_id = args[0] if args else kwargs.get("chat_id")
     text = args[1] if len(args) > 1 else kwargs.get("text")
     if text is None or not _chat_privado_panelizable(chat_id, kwargs):
@@ -112,6 +174,15 @@ def _send_compat(*args, **kwargs):
 
 def _send_media_compat(sender, media_type, *args, **kwargs):
     """Reemplaza el panel privado por una sola pieza multimedia activa."""
+    args = list(args)
+    if len(args) > 2 and isinstance(args[2], str):
+        args[2] = _normalizar_marca_goldpass(args[2])
+    if "caption" in kwargs:
+        kwargs["caption"] = _normalizar_marca_goldpass(kwargs["caption"])
+    if "reply_markup" in kwargs:
+        kwargs["reply_markup"] = _normalizar_markup_goldpass(
+            kwargs["reply_markup"]
+        )
     chat_id = args[0] if args else kwargs.get("chat_id")
     media = args[1] if len(args) > 1 else kwargs.get(media_type)
     if media is None or not _chat_privado_panelizable(chat_id, kwargs):
@@ -148,18 +219,56 @@ def _send_animation_compat(*args, **kwargs):
     return _send_media_compat(_send_animation_original, "animation", *args, **kwargs)
 
 
+def _send_media_group_compat(*args, **kwargs):
+    args = list(args)
+    media_index = 1
+    if len(args) > media_index:
+        media = args[media_index]
+        media_kw = False
+    else:
+        media = kwargs.get("media", [])
+        media_kw = True
+    try:
+        media = copy.deepcopy(media)
+    except Exception:
+        pass
+    for item in media or []:
+        caption = getattr(item, "caption", None)
+        if isinstance(caption, str):
+            try:
+                item.caption = _normalizar_marca_goldpass(caption)
+            except Exception:
+                pass
+    if media_kw:
+        kwargs["media"] = media
+    elif len(args) > media_index:
+        args[media_index] = media
+    return _send_media_group_original(*args, **kwargs)
+
+
 bot.send_message = _send_compat
 bot.send_photo = _send_photo_compat
 bot.send_video = _send_video_compat
 bot.send_document = _send_document_compat
 bot.send_audio = _send_audio_compat
 bot.send_animation = _send_animation_compat
+bot.send_media_group = _send_media_group_compat
 # Panel helpers must always use the unwrapped API methods to avoid recursion.
 _SEND_MESSAGE_ORIGINAL = _send_original
 
 
 def _editar_compat(original):
     def editar(*args, **kwargs):
+        args = list(args)
+        if len(args) > 2 and isinstance(args[2], str):
+            args[2] = _normalizar_marca_goldpass(args[2])
+        for field in ("text", "caption"):
+            if isinstance(kwargs.get(field), str):
+                kwargs[field] = _normalizar_marca_goldpass(kwargs[field])
+        if "reply_markup" in kwargs:
+            kwargs["reply_markup"] = _normalizar_markup_goldpass(
+                kwargs["reply_markup"]
+            )
         try:
             return original(*args, **kwargs)
         except Exception as error:
@@ -181,6 +290,55 @@ def _editar_compat(original):
 bot.edit_message_text = _editar_compat(bot.edit_message_text)
 bot.edit_message_caption = _editar_compat(bot.edit_message_caption)
 bot.edit_message_reply_markup = _editar_compat(bot.edit_message_reply_markup)
+_edit_message_media_original = bot.edit_message_media
+
+
+def _edit_message_media_compat(*args, **kwargs):
+    args = list(args)
+    media = args[2] if len(args) > 2 else kwargs.get("media")
+    caption = getattr(media, "caption", None)
+    if isinstance(caption, str):
+        try:
+            media.caption = _normalizar_marca_goldpass(caption)
+        except Exception:
+            pass
+    if len(args) > 2:
+        args[2] = media
+    elif "media" in kwargs:
+        kwargs["media"] = media
+    return _edit_message_media_original(*args, **kwargs)
+
+
+bot.edit_message_media = _edit_message_media_compat
+
+_answer_callback_original = bot.answer_callback_query
+
+
+def _answer_callback_compat(*args, **kwargs):
+    args = list(args)
+    if len(args) > 1 and isinstance(args[1], str):
+        args[1] = _normalizar_marca_goldpass(args[1])
+    elif isinstance(kwargs.get("text"), str):
+        kwargs["text"] = _normalizar_marca_goldpass(kwargs["text"])
+    return _answer_callback_original(*args, **kwargs)
+
+
+bot.answer_callback_query = _answer_callback_compat
+_answer_inline_query_original = bot.answer_inline_query
+
+
+def _answer_inline_query_compat(*args, **kwargs):
+    args = list(args)
+    if len(args) > 1:
+        args[1] = _normalizar_resultados_inline_goldpass(args[1])
+    elif "results" in kwargs:
+        kwargs["results"] = _normalizar_resultados_inline_goldpass(
+            kwargs["results"]
+        )
+    return _answer_inline_query_original(*args, **kwargs)
+
+
+bot.answer_inline_query = _answer_inline_query_compat
 
 CONFIG_FILE = _state_path("config.json")
 CONFIG_LOCK = threading.RLock()
@@ -223,6 +381,8 @@ SUPABASE_START_CONFIG_KEYS = (
     "payment_start_freepass_instructions",
     "payment_start_button_labels",
     "payment_start_message_media",
+    "free_goldpass",
+    "assistant_share_photo_file_id",
 )
 SUPABASE_PAYMENT_CONFIG_KEY = "payment_menu_photo_file_id"
 db = TinyDB(_state_path("usuarios.json"))
@@ -296,7 +456,7 @@ PAYMENT_MENU_COPY = {
         "offer_no": "⏳ No, quizás más tarde",
         "onlyfans": "💙 Ver OnlyFans",
         "welcome_fallback": "¡Ey, bienvenido! Soy Cacique X. ¿Te gustaría conocer un poco más de mí? Cuéntame qué te interesa y conversamos.",
-        "welcome_cta": "Cuando quieras, pulsa uno de los botones de abajo: conoce el Gold Pass o entra gratis a 🔱FreeClub CX Hub🔱.",
+        "welcome_cta": "Cuando quieras, pulsa uno de los botones de abajo: conoce 🏆🎟GoldPass o entra gratis a 🔱FreeClub CX Hub🔱.",
         "reply_fallback": "Se me trabó la conexión un momento, pero aquí sigo. Cuéntame un poco más o, cuando quieras, pulsa el botón para ver las opciones.",
     },
     "en": {
@@ -311,7 +471,7 @@ PAYMENT_MENU_COPY = {
         "offer_no": "⏳ No, maybe later",
         "onlyfans": "💙 Visit OnlyFans",
         "welcome_fallback": "Hey, welcome! I’m Cacique X. Want to get to know me a little better? Tell me what you’re curious about and we can chat.",
-        "welcome_cta": "Whenever you’re ready, tap one of the buttons below to learn about Gold Pass or join 🔱FreeClub CX Hub🔱 for free.",
+        "welcome_cta": "Whenever you’re ready, tap one of the buttons below to learn about 🏆🎟GoldPass or join 🔱FreeClub CX Hub🔱 for free.",
         "reply_fallback": "My connection glitched for a moment, but I’m still here. Tell me a little more, or tap the button whenever you want to see the options.",
     },
     "pt": {
@@ -326,7 +486,7 @@ PAYMENT_MENU_COPY = {
         "offer_no": "⏳ Não, talvez depois",
         "onlyfans": "💙 Ver OnlyFans",
         "welcome_fallback": "Ei, seja bem-vindo! Sou o Cacique X. Quer me conhecer um pouco melhor? Me conta o que você quer saber e a gente conversa.",
-        "welcome_cta": "Quando quiser, toque em um dos botões abaixo para conhecer o Gold Pass ou entrar grátis no 🔱FreeClub CX Hub🔱.",
+        "welcome_cta": "Quando quiser, toque em um dos botões abaixo para conhecer o 🏆🎟GoldPass ou entrar grátis no 🔱FreeClub CX Hub🔱.",
         "reply_fallback": "Minha conexão deu uma falhada, mas continuo por aqui. Me conta mais um pouco ou toque no botão quando quiser ver as opções.",
     },
     "it": {
@@ -341,7 +501,7 @@ PAYMENT_MENU_COPY = {
         "offer_no": "⏳ No, magari più tardi",
         "onlyfans": "💙 Vai su OnlyFans",
         "welcome_fallback": "Ehi, benvenuto! Sono Cacique X. Ti va di conoscermi un po’ meglio? Dimmi cosa ti incuriosisce e facciamo due chiacchiere.",
-        "welcome_cta": "Quando vuoi, premi uno dei pulsanti qui sotto per conoscere il Gold Pass o entrare gratis nel 🔱FreeClub CX Hub🔱.",
+        "welcome_cta": "Quando vuoi, premi uno dei pulsanti qui sotto per conoscere il 🏆🎟GoldPass o entrare gratis nel 🔱FreeClub CX Hub🔱.",
         "reply_fallback": "La connessione si è bloccata un attimo, ma sono ancora qui. Raccontami qualcosa in più oppure premi il pulsante quando vuoi vedere le opzioni.",
     },
 }
@@ -354,24 +514,24 @@ PAYMENT_USA_MENU_COPY = {
 
 GOLDPASS_OFFER_FACTS = {
     "es": (
-        "🎟️ Gold Pass mensual: $2 USD. El canal privado es nuevo y su catálogo "
+        "🏆🎟GoldPass mensual: $2 USD. El canal privado es nuevo y su catálogo "
         "todavía está creciendo. Encontrarás fragmentos de contenido adulto explícito "
         "y sin censura, de unos 2–3 minutos, tomados de videos más largos. "
         "Las versiones completas están en OnlyFans."
     ),
     "en": (
-        "🎟️ Gold Pass is $2 USD per month. The private channel is new, so its catalog "
+        "🏆🎟GoldPass is $2 USD per month. The private channel is new, so its catalog "
         "is still growing. It features uncensored explicit adult-content clips, around "
         "2–3 minutes long, taken from longer videos. Full versions are on OnlyFans."
     ),
     "pt": (
-        "🎟️ O Gold Pass custa US$ 2 por mês. O canal privado é novo e o catálogo ainda "
+        "🏆🎟GoldPass custa US$ 2 por mês. O canal privado é novo e o catálogo ainda "
         "está crescendo. Você encontrará trechos explícitos e sem censura de conteúdo "
         "adulto, com cerca de 2–3 minutos, extraídos de vídeos mais longos. "
         "As versões completas estão no OnlyFans."
     ),
     "it": (
-        "🎟️ Il Gold Pass costa 2 USD al mese. Il canale privato è nuovo e il catalogo "
+        "🏆🎟GoldPass costa 2 USD al mese. Il canale privato è nuovo e il catalogo "
         "sta ancora crescendo. Troverai clip esplicite e senza censure di contenuti "
         "per adulti, di circa 2–3 minuti, tratte da video più lunghi. "
         "Le versioni complete sono su OnlyFans."
@@ -380,17 +540,17 @@ GOLDPASS_OFFER_FACTS = {
 FREEPASS_USER_COPY = {
     "es": {
         "pending": (
-            "🎟️🏆 Tu pase gratuito GoldPass está listo.\n\n"
+            "Tu pase gratuito de 🏆🎟GoldPass está listo.\n\n"
             "Dura {duration}. El tiempo empieza cuando el bot apruebe tu entrada "
             "al canal; al terminar, el bot te retirará.\n\n¡Disfrútalo! 🔥"
         ),
         "active": (
-            "🎟️🏆 Tu pase gratuito GoldPass está activo.\n\n"
+            "Tu pase gratuito de 🏆🎟GoldPass está activo.\n\n"
             "Tu acceso termina el {expiry}; después el bot te retirará del canal. "
             "¡Disfrútalo! 🔥"
         ),
         "available": (
-            "🎟️🏆 Free Gold Pass disponible.\n\n"
+            "🏆🎟GoldPass gratis disponible.\n\n"
             "Puedes solicitar un acceso gratuito por {duration}. El plazo comienza "
             "cuando se emite tu enlace; al vencer, el bot te retirará del canal.\n\n"
             "Pulsa el botón para recibir tu enlace personal. 🔥"
@@ -398,17 +558,17 @@ FREEPASS_USER_COPY = {
     },
     "en": {
         "pending": (
-            "🎟️🏆 Your free Gold Pass is ready.\n\n"
+            "Your free 🏆🎟GoldPass is ready.\n\n"
             "It lasts {duration}. Your time starts when the bot approves your "
             "channel entry; when it ends, the bot will remove you.\n\nEnjoy it! 🔥"
         ),
         "active": (
-            "🎟️🏆 Your free Gold Pass is active.\n\n"
+            "Your free 🏆🎟GoldPass is active.\n\n"
             "Your access ends on {expiry}; after that, the bot will remove you "
             "from the channel. Enjoy it! 🔥"
         ),
         "available": (
-            "🎟️🏆 Free Gold Pass available.\n\n"
+            "Free access to 🏆🎟GoldPass is available.\n\n"
             "You can request free access for {duration}. The period starts when "
             "your link is issued; when it expires, the bot will remove you from "
             "the channel.\n\nTap the button to receive your personal link. 🔥"
@@ -416,17 +576,17 @@ FREEPASS_USER_COPY = {
     },
     "pt": {
         "pending": (
-            "🎟️🏆 Seu Gold Pass gratuito está pronto.\n\n"
+            "Seu 🏆🎟GoldPass gratuito está pronto.\n\n"
             "Ele dura {duration}. O tempo começa quando o bot aprovar sua entrada "
             "no canal; quando terminar, o bot vai remover você.\n\nAproveite! 🔥"
         ),
         "active": (
-            "🎟️🏆 Seu Gold Pass gratuito está ativo.\n\n"
+            "Seu 🏆🎟GoldPass gratuito está ativo.\n\n"
             "Seu acesso termina em {expiry}; depois disso, o bot vai remover você "
             "do canal. Aproveite! 🔥"
         ),
         "available": (
-            "🎟️🏆 Free Gold Pass disponível.\n\n"
+            "🏆🎟GoldPass gratuito disponível.\n\n"
             "Você pode solicitar acesso grátis por {duration}. O prazo começa "
             "quando o link é emitido; ao vencer, o bot vai remover você do canal."
             "\n\nToque no botão para receber seu link pessoal. 🔥"
@@ -434,17 +594,17 @@ FREEPASS_USER_COPY = {
     },
     "it": {
         "pending": (
-            "🎟️🏆 Il tuo Gold Pass gratuito è pronto.\n\n"
+            "Il tuo 🏆🎟GoldPass gratuito è pronto.\n\n"
             "Dura {duration}. Il tempo inizia quando il bot approva il tuo ingresso "
             "nel canale; alla scadenza il bot ti rimuoverà.\n\nGoditelo! 🔥"
         ),
         "active": (
-            "🎟️🏆 Il tuo Gold Pass gratuito è attivo.\n\n"
+            "Il tuo 🏆🎟GoldPass gratuito è attivo.\n\n"
             "Il tuo accesso termina il {expiry}; dopo, il bot ti rimuoverà dal "
             "canale. Goditelo! 🔥"
         ),
         "available": (
-            "🎟️🏆 Free Gold Pass disponibile.\n\n"
+            "🏆🎟GoldPass gratuito disponibile.\n\n"
             "Puoi richiedere l'accesso gratuito per {duration}. Il periodo inizia "
             "quando viene emesso il link; alla scadenza il bot ti rimuoverà dal "
             "canale.\n\nTocca il pulsante per ricevere il tuo link personale. 🔥"
@@ -473,8 +633,8 @@ START_BUTTON_LABEL_TITLES = {
     "offer_no": "Quizás más tarde",
     "onlyfans": "Ver OnlyFans",
     "express": "Pase Exprés gratuito",
-    "freepass_start": "Iniciar Gold Pass",
-    "freepass_enter": "Entrar al canal GoldPass",
+    "freepass_start": "Iniciar 🏆🎟GoldPass",
+    "freepass_enter": "Entrar al canal 🏆🎟GoldPass",
     "method_binance": "Binance",
     "method_pago_pm": "Pago Móvil",
     "method_pago_trans": "Mercantil",
@@ -490,9 +650,9 @@ START_BUTTON_LABEL_TITLES = {
 }
 START_MESSAGE_MEDIA_SLOTS = {
     "welcome": "Saludo después de elegir idioma",
-    "goldpass_offer": "Presentación de GoldPass",
+    "goldpass_offer": "Presentación de 🏆🎟GoldPass",
     "payment_cta": "Llamada a los métodos de pago",
-    "freepass": "Mensajes de Free Gold Pass",
+    "freepass": "Mensajes de 🏆🎟GoldPass gratis",
 }
 START_MESSAGE_INSTRUCTION_KEYS = {
     "welcome": "payment_start_welcome_instructions",
@@ -562,16 +722,16 @@ START_BUTTON_LABEL_DEFAULTS = {
         "it": "🎟️✨ Pass Express gratuito",
     },
     "freepass_start": {
-        "es": "🎟️🏆 Iniciar Gold Pass",
-        "en": "🎟️🏆 Start Gold Pass",
-        "pt": "🎟️🏆 Iniciar Gold Pass",
-        "it": "🎟️🏆 Avvia Gold Pass",
+        "es": "Iniciar 🏆🎟GoldPass",
+        "en": "Start 🏆🎟GoldPass",
+        "pt": "Iniciar 🏆🎟GoldPass",
+        "it": "Avvia 🏆🎟GoldPass",
     },
     "freepass_enter": {
-        "es": "🎟️🏆 Entrar al canal GoldPass",
-        "en": "🎟️🏆 Enter GoldPass channel",
-        "pt": "🎟️🏆 Entrar no canal GoldPass",
-        "it": "🎟️🏆 Entra nel canale GoldPass",
+        "es": "Entrar al canal 🏆🎟GoldPass",
+        "en": "Enter 🏆🎟GoldPass channel",
+        "pt": "Entrar no canal 🏆🎟GoldPass",
+        "it": "Entra nel canale 🏆🎟GoldPass",
     },
     "method_binance": {lang: "🔸 Binance" for lang in PAYMENT_LANGUAGES},
     "method_pago_pm": {
@@ -816,8 +976,31 @@ def _supabase_sembrar_desde_archivos(config_local=None, settings_actuales=None):
             config_local = {}
     if not isinstance(config_local, dict):
         config_local = {}
+    actuales = dict(settings_actuales or {})
     inicial = {}
     for key in SUPABASE_START_CONFIG_KEYS:
+        if key == "free_goldpass":
+            # A legacy local config may contain an old active campaign. On the
+            # first Supabase seed, default the campaign to off; future changes
+            # are persisted explicitly by the admin activation/cancel buttons.
+            if key not in actuales:
+                estado_local = config_local.get(key, {})
+                duracion = (
+                    estado_local.get("duration_seconds", 86400)
+                    if isinstance(estado_local, dict)
+                    else 86400
+                )
+                try:
+                    duracion = int(duracion)
+                except (TypeError, ValueError):
+                    duracion = 86400
+                if duracion not in FREE_GOLDPASS_DURATIONS:
+                    duracion = 86400
+                inicial[key] = {
+                    "active": False,
+                    "duration_seconds": duracion,
+                }
+            continue
         value = config_local.get(key)
         if value not in (None, ""):
             inicial[key] = value
@@ -834,7 +1017,6 @@ def _supabase_sembrar_desde_archivos(config_local=None, settings_actuales=None):
         app.logger.warning(
             "No se pudieron leer los ajustes locales al inicializar Supabase."
         )
-    actuales = dict(settings_actuales or {})
     faltantes = {
         key: value for key, value in inicial.items() if key not in actuales
     }
@@ -1850,7 +2032,7 @@ def _generar_respuesta_chat_pago(language, history, texto_usuario=None, inicio=F
                     "pregunta con naturalidad si le gustaría conocerte un poco más y "
                     "abre una conversación relajada. No menciones precios ni solicites "
                     "un pago; al final invítala con naturalidad a usar el botón para "
-                    "conocer el Gold Pass o el botón Free Club para entrar al canal "
+                    "conocer 🏆🎟GoldPass o el botón Free Club para entrar al canal "
                     "gratuito."
                 )
             }],
@@ -2039,10 +2221,6 @@ def _gemini_texto_breve(language, system_instruction, user_prompt, max_tokens=16
 
 def _generar_intro_oferta_goldpass(language):
     language = language if language in PAYMENT_LANGUAGES else "es"
-    config = cargar_config()
-    instrucciones = (
-        config.get("payment_goldpass_offer_instructions", "") or ""
-    ).strip()[:600]
     system_instruction = (
         "Escribes la introducción de una oferta para un creador adulto de contenido. "
         f"Usa {PAYMENT_LANGUAGES[language]} con tono cálido, coloquial, atractivo y "
@@ -2052,26 +2230,87 @@ def _generar_intro_oferta_goldpass(language):
         "métodos de pago. No inventes condiciones o reglas. El precio, los datos del "
         "contenido y las opciones están fijados por el bot."
     )
-    if instrucciones:
-        system_instruction += (
-            "\nTexto e indicaciones actuales del administrador: "
-            f"{instrucciones}\n"
-            "Aplícalas de forma visible y fiel. Si contienen un borrador, úsalo como "
-            "base y conserva sus ideas y detalles compatibles con los datos oficiales. "
-            "Si describen un tono, aplícalo. No las trates como una sugerencia opcional "
-            "ni contradigas los datos fijos que aparecerán debajo."
-        )
     prompt = (
-        "Redacta una introducción breve y natural para la oferta GoldPass. Aplica "
-        "fielmente el texto e indicaciones del administrador; el bloque oficial con "
-        "precio, contenido y condiciones se añadirá debajo. No inventes ni contradigas "
-        "ese bloque."
+        "Redacta una introducción breve y natural para la oferta 🏆🎟GoldPass. "
+        "El bloque oficial con precio, contenido y condiciones se añadirá debajo. "
+        "No inventes ni contradigas ese bloque."
     )
-    if instrucciones:
-        prompt += f"\n\nTexto específico del administrador que debes aplicar: {instrucciones}"
     return _gemini_texto_breve(
         language, system_instruction, prompt, max_tokens=120
     )
+
+
+def _traducir_presentacion_goldpass(texto, language):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    if language == "es":
+        return texto
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("falta GEMINI_API_KEY")
+    system_instruction = (
+        f"Traduce íntegramente el mensaje del administrador a {PAYMENT_LANGUAGES[language]}. "
+        "Conserva su significado, tono, emojis, puntuación, saltos de línea, nombres, "
+        "cantidades, precios y condiciones. No resumas, no quites detalles, no agregues "
+        "frases ni información nueva. Devuelve únicamente la traducción, sin comillas "
+        "ni comentarios."
+    )
+    body = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": texto}],
+        }],
+        "generationConfig": {
+            "maxOutputTokens": max(512, min(8192, len(texto) * 2)),
+            "temperature": 0.1,
+        },
+    }
+    model = urllib.parse.quote(GEMINI_MODEL, safe="-_.")
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    for intento in range(3):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=GEMINI_TIMEOUT_SECONDS
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            if error.code == 503 and intento < 2:
+                time.sleep(2 ** intento)
+                continue
+            raise RuntimeError(f"Gemini HTTP {error.code}") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            reason = getattr(error, "reason", None)
+            error_kind = (
+                type(reason).__name__ if reason is not None else type(error).__name__
+            )
+            raise RuntimeError(f"Gemini conexión ({error_kind})") from None
+
+    candidates = result.get("candidates") or []
+    parts = (
+        candidates[0].get("content", {}).get("parts", [])
+        if candidates and isinstance(candidates[0], dict)
+        else []
+    )
+    translated = "\n".join(
+        part.get("text", "").strip()
+        for part in parts
+        if isinstance(part, dict) and part.get("text", "").strip()
+    ).strip()
+    translated = re.sub(
+        r"^```(?:text)?\s*|\s*```$", "", translated, flags=re.I
+    ).strip()
+    if not translated:
+        raise RuntimeError("Gemini devolvió una traducción vacía")
+    return translated
 
 
 def _etiqueta_boton_inicio(key, language="es", config=None):
@@ -3010,6 +3249,8 @@ def editar_o_enviar_panel(
     chat_id, texto, reply_markup=None, message=None, message_id=None, protect_content=False,
     parse_mode="HTML", disable_web_page_preview=True, forzar_texto=False,
 ):
+    texto = _normalizar_marca_goldpass(texto)
+    reply_markup = _normalizar_markup_goldpass(reply_markup)
     message_id = message_id or getattr(message, "message_id", None)
     registro = None
     if int(chat_id) > 0:
@@ -3134,6 +3375,8 @@ def editar_o_enviar_media_panel(
     sender=None,
 ):
     """Conserva un único mensaje activo al cambiar texto o multimedia."""
+    caption = _normalizar_marca_goldpass(caption)
+    reply_markup = _normalizar_markup_goldpass(reply_markup)
     sender = sender or {
         "photo": _send_photo_original,
         "video": _send_video_original,
@@ -3276,7 +3519,7 @@ def eliminar_mensaje_disparador(message):
         return False
 
 # ── Datos de pago ─────────────────────────────────────────────────────────────
-_AVISO = "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines de procesar tu pedido para obtener el GoldPass."
+_AVISO = "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines de procesar tu pedido para obtener 🏆🎟GoldPass."
 
 NOMBRE_METODO = {
     "pago_binance":   "🔸 Binance Pay",
@@ -3388,7 +3631,7 @@ def obtener_datos_pago(metodo):
     opciones = [str(opcion).strip() for opcion in opciones if str(opcion).strip()]
     if not opciones:
         return ""
-    texto = "\n\n────────────\n\n".join(opciones)
+    texto = _normalizar_marca_goldpass("\n\n────────────\n\n".join(opciones))
     if _AVISO.strip() not in texto and _AVISO_LINK.strip() not in texto:
         texto += _AVISO
     return texto
@@ -3463,13 +3706,13 @@ _MSG_LINK = (
 # Aviso de comprobante (se adjunta al texto de datos que el admin copia y envía)
 _AVISO_LINK = (
     "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines "
-    "de procesar tu pedido para obtener el GoldPass."
+    "de procesar tu pedido para obtener 🏆🎟GoldPass."
 )
 
 
 def texto_pago_con_aviso(texto):
     """Devuelve los datos junto con el aviso que debe copiarse al usuario."""
-    texto = str(texto or "").strip()
+    texto = _normalizar_marca_goldpass(str(texto or "").strip())
     if not texto:
         return _AVISO.strip()
     if _AVISO.strip() in texto or _AVISO_LINK.strip() in texto:
@@ -3698,7 +3941,7 @@ def _desactivar_free_goldpass(motivo, campaign_id=None):
     _cancelar_enlaces_pendientes_freepass(actual.get("campaign_id"))
     _editar_anuncio_freepass(
         actual,
-        "⏰ <b>El pase gratuito GoldPass terminó.</b>\n\n"
+        "⏰ <b>El pase gratuito de 🏆🎟GoldPass terminó.</b>\n\n"
         "Los métodos de pago están disponibles nuevamente en el bot.",
     )
     return True
@@ -3791,7 +4034,7 @@ def mostrar_metodos_pago(chat_id, aviso=None, language=None):
             fecha_txt = vence.strftime("%d/%m/%Y %H:%M") if vence else "la fecha registrada"
             return editar_o_enviar_panel(
                 chat_id,
-                "✅ <b>Tu acceso GoldPass ya está activo.</b>\n\n"
+                "✅ <b>Tu acceso a 🏆🎟GoldPass ya está activo.</b>\n\n"
                 f"Tu suscripción está vigente hasta <b>{fecha_txt}</b>.",
                 types.InlineKeyboardMarkup(),
                 protect_content=True,
@@ -3906,7 +4149,7 @@ def markup_admin_config_pagos():
             callback_data="admin_start_welcome",
         ),
         types.InlineKeyboardButton(
-            f"🎟️ Free Gold Pass · {estado_free}",
+            f"🏆🎟GoldPass gratis · {estado_free}",
             callback_data="admin_free_goldpass",
         ),
         types.InlineKeyboardButton(
@@ -4655,7 +4898,7 @@ def _resumen_fuentes_suscripciones():
         f"{conteos.get('usuarios_default', 0)} principal + "
         f"{conteos.get('usuarios_tablas', 0)} en tablas nombradas; "
         f"archivo pagado {conteos.get('historial_pagado', 0)}; "
-        f"Free Gold Pass {conteos.get('free_goldpass', 0)}; "
+        f"🏆🎟GoldPass gratis {conteos.get('free_goldpass', 0)}; "
         f"Supabase {conteos.get('supabase', 0)}.\n"
         "📁 Archivos: usuarios.json "
         f"{html.escape(str(archivos.get('usuarios.json', 'sin comprobar')))}; "
@@ -4679,7 +4922,7 @@ def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
         texto = (
             f"👥 <b>Administrar suscripciones</b> · página {pagina + 1}/{paginas}\n\n"
             f"Registros: <b>{len(registros)}</b>. Incluye usuarios de usuarios.json, "
-            "el historial pagado y Free Gold Pass.\n"
+            "el historial pagado y 🏆🎟GoldPass gratis.\n"
             f"✅ Activas: {conteos['activo']} · ⌛ Vencidas: {conteos['vencido']} · "
             f"🟡 Pendientes: {conteos['pendiente']} · ❔ Sin vencimiento: {conteos['sin_fecha']}\n\n"
             "Pulsa un usuario para ver su ficha y comprobante."
@@ -4767,7 +5010,7 @@ def mostrar_detalle_suscripcion(
         or registro.get("fecha_ingreso")
         or "no registrada"
     )
-    nombre_tipo = "Free Gold Pass" if tipo == "free" else "GoldPass VIP"
+    nombre_tipo = "🏆🎟GoldPass gratis" if tipo == "free" else "🏆🎟GoldPass VIP"
     estado = registro.get("estado_panel") or registro.get("estado") or registro.get("status") or "registrado"
     fecha = _parsear_fecha_suscripcion(registro.get("vence"))
     estado_original = registro.get("status") or registro.get("estado")
@@ -4832,7 +5075,7 @@ def mostrar_admin_config_pagos(
         "el estilo de los mensajes con Gemini y las etiquetas de los botones.\n"
         "El saludo inicial que pide elegir idioma se mantiene fijo; los textos "
         "posteriores respetan el idioma seleccionado.\n\n"
-        "Free Gold Pass: <b>"
+        "🏆🎟GoldPass gratis: <b>"
         + ("activado" if estado_free.get("active") else "desactivado")
         + "</b>.\n"
         "Los datos de pago, las acciones de los botones y las reglas de acceso "
@@ -5016,15 +5259,11 @@ def _mostrar_preview_compartir_asistente(
         share_id = uuid.uuid4().hex[:16]
 
     inline_ready = False
-    inline_username = None
-    inline_status_checked = False
     try:
         bot_identity = bot.get_me()
         inline_ready = bool(
             getattr(bot_identity, "supports_inline_queries", False)
         )
-        inline_username = getattr(bot_identity, "username", None)
-        inline_status_checked = True
     except Exception:
         app.logger.warning(
             "No se pudo verificar si el bot tiene habilitado el modo inline."
@@ -5085,33 +5324,41 @@ def _mostrar_preview_compartir_asistente(
             "admin_id": int(ADMIN_ID),
         }
         ACTIVE_ASSISTANT_SHARE_ID = share_id
+    markup = _markup_preview_compartir_asistente(
+        share_id,
+        inline_ready=inline_ready,
+    )
     try:
-        # La tarjeta de compartir solo se habilita después de guardar el file_id
-        # y el borrador; así una pulsación rápida no consulta un estado vacío.
-        bot.edit_message_caption(
+        # Save the pending payload first, then attach the controls separately.
+        # This avoids an unchanged-caption edit hiding or rejecting the keyboard.
+        bot.edit_message_reply_markup(
             chat_id=chat_id,
             message_id=preview.message_id,
-            caption=html.escape(texto),
-            parse_mode="HTML",
-            reply_markup=_markup_preview_compartir_asistente(
-                share_id,
-                inline_ready=inline_ready,
-            ),
+            reply_markup=markup,
         )
     except Exception:
-        app.logger.exception(
-            "No se pudieron activar los botones de la invitación para compartir."
-        )
-        with ASSISTANT_SHARE_LOCK:
-            PENDING_ASSISTANT_SHARES.pop(share_id, None)
-            if ACTIVE_ASSISTANT_SHARE_ID == share_id:
-                ACTIVE_ASSISTANT_SHARE_ID = None
-        eliminar_mensaje_seguro(chat_id, preview.message_id)
-        return bot.send_message(
-            chat_id,
-            "No pude preparar la tarjeta para compartir. Inténtalo otra vez.",
-            protect_content=True,
-        )
+        try:
+            bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=preview.message_id,
+                caption=html.escape(texto),
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception:
+            app.logger.exception(
+                "No se pudieron activar los botones de la invitación para compartir."
+            )
+            with ASSISTANT_SHARE_LOCK:
+                PENDING_ASSISTANT_SHARES.pop(share_id, None)
+                if ACTIVE_ASSISTANT_SHARE_ID == share_id:
+                    ACTIVE_ASSISTANT_SHARE_ID = None
+            eliminar_mensaje_seguro(chat_id, preview.message_id)
+            return bot.send_message(
+                chat_id,
+                "No pude preparar la tarjeta para compartir. Inténtalo otra vez.",
+                protect_content=True,
+            )
     with PANEL_LOCK:
         PANELES_PRIVADOS.upsert(
             {
@@ -5124,39 +5371,6 @@ def _mostrar_preview_compartir_asistente(
         )
     if es_nueva_vista:
         _eliminar_ayuda_compartir_asistente(chat_id)
-        nombre_bot = f"@{inline_username}" if inline_username else "este bot"
-        if not inline_ready:
-            aviso_inline = (
-                "Telegram confirmó que el modo inline está desactivado."
-                if inline_status_checked
-                else "No pude confirmar que el modo inline esté activo."
-            )
-            ayuda_texto = (
-                f"⚠️ {aviso_inline} para {nombre_bot}.\n"
-                "En @BotFather envía /setinline, selecciona este mismo bot y "
-                "define un texto de ejemplo. Después vuelve a crear la vista previa.\n\n"
-            )
-        else:
-            ayuda_texto = ""
-        ayuda_texto += (
-            "Para enviarlo correctamente:\n"
-            "1. Pulsa «Compartir con un contacto» y elige a la persona.\n"
-            "2. En el chat elegido, toca la tarjeta con la foto que aparece arriba del teclado.\n\n"
-            "Telegram no envía automáticamente la tarjeta al elegir el contacto: "
-            "hay que tocar la tarjeta. No pulses Enviar sobre «@bot compartir»; "
-            "eso manda solo ese texto. Si no aparece la tarjeta, activa /setinline "
-            "en el bot que ejecuta este servicio."
-        )
-        try:
-            ayuda = bot.send_message(
-                chat_id,
-                ayuda_texto,
-                parse_mode=None,
-                protect_content=True,
-            )
-            ASSISTANT_SHARE_HELP_MESSAGE_ID = ayuda.message_id
-        except Exception:
-            app.logger.exception("No se pudo mostrar la guía para compartir.")
     return preview
 
 
@@ -5166,7 +5380,7 @@ def markup_admin_free_goldpass():
     if estado.get("active"):
         markup.add(
             types.InlineKeyboardButton(
-                "⛔ Cancelar Free Gold Pass",
+                "⛔ Cancelar 🏆🎟GoldPass gratis",
                 callback_data="admin_free_goldpass_disable",
             ),
             types.InlineKeyboardButton(
@@ -5196,7 +5410,7 @@ def mostrar_admin_free_goldpass(
             _formato_duracion_freepass(estado.get("duration_seconds", 0))
         )
         texto = (
-            "🎟️ <b>Free Gold Pass · ACTIVADO</b>\n\n"
+        "<b>🏆🎟GoldPass gratis · ACTIVADO</b>\n\n"
             "Los métodos de pago se ocultan para todos mientras esta promoción "
             "esté activa. Cada pase empieza a contar cuando el bot aprueba la "
             "entrada de esa persona al canal.\n"
@@ -5208,7 +5422,7 @@ def mostrar_admin_free_goldpass(
         )
     else:
         texto = (
-            "🎟️ <b>Free Gold Pass · DESACTIVADO</b>\n\n"
+        "<b>🏆🎟GoldPass gratis · DESACTIVADO</b>\n\n"
             "Al activarlo, sustituirá los métodos de pago para todos y publicará "
             "un anuncio en el canal gratuito. Cada persona recibirá un enlace "
             "individual; el plazo comenzará cuando el bot apruebe su entrada "
@@ -5239,16 +5453,16 @@ def activar_free_goldpass(segundos):
     miembro_goldpass = bot.get_chat_member(CANAL_ID, bot_info.id)
     if getattr(miembro_goldpass, "status", None) != "administrator":
         raise RuntimeError(
-            "En el canal privado GoldPass el bot debe ser administrador."
+            "En el canal privado 🏆🎟GoldPass el bot debe ser administrador."
         )
     if not getattr(miembro_goldpass, "can_invite_users", False):
         raise RuntimeError(
-            "En el canal privado GoldPass activa para este bot "
+            "En el canal privado 🏆🎟GoldPass activa para este bot "
             "«Invitar usuarios mediante enlace» o «Añadir suscriptores»."
         )
     if not getattr(miembro_goldpass, "can_restrict_members", False):
         raise RuntimeError(
-            "En el canal privado GoldPass activa para este bot "
+            "En el canal privado 🏆🎟GoldPass activa para este bot "
             "«Expulsar usuarios»; es necesario para retirar a cada persona "
             "cuando venza su pase."
         )
@@ -5271,14 +5485,14 @@ def activar_free_goldpass(segundos):
     url_bot = f"https://t.me/{bot_info.username}?start=free_goldpass"
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🎟️🏆 Reclamar Free Gold Pass",
+            "Reclamar 🏆🎟GoldPass gratis",
             url=url_bot,
         )
     )
     texto = (
         "🏹🔥 <b>¡Porque eres uno de los mejores guerreros de mi tribu, "
         "te regalo un pase gratis!</b> 🔥🏹\n\n"
-        "Accede por tiempo limitado a GoldPass, con contenido explícito para "
+        "Accede por tiempo limitado a 🏆🎟GoldPass, con contenido explícito para "
         "adultos. 🎟️💎\n\n"
         f"Tu pase durará <b>{html.escape(etiqueta)}</b> desde que el bot "
         "apruebe tu entrada al canal privado.\n"
@@ -5618,6 +5832,18 @@ def _enviar_mensaje_inicio_con_media(
     sender = getattr(bot, f"send_{media['type']}", None)
     if not callable(sender):
         raise RuntimeError("El envío de este tipo de multimedia no está disponible.")
+    # Telegram captions are limited to 1024 characters. Send long copy as a
+    # normal text panel after the attachment instead of dropping the copy.
+    if (
+        caption is None
+        or len(str(caption).encode("utf-16-le")) // 2 > 1024
+    ):
+        sender(
+            chat_id,
+            media["file_id"],
+            protect_content=True,
+        )
+        return None
     return sender(
         chat_id,
         media["file_id"],
@@ -6147,7 +6373,7 @@ def _mostrar_prompt_instrucciones_oferta_goldpass(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver a GoldPass",
+            "🔙 Volver a 🏆🎟GoldPass",
             callback_data="admin_start_media|goldpass_offer",
         )
     )
@@ -6158,11 +6384,11 @@ def _mostrar_prompt_instrucciones_oferta_goldpass(
     )
     return editar_o_enviar_panel(
         chat_id,
-        "✍️ <b>Editar la presentación GoldPass</b>\n\n"
-        "Envía el texto o las indicaciones que quieres que Gemini aplique a la "
-        "presentación. Si envías un borrador, lo usará como base. El precio, los "
-        "datos de pago, enlaces, botones y acceso siguen protegidos. Máximo 600 "
-        f"caracteres; /cancelar vuelve atrás.{actual_text}",
+        "✍️ <b>Editar la presentación de 🏆🎟GoldPass</b>\n\n"
+        "Envía el mensaje completo que quieres mostrar. En español aparecerá tal "
+        "como lo escribas; en otros idiomas se traducirá sin añadir el texto "
+        "predeterminado anterior. No se recorta al guardar. Los botones y las "
+        f"acciones de pago/acceso no cambian. /cancelar vuelve atrás.{actual_text}",
         markup,
         message=message,
         message_id=message_id,
@@ -6210,7 +6436,7 @@ def _mostrar_prompt_instrucciones_freepass(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver a Free Gold Pass",
+            "🔙 Volver a 🏆🎟GoldPass gratis",
             callback_data="admin_start_media|freepass",
         )
     )
@@ -6220,7 +6446,7 @@ def _mostrar_prompt_instrucciones_freepass(
         if actual else "\n\nNo hay texto personalizado; se usa el aviso base."
     )
     texto = (
-        "✍️ <b>Editar mensajes de Free Gold Pass</b>\n\n"
+        "✍️ <b>Editar mensajes de 🏆🎟GoldPass gratis</b>\n\n"
         "Envía el texto o las indicaciones que quieres que Gemini aplique al aviso. "
         "Si escribes un borrador, lo usará como base y conservará el estado, la "
         "duración y la fecha reales. Máximo 600 caracteres; /cancelar vuelve."
@@ -6634,7 +6860,7 @@ def admin_previsualizar_oferta_goldpass(call):
         call.message.chat.id,
         message=call.message,
         preview_text=texto,
-        preview_label="👀 Oferta Gold Pass · Español",
+        preview_label="👀 Oferta 🏆🎟GoldPass · Español",
     )
 
 
@@ -6719,11 +6945,27 @@ def _mostrar_previa_texto_inicio(
                 forzar_reemplazo=True,
             )
     if media:
+        caption = f"👀 Vista previa · {START_MESSAGE_MEDIA_SLOTS[slot]}\n\n{texto}"
+        if len(caption.encode("utf-16-le")) // 2 > 1024:
+            _enviar_mensaje_inicio_con_media(
+                call.message.chat.id,
+                slot,
+                None,
+            )
+            return editar_o_enviar_panel(
+                call.message.chat.id,
+                texto,
+                markup,
+                message=call.message,
+                protect_content=True,
+                parse_mode=None,
+                forzar_texto=True,
+            )
         return editar_o_enviar_media_panel(
             call.message.chat.id,
             media["type"],
             media["file_id"],
-            caption=f"👀 Vista previa · {START_MESSAGE_MEDIA_SLOTS[slot]}\n\n{texto}",
+            caption=caption,
             reply_markup=markup,
             protect_content=True,
             parse_mode=None,
@@ -6733,13 +6975,27 @@ def _mostrar_previa_texto_inicio(
                 else None
             ),
         )
+    if slot == "goldpass_offer":
+        preview_caption = (
+            f"👀 Vista previa · {START_MESSAGE_MEDIA_SLOTS[slot]}\n\n{texto}"
+        )
+        if len(preview_caption.encode("utf-16-le")) // 2 > 4096:
+            preview_caption = texto
+        preview_parse_mode = None
+    else:
+        preview_caption = (
+            f"👀 <b>Vista previa · "
+            f"{html.escape(START_MESSAGE_MEDIA_SLOTS[slot])}</b>\n\n"
+            f"{html.escape(texto)}"
+        )
+        preview_parse_mode = "HTML"
     return editar_o_enviar_panel(
         call.message.chat.id,
-        f"👀 <b>Vista previa · {html.escape(START_MESSAGE_MEDIA_SLOTS[slot])}</b>\n\n"
-        f"{html.escape(texto)}",
+        preview_caption,
         markup,
         message=call.message,
         protect_content=True,
+        parse_mode=preview_parse_mode,
         forzar_texto=True,
     )
 
@@ -6788,9 +7044,13 @@ def admin_previsualizar_mensaje_start(call):
             )
         else:
             texto = (
-                "Te cuento con claridad qué incluye GoldPass antes de que decidas.\n\n"
-                f"{GOLDPASS_OFFER_FACTS['es']}"
-            )
+                cargar_config().get("payment_goldpass_offer_instructions") or ""
+            ).strip()
+            if not texto:
+                texto = (
+                    "Te cuento con claridad qué incluye 🏆🎟GoldPass antes de que decidas.\n\n"
+                    f"{GOLDPASS_OFFER_FACTS['es']}"
+                )
     _mostrar_previa_texto_inicio(call, slot, texto)
 
 
@@ -8931,7 +9191,7 @@ def reclamar_free_goldpass(call):
                 emitido = datetime.now().replace(microsecond=0)
                 enlace = bot.create_chat_invite_link(
                     CANAL_ID,
-                    name="Free GoldPass",
+                    name="Free 🏆🎟GoldPass",
                     creates_join_request=True,
                 )
                 registro = {
@@ -13483,6 +13743,22 @@ def _markup_respuesta_rechazo_goldpass(user_id, language):
 
 def _texto_oferta_goldpass(language):
     language = language if language in PAYMENT_LANGUAGES else "es"
+    texto_personalizado = (
+        cargar_config().get("payment_goldpass_offer_instructions") or ""
+    ).strip()
+    if texto_personalizado:
+        try:
+            return _traducir_presentacion_goldpass(
+                texto_personalizado,
+                language,
+            )
+        except Exception as error:
+            app.logger.warning(
+                "Se mostró el texto GoldPass guardado sin traducir (error=%s).",
+                type(error).__name__,
+            )
+            # Never replace a saved administrator message with the old default.
+            return texto_personalizado
     try:
         introduccion = _generar_intro_oferta_goldpass(language)
     except Exception as error:
@@ -13592,7 +13868,6 @@ def _mostrar_selector_idioma_pago(chat_id):
 def _usuario_usa_inicio_directo(user_id, payload=""):
     if (
         str(user_id) == str(ADMIN_ID)
-        or str(payload).lower().startswith("free_goldpass")
         or free_goldpass_activo()
     ):
         return True
@@ -14278,7 +14553,7 @@ def flujo_admin_pago(message):
             )
         return
     if paso == "esperando_instrucciones_oferta_goldpass":
-        if not text or len(text) > 600:
+        if not text:
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
             _mostrar_prompt_instrucciones_oferta_goldpass(
                 message.chat.id,

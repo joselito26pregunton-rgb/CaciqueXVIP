@@ -1,6 +1,6 @@
 # CaciqueX VIP Bot
 
-Esta carpeta contiene una copia independiente del bot para un repositorio privado de GitHub. Conserva los destinos y botones existentes de GoldPass y Freeclub, además de las funciones actuales del bot y las mejoras del panel `/admin`.
+Esta carpeta contiene una copia independiente del bot para un repositorio privado de GitHub. Conserva los destinos y botones existentes de 🏆🎟GoldPass y Freeclub, además de las funciones actuales del bot y las mejoras del panel `/admin`.
 
 ## Archivos
 
@@ -15,7 +15,7 @@ Esta carpeta contiene una copia independiente del bot para un repositorio privad
 ## Cambios del panel `/admin`
 
 - **Ver y administrar botones** muestra una vista previa con el teclado real y permite crear o eliminar botones.
-- **Enviar a grupo o canal** permite elegir entre GoldPass, Freeclub y los destinos adicionales que se agreguen.
+- **Enviar a grupo o canal** permite elegir entre 🏆🎟GoldPass, Freeclub y los destinos adicionales que se agreguen.
 - **Grupos y canales** conserva los destinos existentes y permite agregar más. El bot debe estar en el grupo o ser administrador del canal para publicar.
 - **Mensajes recurrentes** permite elegir un destino y un intervalo (`30m`, `2h`, `1d`, etc.). El primer envío ocurre al terminar el intervalo; cuando se publica el siguiente, el bot intenta borrar el recurrente anterior de ese destino. Para borrar mensajes, Telegram debe concederle al bot los permisos necesarios.
 

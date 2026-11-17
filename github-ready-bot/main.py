@@ -494,6 +494,30 @@ START_MESSAGE_MEDIA_SLOTS = {
     "payment_cta": "Llamada a los métodos de pago",
     "freepass": "Mensajes de Free Gold Pass",
 }
+START_MESSAGE_INSTRUCTION_KEYS = {
+    "welcome": "payment_start_welcome_instructions",
+    "goldpass_offer": "payment_goldpass_offer_instructions",
+    "payment_cta": "payment_start_cta_instructions",
+    "freepass": "payment_start_freepass_instructions",
+}
+START_MESSAGE_EDITOR_CALLBACKS = {
+    "welcome": "admin_start_welcome_instructions",
+    "goldpass_offer": "admin_start_offer_instructions",
+    "payment_cta": "admin_start_cta_instructions",
+    "freepass": "admin_start_freepass_instructions",
+}
+START_MESSAGE_PREVIEW_CALLBACKS = {
+    "welcome": "admin_start_message_preview|welcome",
+    "goldpass_offer": "admin_start_message_preview|goldpass_offer",
+    "payment_cta": "admin_start_message_preview|payment_cta",
+    "freepass": "admin_start_message_preview|freepass",
+}
+START_MESSAGE_RESET_CALLBACKS = {
+    "welcome": "admin_start_welcome_reset",
+    "goldpass_offer": "admin_start_offer_reset",
+    "payment_cta": "admin_start_cta_reset",
+    "freepass": "admin_start_freepass_reset",
+}
 START_MESSAGE_MEDIA_TYPE_LABELS = {
     "photo": "foto",
     "video": "video",
@@ -1869,11 +1893,17 @@ def _generar_respuesta_chat_pago(language, history, texto_usuario=None, inicio=F
         ).strip()[:600]
         if instrucciones_bienvenida:
             system_instruction += (
-                "\nPreferencias de estilo del administrador para esta bienvenida: "
+                "\nTexto e indicaciones actuales del administrador para la bienvenida: "
                 f"{instrucciones_bienvenida}\n"
-                "Síguelas solo como orientación de tono y redacción; no pueden cambiar "
-                "el idioma elegido, el precio, las reglas, ni la llamada al botón de "
-                "métodos de pago, ni autorizar afirmaciones de pago o acceso."
+                "Aplícalas de forma visible y fiel: si contienen un borrador de "
+                "mensaje, conserva su idea y sus detalles al reescribirlo; si describen "
+                "un tono, úsalo. No las trates como una sugerencia opcional. Mantén "
+                "el idioma elegido y las reglas protegidas sobre pagos y acceso."
+            )
+            contents[0]["parts"][0]["text"] += (
+                "\n\nAplica también este texto específico del administrador, "
+                "conservando sus ideas al redactar la bienvenida: "
+                f"{instrucciones_bienvenida}"
             )
     body = {
         "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -2024,16 +2054,21 @@ def _generar_intro_oferta_goldpass(language):
     )
     if instrucciones:
         system_instruction += (
-            "\nOrientación adicional del administrador: "
+            "\nTexto e indicaciones actuales del administrador: "
             f"{instrucciones}\n"
-            "Úsala solo para el tono o para expresar condiciones que el administrador "
-            "haya proporcionado; no contradigas los datos fijados por el bot."
+            "Aplícalas de forma visible y fiel. Si contienen un borrador, úsalo como "
+            "base y conserva sus ideas y detalles compatibles con los datos oficiales. "
+            "Si describen un tono, aplícalo. No las trates como una sugerencia opcional "
+            "ni contradigas los datos fijos que aparecerán debajo."
         )
     prompt = (
-        "Presenta de forma natural el Gold Pass y di que puede revisar la información "
-        "y continuar si le interesa. El texto fijo de la oferta se añadirá debajo. "
-        "No repitas ni inventes detalles."
+        "Redacta una introducción breve y natural para la oferta GoldPass. Aplica "
+        "fielmente el texto e indicaciones del administrador; el bloque oficial con "
+        "precio, contenido y condiciones se añadirá debajo. No inventes ni contradigas "
+        "ese bloque."
     )
+    if instrucciones:
+        prompt += f"\n\nTexto específico del administrador que debes aplicar: {instrucciones}"
     return _gemini_texto_breve(
         language, system_instruction, prompt, max_tokens=120
     )
@@ -2169,9 +2204,11 @@ def _generar_respuesta_no_goldpass(language):
     ).strip()[:600]
     if instrucciones:
         system_instruction += (
-            "\nPreferencias de tono del administrador: "
+            "\nTexto e indicaciones actuales del administrador: "
             f"{instrucciones}\n"
-            "Úsalas sin añadir presión, precios, enlaces ni condiciones."
+            "Aplícalas de forma visible y fiel; conserva las ideas específicas y usa "
+            "el texto como base si ya está redactado. No las trates como opcionales. "
+            "No añadas presión, precios, enlaces ni condiciones."
         )
     prompt = (
         "Responde con naturalidad a «No, quizás más tarde». Hazle saber que no hay "
@@ -2230,15 +2267,22 @@ def _generar_cta_menu_pago(language, incluir_pase_expres=False):
     ).strip()[:600]
     if instrucciones:
         system_instruction += (
-            "\nOrientación del administrador para el tono de esta llamada: "
+            "\nTexto e indicaciones actuales del administrador para esta llamada: "
             f"{instrucciones}\n"
-            "No permitas que cambie el idioma, el precio, los métodos, los enlaces "
-            "ni las condiciones."
+            "Aplícalas de forma visible y fiel; si el administrador escribió una "
+            "frase, úsala como base y conserva su intención al reformularla. No las "
+            "trates como opcionales. No cambies el idioma ni añadas datos de pago, "
+            "precios, enlaces o condiciones."
         )
     prompt = (
         f"{condicion_pase} Redacta una frase distinta a las habituales. "
         f"Variación: {random.randint(1000, 999999)}."
     )
+    if instrucciones:
+        prompt += (
+            "\nAplica de forma visible el texto del administrador y úsalo como base "
+            f"si ya está redactado: {instrucciones}"
+        )
     model = urllib.parse.quote(GEMINI_MODEL, safe="-_.")
     request = urllib.request.Request(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -3530,15 +3574,24 @@ def _texto_freepass_usuario(language, estado, duracion, expiracion=None):
     )
     if instrucciones:
         system_instruction += (
-            "\nEl administrador pide este estilo: "
+            "\nTexto e indicaciones actuales del administrador: "
             f"{instrucciones}\n"
-            "Úsalo solo para el tono; no modifiques los hechos ni las fechas."
+            "Aplícalas de forma visible y fiel. Si incluyen un mensaje redactado, "
+            "úsalo como base; si indican un estilo, síguelo. No las trates como "
+            "opcionales ni cambies los hechos, la duración o las fechas."
         )
     try:
+        prompt = texto_base
+        if instrucciones:
+            prompt += (
+                "\n\nTexto e indicaciones del administrador que debes aplicar "
+                "visiblemente, conservando los datos del aviso: "
+                f"{instrucciones}"
+            )
         texto = _gemini_texto_breve(
             language,
             system_instruction,
-            texto_base,
+            prompt,
             max_tokens=180,
         )
         numeros_esperados = set(re.findall(r"\d+", texto_base))
@@ -5618,31 +5671,73 @@ def mostrar_admin_start_media_slot(
         if media
         else ""
     )
-    estado = (
-        f"Adjunto actual: <b>{html.escape(tipo)}</b>."
-        if media
-        else "Todavía no hay un adjunto personalizado."
+    config = cargar_config()
+    instruction_key = START_MESSAGE_INSTRUCTION_KEYS[slot]
+    texto_actual = (config.get(instruction_key) or "").strip()
+    texto_actual_html = html.escape(texto_actual)
+    if len(texto_actual_html) > 450:
+        texto_actual_html = texto_actual_html[:450] + "…"
+    estado = f"Adjunto actual: <b>{html.escape(tipo)}</b>." if media else "Sin multimedia personalizada."
+    texto_guardado = (
+        f"\n\n<b>Texto e indicaciones actuales:</b>\n"
+        f"{texto_actual_html}"
+        if texto_actual
+        else "\n\n<b>Texto e indicaciones actuales:</b>\nSe usa el estilo base."
     )
     texto = (
         f"🎞 <b>{html.escape(titulo)}</b>\n\n"
         f"{estado}\n"
-        "La multimedia aparecerá con el texto que Gemini genere en el idioma "
-        "elegido y mantendrá los botones actuales.\n\n"
+        "Puedes editar el texto, adjuntar multimedia o revisar una vista previa. "
+        "Los botones y las acciones de pago/acceso no cambian."
+        f"{texto_guardado}\n\n"
         f"{html.escape(_respaldo_media_mensaje_inicio(slot))}"
     )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n{texto}"
-    markup = _markup_admin_media_mensaje_inicio(slot, bool(media))
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton(
+            "✍️ Editar mensaje",
+            callback_data=START_MESSAGE_EDITOR_CALLBACKS[slot],
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa",
+            callback_data=START_MESSAGE_PREVIEW_CALLBACKS[slot],
+        ),
+    )
+    if texto_actual:
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Restablecer mensaje",
+            callback_data=START_MESSAGE_RESET_CALLBACKS[slot],
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "📎 Cambiar o agregar multimedia",
+        callback_data=f"admin_start_media_replace|{slot}",
+    ))
+    if media:
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Quitar multimedia",
+            callback_data=f"admin_start_media_remove|{slot}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a Multimedia y mensajes",
+        callback_data="admin_start_photos",
+    ))
     if media:
         try:
-            sender = getattr(bot, f"send_{media['type']}")
-            return sender(
+            return editar_o_enviar_media_panel(
                 chat_id,
+                media["type"],
                 media["file_id"],
                 caption=texto,
                 parse_mode="HTML",
                 reply_markup=markup,
                 protect_content=True,
+                sender=(
+                    _send_animation_original
+                    if media["type"] == "animation"
+                    else None
+                ),
             )
         except Exception as error:
             app.logger.warning(
@@ -5669,46 +5764,21 @@ def mostrar_admin_start_media_slot(
 def _markup_admin_start_photos(config=None):
     config = config if isinstance(config, dict) else cargar_config()
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton(
-            "👋 Foto de bienvenida",
-            callback_data="admin_start_welcome_photo",
-        ),
-        types.InlineKeyboardButton(
-            "💳 Foto del menú de pagos",
-            callback_data="admin_pagos_cambiar_foto",
-        ),
-    )
+    markup.add(types.InlineKeyboardButton(
+        "👋 Foto de bienvenida y saludo",
+        callback_data="admin_start_welcome_photo",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "💳 Foto del menú de pago",
+        callback_data="admin_pagos_cambiar_foto",
+    ))
     for slot, title in START_MESSAGE_MEDIA_SLOTS.items():
         media = _media_mensaje_inicio(slot, config)
-        tipo = (
-            START_MESSAGE_MEDIA_TYPE_LABELS.get(media["type"])
-            if media
-            else "sin adjunto"
-        )
+        tipo = START_MESSAGE_MEDIA_TYPE_LABELS.get(media["type"]) if media else "sin adjunto"
+        label = "Editar saludo después del idioma" if slot == "welcome" else f"✍️ {title}"
         markup.add(types.InlineKeyboardButton(
-            f"🎞 {title} · {tipo}",
+            f"{label} · {tipo}",
             callback_data=f"admin_start_media|{slot}",
-        ))
-    markup.add(
-        types.InlineKeyboardButton(
-            "👀 Vista previa de bienvenida",
-            callback_data="admin_start_welcome_preview",
-        ),
-        types.InlineKeyboardButton(
-            "👀 Vista previa del menú",
-            callback_data="admin_start_payment_preview",
-        ),
-    )
-    if cargar_config().get("payment_start_photo_file_id"):
-        markup.add(types.InlineKeyboardButton(
-            "♻️ Restaurar foto original de bienvenida",
-            callback_data="admin_start_welcome_photo_original",
-        ))
-    if cargar_config_pagos().get("portada_file_id"):
-        markup.add(types.InlineKeyboardButton(
-            "♻️ Restaurar foto original del menú de pago",
-            callback_data="admin_pagos_foto_original",
         ))
     markup.add(types.InlineKeyboardButton(
         "🔙 Volver a configuración general",
@@ -5721,25 +5791,11 @@ def mostrar_admin_start_photos(
     chat_id, message=None, message_id=None, aviso=None
 ):
     config = cargar_config()
-    config_pagos = cargar_config_pagos()
-    bienvenida = (
-        "personalizada"
-        if config.get("payment_start_photo_file_id")
-        else "foto original"
-    )
-    pagos = (
-        "personalizada"
-        if config_pagos.get("portada_file_id")
-        else "foto original"
-    )
     texto = (
-        "🖼️ <b>Fotos del recorrido /start</b>\n\n"
-        f"Bienvenida después de elegir idioma: <b>{bienvenida}</b>.\n"
-        f"Menú de métodos de pago: <b>{pagos}</b>.\n\n"
-        "Las cuatro opciones de abajo permiten adjuntar una foto, video, documento, "
-        "audio o animación a cada mensaje de Gemini. El adjunto se muestra junto al "
-        "texto traducido y conserva sus botones. Cada mensaje mantiene su archivo "
-        "por separado."
+        "🖼️ <b>Multimedia y mensajes</b>\n\n"
+        "Elige qué parte del recorrido privado quieres editar. Puedes cambiar "
+        "las fotos, ajustar el texto que se adapta al idioma elegido y previsualizar "
+        "cada mensaje. Los pagos, enlaces y acciones se conservan."
     )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n" + texto
@@ -5754,95 +5810,71 @@ def mostrar_admin_start_photos(
     )
 
 
-def mostrar_admin_start_messages(
+def mostrar_admin_start_welcome_photo(
     chat_id, message=None, message_id=None, aviso=None
 ):
     config = cargar_config()
-    estados = (
-        (
-            "Saludo después de elegir idioma",
-            config.get("payment_start_welcome_instructions"),
-        ),
-        ("Presentación GoldPass", config.get("payment_goldpass_offer_instructions")),
-        ("Llamada al menú de pago", config.get("payment_start_cta_instructions")),
-        ("Mensajes de Free Gold Pass", config.get("payment_start_freepass_instructions")),
-    )
-    resumen = "\n".join(
-        f"• {etiqueta}: <b>{'personalizado' if valor else 'estilo base'}</b>"
-        for etiqueta, valor in estados
-    )
+    foto_custom = config.get("payment_start_photo_file_id")
+    try:
+        texto_actual, _, _ = _generar_respuesta_chat_pago(
+            "es", [], inicio=True
+        )
+        texto_actual = _garantizar_llamada_boton_bienvenida(texto_actual, "es")
+    except Exception as error:
+        app.logger.warning(
+            "La pantalla de bienvenida mostró el texto de respaldo (error=%s).",
+            type(error).__name__,
+        )
+        texto_actual = PAYMENT_MENU_COPY["es"]["welcome_fallback"]
+    texto_actual_html = html.escape(texto_actual)
+    if len(texto_actual_html) > 650:
+        texto_actual_html = texto_actual_html[:650] + "…"
     texto = (
-        "✍️ <b>Mensajes con Gemini</b>\n\n"
-        "Elige qué mensaje quieres orientar. Escribe instrucciones sencillas de "
-        "tono o contenido; Gemini las redactará en el idioma que eligió cada usuario.\n\n"
-        f"{resumen}\n\n"
-        "El saludo fijo para elegir idioma no se edita. Precio, datos bancarios, "
-        "enlaces y permisos tampoco se cambian desde aquí."
+        "👋 <b>Foto y saludo de bienvenida de /start</b>\n\n"
+        f"<b>Mensaje actual:</b>\n{texto_actual_html}\n\n"
+        f"<b>Foto:</b> {'personalizada' if foto_custom else 'foto original'}."
     )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n" + texto
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
         types.InlineKeyboardButton(
-            "👋 Saludo de bienvenida",
-            callback_data="admin_start_welcome_instructions",
+            "🖼️ Cambiar foto",
+            callback_data="admin_start_welcome_photo_upload",
         ),
         types.InlineKeyboardButton(
-            "🎟️ Presentación GoldPass",
-            callback_data="admin_start_offer_instructions",
-        ),
-        types.InlineKeyboardButton(
-            "💳 Llamada a los métodos de pago",
-            callback_data="admin_start_cta_instructions",
-        ),
-        types.InlineKeyboardButton(
-            "🎫 Mensajes de Free Gold Pass",
-            callback_data="admin_start_freepass_instructions",
-        ),
-        types.InlineKeyboardButton(
-            "👀 Vista previa de bienvenida",
-            callback_data="admin_start_welcome_preview",
-        ),
-        types.InlineKeyboardButton(
-            "👀 Vista previa de oferta",
-            callback_data="admin_start_offer_preview",
-        ),
-        types.InlineKeyboardButton(
-            "👀 Vista previa del menú de pago",
-            callback_data="admin_start_payment_preview",
+            "✍️ Editar mensaje",
+            callback_data="admin_start_welcome_edit_message",
         ),
     )
-    for key, callback_data, label in (
-        (
-            "payment_start_welcome_instructions",
-            "admin_start_welcome_reset",
-            "♻️ Restablecer saludo",
-        ),
-        (
-            "payment_goldpass_offer_instructions",
-            "admin_start_offer_reset",
-            "♻️ Restablecer estilo de oferta",
-        ),
-        (
-            "payment_start_cta_instructions",
-            "admin_start_cta_reset",
-            "♻️ Restablecer llamada al pago",
-        ),
-        (
-            "payment_start_freepass_instructions",
-            "admin_start_freepass_reset",
-            "♻️ Restablecer mensajes Free Pass",
-        ),
-    ):
-        if config.get(key):
-            markup.add(types.InlineKeyboardButton(
-                label,
-                callback_data=callback_data,
-            ))
     markup.add(types.InlineKeyboardButton(
-        "🔙 Volver a configuración general",
-        callback_data="admin_start_welcome_back",
+        "👀 Vista previa",
+        callback_data="admin_start_welcome_photo_preview",
     ))
+    if foto_custom:
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Usar foto original",
+            callback_data="admin_start_welcome_photo_original",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a Multimedia y mensajes",
+        callback_data="admin_start_photos",
+    ))
+    foto = _foto_bienvenida_inicio_pago()
+    if foto:
+        try:
+            if isinstance(foto, str) and os.path.isfile(foto):
+                with open(foto, "rb") as archivo:
+                    return enviar_foto_panel(
+                        chat_id, archivo, texto, markup, forzar_reemplazo=True
+                    )
+            return enviar_foto_panel(
+                chat_id, foto, texto, markup, forzar_reemplazo=True
+            )
+        except Exception:
+            app.logger.exception(
+                "No se pudo mostrar la foto actual de bienvenida de /start."
+            )
     return editar_o_enviar_panel(
         chat_id,
         texto,
@@ -5851,6 +5883,17 @@ def mostrar_admin_start_messages(
         message_id=message_id,
         protect_content=True,
         forzar_texto=True,
+    )
+
+
+def mostrar_admin_start_messages(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    return mostrar_admin_start_photos(
+        chat_id,
+        message=message,
+        message_id=message_id,
+        aviso=aviso,
     )
 
 
@@ -5955,33 +5998,13 @@ def _markup_admin_bienvenida_inicio_pago(
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton(
-            "🖼️ Fotos",
+            "🖼️ Multimedia y mensajes",
             callback_data="admin_start_photos",
         ),
-        types.InlineKeyboardButton(
-            "✍️ Mensajes de Gemini",
-            callback_data="admin_start_messages",
-        ),
-    )
-    markup.add(
         types.InlineKeyboardButton(
             "🔘 Etiquetas de botones",
             callback_data="admin_start_button_labels|0",
         ),
-        types.InlineKeyboardButton(
-            "👀 Vista previa de oferta",
-            callback_data="admin_start_offer_preview",
-        ),
-        types.InlineKeyboardButton(
-            "👀 Vista previa del menú de pago",
-            callback_data="admin_start_payment_preview",
-        ),
-    )
-    markup.add(
-        types.InlineKeyboardButton(
-            "👀 Vista previa en español",
-            callback_data="admin_start_welcome_preview",
-        )
     )
     markup.add(
         types.InlineKeyboardButton(
@@ -6001,21 +6024,6 @@ def mostrar_admin_bienvenida_inicio_pago(
     preview_label="👀 Vista previa · Español",
 ):
     config = cargar_config()
-    instrucciones = (
-        config.get("payment_start_welcome_instructions", "") or ""
-    ).strip()
-    instrucciones_oferta = (
-        config.get("payment_goldpass_offer_instructions", "") or ""
-    ).strip()
-    instrucciones_cta = (
-        config.get("payment_start_cta_instructions", "") or ""
-    ).strip()
-    instrucciones_freepass = (
-        config.get("payment_start_freepass_instructions", "") or ""
-    ).strip()
-    foto_personalizada = config.get("payment_start_photo_file_id")
-    foto = _foto_bienvenida_inicio_pago()
-    foto_menu_pago = cargar_config_pagos().get("portada_file_id")
     if preview_text is not None:
         markup = types.InlineKeyboardMarkup(row_width=1)
         ui_config = config
@@ -6057,61 +6065,17 @@ def mostrar_admin_bienvenida_inicio_pago(
             "<i>Los botones son solo de muestra; no ejecutan pagos ni abren enlaces.</i>"
         )
     else:
-        markup = _markup_admin_bienvenida_inicio_pago(
-            bool(foto_personalizada),
-            bool(instrucciones),
-            bool(instrucciones_oferta),
-        )
-        estado_foto = "personalizada" if foto_personalizada else "foto original"
-        estado_foto_pago = "personalizada" if foto_menu_pago else "foto original"
-        estado_texto = "instrucciones personalizadas" if instrucciones else "estilo predeterminado"
-        estado_oferta = (
-            "instrucciones personalizadas"
-            if instrucciones_oferta
-            else "estilo predeterminado"
-        )
-        estado_cta = "personalizado" if instrucciones_cta else "predeterminado"
-        estado_freepass = (
-            "personalizado" if instrucciones_freepass else "predeterminado"
-        )
+        markup = _markup_admin_bienvenida_inicio_pago(False, False)
         caption = (
             "⚙️ <b>Configuración general de /start</b>\n\n"
-            "Aquí organizas las fotos, los mensajes generados por Gemini y las "
-            "etiquetas de los botones del recorrido privado.\n\n"
-            f"Foto de bienvenida: <b>{estado_foto}</b>.\n"
-            f"Foto del menú de pago: <b>{estado_foto_pago}</b>.\n"
-            f"Estilo del saludo: <b>{estado_texto}</b>.\n"
-            f"Estilo de oferta Gold Pass: <b>{estado_oferta}</b>.\n"
-            f"Estilo de llamada al pago: <b>{estado_cta}</b>.\n"
-            f"Estilo de mensajes Free Pass: <b>{estado_freepass}</b>.\n"
-            "El mensaje inicial para elegir idioma queda fijo. Después, Gemini "
-            "responde en el idioma elegido. Precios, datos bancarios, enlaces y "
-            "acciones de pago/acceso siguen protegidos.\n\n"
-            f"{html.escape(_estado_persistencia_admin())}"
+            "Desde aquí puedes cambiar las imágenes y mensajes del recorrido, "
+            "o renombrar sus botones. El saludo para elegir idioma permanece fijo; "
+            "los pagos y las acciones de acceso no se modifican."
         )
-        if instrucciones:
-            caption += (
-                "\n\n<b>Estilo de bienvenida guardado:</b>\n"
-                f"{html.escape(instrucciones[:300])}"
-            )
-        if instrucciones_oferta:
-            caption += (
-                "\n\n<b>Estilo/condiciones de oferta guardadas:</b>\n"
-                f"{html.escape(instrucciones_oferta[:300])}"
-            )
-        if instrucciones_cta:
-            caption += (
-                "\n\n<b>Estilo de llamada al pago:</b>\n"
-                f"{html.escape(instrucciones_cta[:300])}"
-            )
-        if instrucciones_freepass:
-            caption += (
-                "\n\n<b>Estilo de mensajes Free Pass:</b>\n"
-                f"{html.escape(instrucciones_freepass[:300])}"
-            )
     if aviso:
         caption = f"✅ {html.escape(aviso)}\n\n{caption}"
 
+    foto = _foto_bienvenida_inicio_pago() if preview_text is not None else None
     if foto:
         try:
             if isinstance(foto, str) and os.path.isfile(foto):
@@ -6146,23 +6110,30 @@ def mostrar_admin_bienvenida_inicio_pago(
 
 
 def _mostrar_prompt_instrucciones_bienvenida_pago(
-    chat_id, message=None, message_id=None
+    chat_id, message=None, message_id=None, return_to_welcome_photo=False
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver a mensajes de Gemini",
-            callback_data="admin_start_messages",
+            "🔙 Volver al saludo",
+            callback_data=(
+                "admin_start_welcome_photo"
+                if return_to_welcome_photo
+                else "admin_start_media|welcome"
+            ),
         )
+    )
+    actual = (cargar_config().get("payment_start_welcome_instructions") or "").strip()
+    actual_text = (
+        f"\n\n<b>Texto guardado ahora:</b>\n{html.escape(actual[:1200])}"
+        if actual else "\n\nNo hay texto personalizado; se usa el saludo base."
     )
     return editar_o_enviar_panel(
         chat_id,
-        "✍️ <b>Instrucciones para la bienvenida de /start</b>\n\n"
-        "Escribe cómo quieres que Gemini personalice el saludo después de que "
-        "la persona elija idioma. Por ejemplo: «Más cálido y juguetón, con una "
-        "pregunta para iniciar conversación».\n\n"
-        "Se aplica solo al saludo inicial: no puede cambiar el idioma elegido, "
-        "el precio, los métodos de pago ni el acceso. Máximo 600 caracteres. "
-        "Escribe /cancelar para volver.",
+        "✍️ <b>Editar el mensaje de bienvenida</b>\n\n"
+        "Envía el texto o las indicaciones que quieres que Gemini aplique al "
+        "saludo después de elegir idioma. Si envías un borrador, conservará sus "
+        "ideas al adaptarlo; las acciones de pago y acceso permanecen protegidas. "
+        f"Máximo 600 caracteres. Escribe /cancelar para volver.{actual_text}",
         markup,
         message=message,
         message_id=message_id,
@@ -6176,17 +6147,22 @@ def _mostrar_prompt_instrucciones_oferta_goldpass(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver a mensajes de Gemini",
-            callback_data="admin_start_messages",
+            "🔙 Volver a GoldPass",
+            callback_data="admin_start_media|goldpass_offer",
         )
+    )
+    actual = (cargar_config().get("payment_goldpass_offer_instructions") or "").strip()
+    actual_text = (
+        f"\n\n<b>Texto guardado ahora:</b>\n{html.escape(actual[:1200])}"
+        if actual else "\n\nNo hay texto personalizado; se usa el contenido base."
     )
     return editar_o_enviar_panel(
         chat_id,
-        "✍️ <b>Estilo y condiciones de la oferta Gold Pass</b>\n\n"
-        "Escribe el tono que quieres que use Gemini o las condiciones reales que "
-        "quieres explicar. El precio ($2 USD al mes), el contenido descrito, los "
-        "botones y el flujo de pagos se mantienen protegidos. Máximo 600 caracteres. "
-        "Escribe /cancelar para volver.",
+        "✍️ <b>Editar la presentación GoldPass</b>\n\n"
+        "Envía el texto o las indicaciones que quieres que Gemini aplique a la "
+        "presentación. Si envías un borrador, lo usará como base. El precio, los "
+        "datos de pago, enlaces, botones y acceso siguen protegidos. Máximo 600 "
+        f"caracteres; /cancelar vuelve atrás.{actual_text}",
         markup,
         message=message,
         message_id=message_id,
@@ -6200,15 +6176,21 @@ def _mostrar_prompt_instrucciones_cta_pago(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver a mensajes de Gemini",
-            callback_data="admin_start_messages",
+            "🔙 Volver a la llamada al pago",
+            callback_data="admin_start_media|payment_cta",
         )
     )
+    actual = (cargar_config().get("payment_start_cta_instructions") or "").strip()
+    actual_text = (
+        f"\n\n<b>Texto guardado ahora:</b>\n{html.escape(actual[:1200])}"
+        if actual else "\n\nNo hay texto personalizado; se usa la llamada base."
+    )
     texto = (
-        "✍️ <b>Llamada al menú de pago</b>\n\n"
-        "Indica cómo quieres que Gemini invite a tocar los métodos de pago o el "
-        "Pase Exprés. El precio y los métodos disponibles no se pueden cambiar "
-        "desde este texto. Máximo 600 caracteres; /cancelar vuelve atrás."
+        "✍️ <b>Editar llamada a los métodos de pago</b>\n\n"
+        "Envía la frase o indicaciones que quieres que Gemini aplique al menú. "
+        "Si escribes una frase completa, la tomará como base y la adaptará al "
+        "idioma del usuario. No se cambian precios, métodos, enlaces ni acciones. "
+        f"Máximo 600 caracteres; /cancelar vuelve atrás.{actual_text}"
     )
     if aviso:
         texto = f"⚠️ {html.escape(aviso)}\n\n" + texto
@@ -6228,15 +6210,21 @@ def _mostrar_prompt_instrucciones_freepass(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver a mensajes de Gemini",
-            callback_data="admin_start_messages",
+            "🔙 Volver a Free Gold Pass",
+            callback_data="admin_start_media|freepass",
         )
     )
+    actual = (cargar_config().get("payment_start_freepass_instructions") or "").strip()
+    actual_text = (
+        f"\n\n<b>Texto guardado ahora:</b>\n{html.escape(actual[:1200])}"
+        if actual else "\n\nNo hay texto personalizado; se usa el aviso base."
+    )
     texto = (
-        "✍️ <b>Mensajes de Free Gold Pass</b>\n\n"
-        "Indica el tono para explicar el pase disponible, pendiente o activo. "
-        "Gemini lo redactará en el idioma elegido y conservará la duración, la "
-        "fecha y cuándo comienza el plazo. Máximo 600 caracteres; /cancelar vuelve."
+        "✍️ <b>Editar mensajes de Free Gold Pass</b>\n\n"
+        "Envía el texto o las indicaciones que quieres que Gemini aplique al aviso. "
+        "Si escribes un borrador, lo usará como base y conservará el estado, la "
+        "duración y la fecha reales. Máximo 600 caracteres; /cancelar vuelve."
+        f"{actual_text}"
     )
     if aviso:
         texto = f"⚠️ {html.escape(aviso)}\n\n" + texto
@@ -6270,6 +6258,7 @@ def _limpiar_edicion_inicio_admin(user_id):
         "esperando_etiqueta_boton_inicio",
         "esperando_foto_bienvenida_pago",
         "esperando_foto_metodos_pago",
+        "esperando_media_mensaje_start",
     }:
         admin_estado.pop(user_id, None)
 
@@ -6452,6 +6441,27 @@ def admin_restaurar_etiqueta_inicio(call):
 
 
 @bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_welcome_edit_message"
+)
+def admin_editar_bienvenida_desde_foto(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_instrucciones_bienvenida_pago",
+        "media_slot": "welcome",
+        "return_to_welcome_photo": True,
+        "panel_message_id": call.message.message_id,
+    }
+    _mostrar_prompt_instrucciones_bienvenida_pago(
+        call.message.chat.id,
+        message=call.message,
+        return_to_welcome_photo=True,
+    )
+
+
+@bot.callback_query_handler(
     func=lambda call: call.data == "admin_start_welcome_instructions"
 )
 def admin_editar_instrucciones_bienvenida(call):
@@ -6461,6 +6471,7 @@ def admin_editar_instrucciones_bienvenida(call):
     bot.answer_callback_query(call.id)
     admin_estado[call.from_user.id] = {
         "paso": "esperando_instrucciones_bienvenida_pago",
+        "media_slot": "welcome",
         "panel_message_id": call.message.message_id,
     }
     _mostrar_prompt_instrucciones_bienvenida_pago(
@@ -6479,6 +6490,7 @@ def admin_editar_instrucciones_oferta_goldpass(call):
     bot.answer_callback_query(call.id)
     admin_estado[call.from_user.id] = {
         "paso": "esperando_instrucciones_oferta_goldpass",
+        "media_slot": "goldpass_offer",
         "panel_message_id": call.message.message_id,
     }
     _mostrar_prompt_instrucciones_oferta_goldpass(
@@ -6497,6 +6509,7 @@ def admin_editar_instrucciones_cta_pago(call):
     bot.answer_callback_query(call.id)
     admin_estado[call.from_user.id] = {
         "paso": "esperando_instrucciones_cta_pago",
+        "media_slot": "payment_cta",
         "panel_message_id": call.message.message_id,
     }
     _mostrar_prompt_instrucciones_cta_pago(
@@ -6515,6 +6528,7 @@ def admin_editar_instrucciones_freepass(call):
     bot.answer_callback_query(call.id)
     admin_estado[call.from_user.id] = {
         "paso": "esperando_instrucciones_freepass",
+        "media_slot": "freepass",
         "panel_message_id": call.message.message_id,
     }
     _mostrar_prompt_instrucciones_freepass(
@@ -6635,6 +6649,204 @@ def admin_previsualizar_menu_pago(call):
     _mostrar_vista_previa_menu_pago(call)
 
 
+def _mostrar_previa_texto_inicio(
+    call, slot, texto, back_callback=None, back_label="🔙 Volver al mensaje"
+):
+    config = cargar_config()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if slot == "welcome":
+        markup.add(
+            types.InlineKeyboardButton(
+                _etiqueta_boton_inicio("confirm", "es", config),
+                callback_data="start_preview|methods",
+            ),
+            types.InlineKeyboardButton(
+                _etiqueta_boton_inicio("free_club", "es", config),
+                callback_data="start_preview|freeclub",
+            ),
+        )
+    elif slot == "goldpass_offer":
+        markup.add(
+            types.InlineKeyboardButton(
+                _etiqueta_boton_inicio("offer_yes", "es", config),
+                callback_data="start_preview|yes",
+            ),
+            types.InlineKeyboardButton(
+                _etiqueta_boton_inicio("offer_no", "es", config),
+                callback_data="start_preview|later",
+            ),
+        )
+        markup.add(types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("onlyfans", "es", config),
+            callback_data="start_preview|onlyfans",
+        ))
+    elif slot == "payment_cta":
+        markup.add(types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("confirm", "es", config),
+            callback_data="start_preview|methods",
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("freepass_start", "es", config),
+            callback_data="start_preview|freepass",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        back_label,
+        callback_data=back_callback or f"admin_start_media|{slot}",
+    ))
+    media = _media_mensaje_inicio(slot)
+    if not media and slot == "welcome":
+        foto = _foto_bienvenida_inicio_pago()
+        if foto:
+            caption = (
+                "👀 <b>Vista previa · Bienvenida</b>\n\n"
+                f"{html.escape(texto)}"
+            )
+            if isinstance(foto, str) and os.path.isfile(foto):
+                with open(foto, "rb") as archivo:
+                    return enviar_foto_panel(
+                        call.message.chat.id,
+                        archivo,
+                        caption,
+                        markup,
+                        forzar_reemplazo=True,
+                    )
+            return enviar_foto_panel(
+                call.message.chat.id,
+                foto,
+                caption,
+                markup,
+                forzar_reemplazo=True,
+            )
+    if media:
+        return editar_o_enviar_media_panel(
+            call.message.chat.id,
+            media["type"],
+            media["file_id"],
+            caption=f"👀 Vista previa · {START_MESSAGE_MEDIA_SLOTS[slot]}\n\n{texto}",
+            reply_markup=markup,
+            protect_content=True,
+            parse_mode=None,
+            sender=(
+                _send_animation_original
+                if media["type"] == "animation"
+                else None
+            ),
+        )
+    return editar_o_enviar_panel(
+        call.message.chat.id,
+        f"👀 <b>Vista previa · {html.escape(START_MESSAGE_MEDIA_SLOTS[slot])}</b>\n\n"
+        f"{html.escape(texto)}",
+        markup,
+        message=call.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_message_preview|")
+)
+def admin_previsualizar_mensaje_start(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    slot = call.data.split("|", 1)[1]
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        bot.answer_callback_query(call.id, "Ese mensaje no está disponible.")
+        return
+    bot.answer_callback_query(call.id, "Preparando la vista previa…")
+    try:
+        if slot == "welcome":
+            texto, _, _ = _generar_respuesta_chat_pago("es", [], inicio=True)
+            texto = _garantizar_llamada_boton_bienvenida(texto, "es")
+        elif slot == "goldpass_offer":
+            texto = _texto_oferta_goldpass("es")
+        elif slot == "payment_cta":
+            texto = _generar_cta_menu_pago("es", pase_expres_activo())
+        else:
+            config = free_goldpass_config()
+            duracion = _formato_duracion_freepass_idioma(
+                int(config.get("duration_seconds") or 60), "es"
+            )
+            texto = _texto_freepass_usuario("es", "available", duracion)
+    except Exception as error:
+        app.logger.warning(
+            "La vista previa de un mensaje de /start usó el respaldo "
+            "(slot=%s, error=%s).",
+            slot,
+            type(error).__name__,
+        )
+        if slot == "welcome":
+            texto = PAYMENT_MENU_COPY["es"]["welcome_fallback"]
+        elif slot == "payment_cta":
+            texto = PAYMENT_MENU_COPY["es"]["choose"]
+        elif slot == "freepass":
+            texto = FREEPASS_USER_COPY["es"]["available"].format(
+                duration="1 minuto",
+                expiry="—",
+            )
+        else:
+            texto = (
+                "Te cuento con claridad qué incluye GoldPass antes de que decidas.\n\n"
+                f"{GOLDPASS_OFFER_FACTS['es']}"
+            )
+    _mostrar_previa_texto_inicio(call, slot, texto)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_welcome_photo_preview"
+)
+def admin_previsualizar_bienvenida_desde_foto(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id, "Preparando la vista previa…")
+    try:
+        texto, _, _ = _generar_respuesta_chat_pago("es", [], inicio=True)
+        texto = _garantizar_llamada_boton_bienvenida(texto, "es")
+    except Exception as error:
+        app.logger.warning(
+            "La vista previa de bienvenida usó el texto de respaldo (error=%s).",
+            type(error).__name__,
+        )
+        texto = PAYMENT_MENU_COPY["es"]["welcome_fallback"]
+    _mostrar_previa_texto_inicio(
+        call,
+        "welcome",
+        texto,
+        back_callback="admin_start_welcome_photo",
+        back_label="🔙 Volver a la foto de bienvenida",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_cta_preview"
+)
+def admin_previsualizar_cta_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id, "Preparando la vista previa…")
+    texto = _generar_cta_menu_pago("es", pase_expres_activo())
+    _mostrar_previa_texto_inicio(call, "payment_cta", texto)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_freepass_preview"
+)
+def admin_previsualizar_mensaje_freepass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id, "Preparando la vista previa…")
+    config = free_goldpass_config()
+    segundos = int(config.get("duration_seconds") or 60)
+    duracion = _formato_duracion_freepass_idioma(segundos, "es")
+    texto = _texto_freepass_usuario("es", "available", duracion)
+    _mostrar_previa_texto_inicio(call, "freepass", texto)
+
+
 @bot.callback_query_handler(
     func=lambda call: call.data == "admin_start_offer_reset"
 )
@@ -6656,8 +6868,9 @@ def admin_restaurar_instrucciones_oferta_goldpass(call):
         return
     admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
-    mostrar_admin_start_messages(
+    mostrar_admin_start_media_slot(
         call.message.chat.id,
+        "goldpass_offer",
         message=call.message,
         aviso="Instrucciones de oferta restablecidas.",
     )
@@ -6679,8 +6892,9 @@ def admin_restaurar_instrucciones_cta_pago(call):
         bot.answer_callback_query(call.id, "No se pudo guardar.")
         return
     bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
-    mostrar_admin_start_messages(
+    mostrar_admin_start_media_slot(
         call.message.chat.id,
+        "payment_cta",
         message=call.message,
         aviso="Llamada al menú de pagos restablecida.",
     )
@@ -6703,8 +6917,9 @@ def admin_restaurar_instrucciones_freepass(call):
         return
     _FREEPASS_COPY_CACHE.clear()
     bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
-    mostrar_admin_start_messages(
+    mostrar_admin_start_media_slot(
         call.message.chat.id,
+        "freepass",
         message=call.message,
         aviso="Mensajes de Free Gold Pass restablecidos.",
     )
@@ -6757,8 +6972,9 @@ def admin_restaurar_instrucciones_bienvenida(call):
         return
     admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
-    mostrar_admin_start_messages(
+    mostrar_admin_start_media_slot(
         call.message.chat.id,
+        "welcome",
         message=call.message,
         aviso="Instrucciones restablecidas.",
     )
@@ -6766,6 +6982,21 @@ def admin_restaurar_instrucciones_bienvenida(call):
 
 @bot.callback_query_handler(
     func=lambda call: call.data == "admin_start_welcome_photo"
+)
+def admin_ver_foto_bienvenida_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    _limpiar_edicion_inicio_admin(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    mostrar_admin_start_welcome_photo(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_welcome_photo_upload"
 )
 def admin_cambiar_foto_bienvenida_pago(call):
     if not es_admin_privado(call):
@@ -6823,7 +7054,7 @@ def admin_restaurar_foto_bienvenida_pago(call):
         bot.answer_callback_query(call.id, "No se pudo guardar.")
         return
     bot.answer_callback_query(call.id, "Se usará la foto original.")
-    mostrar_admin_start_photos(
+    mostrar_admin_start_welcome_photo(
         call.message.chat.id,
         message=call.message,
         aviso="Foto original restaurada.",
@@ -6841,7 +7072,7 @@ def admin_cancelar_foto_bienvenida_pago(call):
     if estado.get("paso") == "esperando_foto_bienvenida_pago":
         admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "No se guardaron cambios.")
-    mostrar_admin_start_photos(
+    mostrar_admin_start_welcome_photo(
         call.message.chat.id,
         message=call.message,
     )
@@ -6858,6 +7089,7 @@ def admin_abrir_media_mensaje_inicio(call):
     if slot not in START_MESSAGE_MEDIA_SLOTS:
         bot.answer_callback_query(call.id, "Ese mensaje no está disponible.")
         return
+    _limpiar_edicion_inicio_admin(call.from_user.id)
     bot.answer_callback_query(call.id)
     mostrar_admin_start_media_slot(
         call.message.chat.id,
@@ -8508,7 +8740,7 @@ def guardar_foto_bienvenida_pago(message, foto_id):
         return True
     admin_estado.pop(uid, None)
     eliminar_mensaje_disparador(message)
-    mostrar_admin_start_photos(
+    mostrar_admin_start_welcome_photo(
         message.chat.id,
         message_id=panel_message_id,
         aviso="Foto de bienvenida actualizada; la foto del menú de pagos no cambió.",
@@ -13924,16 +14156,24 @@ def flujo_admin_pago(message):
         ):
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
-            mostrar_admin_start_messages(
-                message.chat.id,
-                message_id=state.get("panel_message_id"),
-                aviso="No se guardaron cambios.",
-            )
+            if state.get("return_to_welcome_photo"):
+                mostrar_admin_start_welcome_photo(
+                    message.chat.id,
+                    message_id=state.get("panel_message_id"),
+                    aviso="No se guardaron cambios.",
+                )
+            else:
+                mostrar_admin_start_media_slot(
+                    message.chat.id,
+                    state.get("media_slot", "welcome"),
+                    message_id=state.get("panel_message_id"),
+                    aviso="No se guardaron cambios.",
+                )
             return
         if paso == "esperando_foto_bienvenida_pago":
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
-            mostrar_admin_start_photos(
+            mostrar_admin_start_welcome_photo(
                 message.chat.id,
                 message_id=state.get("panel_message_id"),
                 aviso="No se guardaron cambios.",
@@ -14001,6 +14241,7 @@ def flujo_admin_pago(message):
             _mostrar_prompt_instrucciones_bienvenida_pago(
                 message.chat.id,
                 message_id=state.get("panel_message_id"),
+                return_to_welcome_photo=state.get("return_to_welcome_photo", False),
             )
             return
         try:
@@ -14017,15 +14258,24 @@ def flujo_admin_pago(message):
             _mostrar_prompt_instrucciones_bienvenida_pago(
                 message.chat.id,
                 message_id=state.get("panel_message_id"),
+                return_to_welcome_photo=state.get("return_to_welcome_photo", False),
             )
             return
         admin_estado.pop(message.from_user.id, None)
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
-        mostrar_admin_start_messages(
-            message.chat.id,
-            message_id=state.get("panel_message_id"),
-            aviso="Gemini aplicará estas instrucciones al saludo inicial.",
-        )
+        if state.get("return_to_welcome_photo"):
+            mostrar_admin_start_welcome_photo(
+                message.chat.id,
+                message_id=state.get("panel_message_id"),
+                aviso="Mensaje guardado; se aplicará a las próximas bienvenidas.",
+            )
+        else:
+            mostrar_admin_start_media_slot(
+                message.chat.id,
+                "welcome",
+                message_id=state.get("panel_message_id"),
+                aviso="Mensaje guardado; se aplicará a las próximas bienvenidas.",
+            )
         return
     if paso == "esperando_instrucciones_oferta_goldpass":
         if not text or len(text) > 600:
@@ -14053,10 +14303,11 @@ def flujo_admin_pago(message):
             return
         admin_estado.pop(message.from_user.id, None)
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
-        mostrar_admin_start_messages(
+        mostrar_admin_start_media_slot(
             message.chat.id,
+            "goldpass_offer",
             message_id=state.get("panel_message_id"),
-            aviso="Gemini usará estas instrucciones al explicar el Gold Pass.",
+            aviso="Mensaje guardado. Se aplicará a las próximas presentaciones GoldPass.",
         )
         return
     if paso in (
@@ -14101,10 +14352,16 @@ def flujo_admin_pago(message):
             _FREEPASS_COPY_CACHE.clear()
         admin_estado.pop(message.from_user.id, None)
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
-        mostrar_admin_start_messages(
+        slot = (
+            "payment_cta"
+            if key == "payment_start_cta_instructions"
+            else "freepass"
+        )
+        mostrar_admin_start_media_slot(
             message.chat.id,
+            slot,
             message_id=state.get("panel_message_id"),
-            aviso="Gemini usará estas instrucciones en el idioma elegido.",
+            aviso="Mensaje guardado. Se aplicará en las próximas interacciones.",
         )
         return
     if paso == "esperando_etiqueta_boton_inicio":

@@ -3520,6 +3520,13 @@ def eliminar_mensaje_disparador(message):
 
 # ── Datos de pago ─────────────────────────────────────────────────────────────
 _AVISO = "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines de procesar tu pedido para obtener 🏆🎟GoldPass."
+_AVISO_COMPROBANTE_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*⚠️?[ \t]*Importante\s*:\s*"
+    r"Env[ií]a\s+tu\s+comprobante\s+a\s+este\s+mismo\s+chat\s+"
+    r"cuando\s+termines\s+de\s+procesar\s+tu\s+pedido\s+"
+    r"para\s+obtener\s+(?:el\s+)?[^\w\r\n]{0,12}Gold\s*Pass\b[.!]?"
+    r"[ \t]*(?:\n|$)"
+)
 
 NOMBRE_METODO = {
     "pago_binance":   "🔸 Binance Pay",
@@ -3632,9 +3639,7 @@ def obtener_datos_pago(metodo):
     if not opciones:
         return ""
     texto = _normalizar_marca_goldpass("\n\n────────────\n\n".join(opciones))
-    if _AVISO.strip() not in texto and _AVISO_LINK.strip() not in texto:
-        texto += _AVISO
-    return texto
+    return texto_pago_con_aviso(texto)
 
 
 def obtener_mensaje_solicitud_enlace(metodo):
@@ -3703,20 +3708,13 @@ _MSG_LINK = (
     "🙏 <i>Gracias por tu paciencia.</i>"
 )
 
-# Aviso de comprobante (se adjunta al texto de datos que el admin copia y envía)
-_AVISO_LINK = (
-    "\n\n⚠️ Importante: Envía tu comprobante a este mismo chat cuando termines "
-    "de procesar tu pedido para obtener 🏆🎟GoldPass."
-)
-
-
 def texto_pago_con_aviso(texto):
     """Devuelve los datos junto con el aviso que debe copiarse al usuario."""
     texto = _normalizar_marca_goldpass(str(texto or "").strip())
+    texto = _AVISO_COMPROBANTE_RE.sub("", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto).strip()
     if not texto:
         return _AVISO.strip()
-    if _AVISO.strip() in texto or _AVISO_LINK.strip() in texto:
-        return texto
     return texto + _AVISO
 
 

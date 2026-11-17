@@ -9560,6 +9560,58 @@ def _solicitudes_pago_pendientes():
     return salida
 
 
+def _tarjeta_solicitud_pago_admin(user_id, info, cantidad_pendientes=None):
+    metodo = str(info.get("metodo") or "")
+    username = str(info.get("username") or "sin_usuario").lstrip("@")
+    nombre = str(info.get("nombre") or username or "Usuario")
+    tiene_username = username not in ("", "sin_usuario")
+    nombre_metodo = NOMBRE_METODO.get(metodo, metodo)
+    mencion_html = (
+        f'<a href="tg://user?id={int(user_id)}">{html.escape(nombre)}</a>'
+    )
+    texto = (
+        f"🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n"
+        f"👤 Nombre: {mencion_html}\n"
+        f"🆔 ID: <code>{int(user_id)}</code>\n"
+        f"📛 Usuario: {html.escape('@' + username if tiene_username else '(sin @username)')}\n\n"
+        f"💳 Método elegido: <b>{html.escape(nombre_metodo)}</b>"
+    )
+    etiqueta_opcion = info.get("payment_option_label")
+    if etiqueta_opcion:
+        texto += (
+            f"\n🏦 Banco solicitado: "
+            f"<b>{html.escape(str(etiqueta_opcion))}</b>"
+        )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if tiene_username:
+        markup.add(types.InlineKeyboardButton(
+            "💬 Abrir chat del usuario",
+            url=f"https://t.me/{username}",
+        ))
+    if metodo in _METODOS_LINK:
+        markup.add(types.InlineKeyboardButton(
+            "🔗 Crear enlace de pago",
+            callback_data=f"ac_{int(user_id)}_{metodo}",
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            "📋 Ver datos para copiar",
+            callback_data=f"ac_{int(user_id)}_{metodo}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Rechazar solicitud",
+        callback_data=f"admin_no_{int(user_id)}",
+    ))
+    if cantidad_pendientes is None:
+        cantidad_pendientes = len(_solicitudes_pago_pendientes())
+    markup.add(types.InlineKeyboardButton(
+        f"📥 Otras solicitudes ({cantidad_pendientes})",
+        callback_data="admin_payment_queue|0",
+    ))
+    return texto, markup
+
+
 def _markup_cola_solicitudes_pago():
     pendientes = _solicitudes_pago_pendientes()
     if not pendientes:
@@ -9664,40 +9716,15 @@ def _procesar_solicitud_metodo_pago(call, metodo, opcion_indice=None, opcion_eti
         protect_content=True,
     )
 
-    nombre_metodo = NOMBRE_METODO.get(metodo, metodo)
-
-    # Enlace al usuario: en el TEXTO funciona tg:// siempre;
-    # en botones URL solo es seguro usar https://, por eso separamos.
-    mencion_html = f'<a href="tg://user?id={user_id}">{nombre}</a>'
-    tiene_username = username != "sin_usuario"
-
-    markup_admin = types.InlineKeyboardMarkup(row_width=1)
-    if tiene_username:
-        markup_admin.add(
-            types.InlineKeyboardButton("💬 Abrir chat del usuario",
-                                       url=f"https://t.me/{username}"),
-        )
-    markup_admin.add(
-        types.InlineKeyboardButton("📋 Ver datos para copiar",
-                                   callback_data=f"ac_{user_id}_{metodo}"),
-        types.InlineKeyboardButton("❌ Rechazar solicitud",
-                                   callback_data=f"admin_no_{user_id}"),
-    )
-    markup_admin.add(types.InlineKeyboardButton(
-        f"📥 Otras solicitudes ({len(_solicitudes_pago_pendientes()) + 1})",
-        callback_data="admin_payment_queue|0",
-    ))
-
-    texto_admin = (
-        f"🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n"
-        f"👤 Nombre: {mencion_html}\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"📛 Usuario: {'@' + username if tiene_username else '(sin @username)'}\n\n"
-        f"💳 Método elegido: <b>{nombre_metodo}</b>"
-        + (
-            f"\n🏦 Banco solicitado: <b>{html.escape(opcion_etiqueta)}</b>"
-            if opcion_etiqueta else ""
-        )
+    texto_admin, markup_admin = _tarjeta_solicitud_pago_admin(
+        user_id,
+        {
+            "metodo": metodo,
+            "username": username,
+            "nombre": nombre,
+            "payment_option_label": opcion_etiqueta,
+        },
+        cantidad_pendientes=len(_solicitudes_pago_pendientes()) + 1,
     )
 
     try:
@@ -9724,6 +9751,7 @@ def _procesar_solicitud_metodo_pago(call, metodo, opcion_indice=None, opcion_eti
     solicitudes_info[user_id] = {
         'metodo':         metodo,
         'username':       username,
+        'nombre':         nombre,
         'payment_option_index': opcion_indice,
         'payment_option_label': opcion_etiqueta,
         'payment_option_data': opcion_texto,
@@ -9874,6 +9902,10 @@ def _mostrar_datos_pago_admin(user_id, metodo, indice=0, message=None):
         types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
         types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
     )
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver",
+        callback_data=f"admin_payment_request|{user_id}",
+    ))
     if len(opciones) > 1 and not isinstance(seleccion, int):
         navegacion = []
         if indice > 0:
@@ -9964,6 +9996,42 @@ def admin_ver_datos(call):
         indice=0,
         message=call.message,
     )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_payment_request|")
+)
+def admin_volver_solicitud_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        user_id = int(call.data.split("|", 1)[1])
+        info = solicitudes_info[user_id]
+        metodo = str(info.get("metodo") or "")
+        if metodo not in NOMBRE_METODO:
+            raise KeyError("solicitud no disponible")
+    except (IndexError, TypeError, ValueError, KeyError):
+        bot.answer_callback_query(
+            call.id,
+            "La solicitud ya no está disponible.",
+            show_alert=True,
+        )
+        return
+
+    texto, markup = _tarjeta_solicitud_pago_admin(user_id, info)
+    bot.answer_callback_query(call.id)
+    panel = editar_o_enviar_panel(
+        int(ADMIN_ID),
+        texto,
+        markup,
+        message=call.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+    info["notif_msg_id"] = panel.message_id
+    info["datos_msg_id"] = None
+    info["datos_msg_ids"] = []
 
 
 def borrar_mensajes_datos_pago(info):

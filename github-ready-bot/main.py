@@ -78,6 +78,7 @@ _send_photo_original = bot.send_photo
 _send_video_original = bot.send_video
 _send_document_original = bot.send_document
 _send_audio_original = bot.send_audio
+_send_animation_original = bot.send_animation
 
 
 def _chat_privado_panelizable(chat_id, kwargs):
@@ -143,11 +144,16 @@ def _send_audio_compat(*args, **kwargs):
     return _send_media_compat(_send_audio_original, "audio", *args, **kwargs)
 
 
+def _send_animation_compat(*args, **kwargs):
+    return _send_media_compat(_send_animation_original, "animation", *args, **kwargs)
+
+
 bot.send_message = _send_compat
 bot.send_photo = _send_photo_compat
 bot.send_video = _send_video_compat
 bot.send_document = _send_document_compat
 bot.send_audio = _send_audio_compat
+bot.send_animation = _send_animation_compat
 # Panel helpers must always use the unwrapped API methods to avoid recursion.
 _SEND_MESSAGE_ORIGINAL = _send_original
 
@@ -193,6 +199,16 @@ SUPABASE_SUBSCRIPTIONS_TABLE = "bot_subscription_records"
 SUPABASE_SUBSCRIPTIONS_SYNC_TTL_SECONDS = 60
 SUPABASE_SUBSCRIPTIONS_STATUS = "not_checked"
 SUPABASE_SUBSCRIPTIONS_SYNC_AT = 0.0
+SUPABASE_SUBSCRIPTIONS_ERROR = ""
+SUPABASE_SUBSCRIPTIONS_COUNTS = {
+    "usuarios_default": 0,
+    "usuarios_tablas": 0,
+    "historial_pagado": 0,
+    "legacy": 0,
+    "free_goldpass": 0,
+    "supabase": 0,
+    "archivos": {},
+}
 SUPABASE_SUBSCRIPTIONS_LOCK = threading.RLock()
 SUPABASE_SETTINGS_LOCK = threading.RLock()
 SUPABASE_SETTINGS_CACHE = None
@@ -206,6 +222,7 @@ SUPABASE_START_CONFIG_KEYS = (
     "payment_start_cta_instructions",
     "payment_start_freepass_instructions",
     "payment_start_button_labels",
+    "payment_start_message_media",
 )
 SUPABASE_PAYMENT_CONFIG_KEY = "payment_menu_photo_file_id"
 db = TinyDB(_state_path("usuarios.json"))
@@ -214,6 +231,8 @@ FREE_GOLDPASS_QUERY = Query()
 FREE_GOLDPASS_LOCK = threading.RLock()
 PANELES_PRIVADOS = db.table("paneles_privados")
 TECLADOS_PRIVADOS = db.table("teclados_privados")
+StartedBotUsers = db.table("bot_started_users")
+STARTED_BOT_QUERY = Query()
 PANEL_QUERY = Query()
 PANEL_LOCK = threading.RLock()
 ASSISTANT_SHARE_LOCK = threading.RLock()
@@ -222,6 +241,7 @@ ASSISTANT_SHARE_TTL_SECONDS = 60 * 60
 ACTIVE_ASSISTANT_SHARE_ID = None
 ASSISTANT_SHARE_HELP_MESSAGE_ID = None
 PUBLICATION_MEDIA_LOCK = threading.RLock()
+PUBLICATION_SEND_LOCK = threading.RLock()
 admin_estado = {}
 solicitudes_pendientes = {}
 solicitudes_info = {}
@@ -468,6 +488,19 @@ START_BUTTON_LABEL_TITLES = {
     "method_usa_bank": "Transferencia bancaria USA",
     "method_usa_link": "Pago por link USA",
 }
+START_MESSAGE_MEDIA_SLOTS = {
+    "welcome": "Saludo después de elegir idioma",
+    "goldpass_offer": "Presentación de GoldPass",
+    "payment_cta": "Llamada a los métodos de pago",
+    "freepass": "Mensajes de Free Gold Pass",
+}
+START_MESSAGE_MEDIA_TYPE_LABELS = {
+    "photo": "foto",
+    "video": "video",
+    "document": "documento",
+    "audio": "audio",
+    "animation": "animación",
+}
 START_BUTTON_LABEL_DEFAULTS = {
     "language_es": {
         "es": "🇪🇸 Español",
@@ -647,6 +680,59 @@ def telegram_webhook():
         app.logger.exception("No se pudo procesar una actualización del webhook de Telegram.")
         return "Update processing failed", 500
     return "OK", 200
+
+
+def _supabase_error_resumido(error):
+    """Devuelve un diagnóstico seguro que nunca incluye URL, claves ni datos."""
+    if isinstance(error, urllib.error.HTTPError):
+        status = int(getattr(error, "code", 0) or 0)
+        if status in (401, 403):
+            return (
+                f"Supabase rechazó el acceso (HTTP {status}); verifica que Render "
+                "use la clave secreta/de servicio del proyecto."
+            )
+        if status == 404:
+            return (
+                "Supabase no encuentra la tabla de suscripciones; ejecuta "
+                "supabase/schema.sql en el proyecto conectado."
+            )
+        if status == 400:
+            return (
+                "Supabase recibió una consulta o estructura inválida; revisa que "
+                "la tabla tenga las columnas definidas en supabase/schema.sql."
+            )
+        if status == 409:
+            return (
+                "Supabase detectó un conflicto de clave; revisa la clave primaria "
+                "(record_type, user_id) de la tabla."
+            )
+        return f"Supabase respondió con HTTP {status}; revisa la conexión y el esquema."
+    if isinstance(error, urllib.error.URLError):
+        reason = getattr(error, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return "La conexión con Supabase agotó el tiempo de espera."
+        return "Render no pudo conectar con Supabase; revisa la URL y la red del servicio."
+    if isinstance(error, TimeoutError):
+        return "La conexión con Supabase agotó el tiempo de espera."
+    if isinstance(error, json.JSONDecodeError):
+        return "Supabase devolvió una respuesta que no es JSON válido."
+    if isinstance(error, ValueError):
+        return "Supabase devolvió datos con un formato inesperado."
+    if isinstance(error, RuntimeError):
+        return "Faltan SUPABASE_URL o SUPABASE_SECRET_KEY en el entorno de Render."
+    return "Falló la sincronización; revisa el tipo de error registrado en Render."
+
+
+def _supabase_registrar_error(error, contexto):
+    global SUPABASE_SUBSCRIPTIONS_ERROR
+    diagnostico = _supabase_error_resumido(error)
+    SUPABASE_SUBSCRIPTIONS_ERROR = diagnostico
+    app.logger.warning(
+        "%s (diagnóstico=%s; clase=%s).",
+        contexto,
+        diagnostico,
+        type(error).__name__,
+    )
 
 
 def _supabase_configurado():
@@ -844,9 +930,10 @@ def _supabase_parsear_actualizacion(valor):
     if not valor:
         return None
     try:
-        return datetime.fromisoformat(str(valor).replace("Z", "+00:00")).replace(
-            tzinfo=None
-        )
+        fecha = datetime.fromisoformat(str(valor).replace("Z", "+00:00"))
+        if fecha.tzinfo is None:
+            return fecha.replace(tzinfo=timezone.utc)
+        return fecha.astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
 
@@ -874,7 +961,7 @@ def _supabase_obtener_registros_suscripcion():
 
 
 def _supabase_guardar_registro_suscripcion(tipo, registro, actualizado=None):
-    global SUPABASE_SUBSCRIPTIONS_STATUS
+    global SUPABASE_SUBSCRIPTIONS_STATUS, SUPABASE_SUBSCRIPTIONS_ERROR
     if tipo not in ("paid", "free") or not isinstance(registro, dict):
         return False
     try:
@@ -886,6 +973,11 @@ def _supabase_guardar_registro_suscripcion(tipo, registro, actualizado=None):
     if not _supabase_configurado():
         SUPABASE_SUBSCRIPTIONS_STATUS = (
             "incomplete" if SUPABASE_URL or SUPABASE_SECRET_KEY else "not_configured"
+        )
+        SUPABASE_SUBSCRIPTIONS_ERROR = (
+            "Falta SUPABASE_URL o SUPABASE_SECRET_KEY en el entorno de Render."
+            if SUPABASE_SUBSCRIPTIONS_STATUS == "incomplete"
+            else "Supabase no está configurado."
         )
         return False
     data = {
@@ -919,13 +1011,13 @@ def _supabase_guardar_registro_suscripcion(tipo, registro, actualizado=None):
                 query_parameters={"on_conflict": "record_type,user_id"},
             )
         SUPABASE_SUBSCRIPTIONS_STATUS = "connected"
+        SUPABASE_SUBSCRIPTIONS_ERROR = ""
         return True
     except Exception as error:
         SUPABASE_SUBSCRIPTIONS_STATUS = "error"
-        app.logger.warning(
-            "No se pudo guardar una suscripción en Supabase (tipo=%s, error=%s).",
-            tipo,
-            type(error).__name__,
+        _supabase_registrar_error(
+            error,
+            f"No se pudo guardar una suscripción en Supabase (tipo={tipo})",
         )
         return False
 
@@ -943,6 +1035,7 @@ def _supabase_aplicar_registro_local(tipo, fila):
     registro["id"] = user_id
     registro.setdefault("username", fila.get("username") or "")
     registro.setdefault("updated_at", fila.get("updated_at") or "")
+    registro.setdefault("estado", fila.get("status") or "")
     if fila.get("expires_at") and not registro.get("vence"):
         registro["vence"] = fila["expires_at"]
 
@@ -950,17 +1043,50 @@ def _supabase_aplicar_registro_local(tipo, fila):
         SUSCRIPCIONES_ARCHIVO.upsert(registro, Query().id == user_id)
         vencimiento = _parsear_fecha_suscripcion(registro.get("vence"))
         estado = str(registro.get("estado") or fila.get("status") or "")
-        if vencimiento and estado not in ("expired", "cancelled", "revoked"):
+        if (
+            vencimiento
+            and vencimiento > datetime.now()
+            and estado not in ("expired", "cancelled", "revoked", "pending")
+        ):
             db.upsert(registro, Query().id == user_id)
-        elif estado in ("expired", "cancelled", "revoked"):
+        elif (
+            estado in ("expired", "cancelled", "revoked")
+            or (vencimiento and vencimiento <= datetime.now())
+        ):
             db.remove(Query().id == user_id)
     elif tipo == "free":
         FreeGoldPasses.upsert(registro, FREE_GOLDPASS_QUERY.id == user_id)
 
 
+def _contar_registros_con_id(tabla):
+    try:
+        return sum(
+            1
+            for registro in tabla.all()
+            if isinstance(registro, dict)
+            and str(registro.get("id", "")).isdigit()
+            and int(registro.get("id", 0)) > 0
+        )
+    except Exception:
+        return 0
+
+
+def _estado_archivo_suscripcion(nombre):
+    try:
+        ruta = _state_path(nombre)
+        if not os.path.isfile(ruta):
+            return "ausente"
+        if os.path.getsize(ruta) == 0:
+            return "vacío"
+        return "presente"
+    except OSError:
+        return "no accesible"
+
+
 def _supabase_sincronizar_suscripciones(force=False):
     """Importa el historial local una vez y mantiene Supabase como fuente compartida."""
     global SUPABASE_SUBSCRIPTIONS_STATUS, SUPABASE_SUBSCRIPTIONS_SYNC_AT
+    global SUPABASE_SUBSCRIPTIONS_ERROR
     with SUPABASE_SUBSCRIPTIONS_LOCK:
         ahora_mono = time.monotonic()
         if (
@@ -970,25 +1096,61 @@ def _supabase_sincronizar_suscripciones(force=False):
             < SUPABASE_SUBSCRIPTIONS_SYNC_TTL_SECONDS
         ):
             return SUPABASE_SUBSCRIPTIONS_STATUS == "connected"
+        preparacion_incompleta = False
         # Mantiene el respaldo local actualizado incluso si Supabase todavía no
         # está configurado, y migra las filas antiguas antes del primer acceso.
         try:
-            _sincronizar_suscripciones_pagadas()
+            fuentes = _sincronizar_suscripciones_pagadas()
+            preparacion_incompleta = bool(fuentes.get("errores_fuente"))
+            SUPABASE_SUBSCRIPTIONS_COUNTS.update(fuentes)
+            SUPABASE_SUBSCRIPTIONS_COUNTS.update({
+                "historial_pagado": _contar_registros_con_id(SUSCRIPCIONES_ARCHIVO),
+                "free_goldpass": _contar_registros_con_id(FreeGoldPasses),
+                "supabase": 0,
+                "archivos": {
+                    "usuarios.json": _estado_archivo_suscripcion("usuarios.json"),
+                    "suscripciones.json": _estado_archivo_suscripcion("suscripciones.json"),
+                    "database.json": _estado_archivo_suscripcion("database.json"),
+                },
+            })
+            if preparacion_incompleta:
+                SUPABASE_SUBSCRIPTIONS_STATUS = "error"
+                SUPABASE_SUBSCRIPTIONS_ERROR = (
+                    "No se pudo leer database.json; se omiten sus filas heredadas."
+                )
         except Exception as error:
+            preparacion_incompleta = True
+            SUPABASE_SUBSCRIPTIONS_STATUS = "error"
+            SUPABASE_SUBSCRIPTIONS_ERROR = (
+                "No se pudieron leer los archivos locales de suscripciones; "
+                "revisa usuarios.json y suscripciones.json."
+            )
             app.logger.warning(
-                "No se pudieron preparar los JSON de suscripciones (error=%s).",
+                "No se pudieron preparar los archivos locales de suscripciones "
+                "(clase=%s).",
                 type(error).__name__,
             )
             if not _supabase_configurado():
-                SUPABASE_SUBSCRIPTIONS_STATUS = "error"
                 SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
                 return False
         if not _supabase_configurado():
-            SUPABASE_SUBSCRIPTIONS_STATUS = (
-                "incomplete"
-                if SUPABASE_URL or SUPABASE_SECRET_KEY
-                else "not_configured"
-            )
+            if preparacion_incompleta:
+                SUPABASE_SUBSCRIPTIONS_STATUS = "error"
+                SUPABASE_SUBSCRIPTIONS_ERROR = (
+                    "No se pudo leer database.json y Supabase tampoco está "
+                    "configurado; se usa el respaldo local disponible."
+                )
+            else:
+                SUPABASE_SUBSCRIPTIONS_STATUS = (
+                    "incomplete"
+                    if SUPABASE_URL or SUPABASE_SECRET_KEY
+                    else "not_configured"
+                )
+                SUPABASE_SUBSCRIPTIONS_ERROR = (
+                    "Falta SUPABASE_URL o SUPABASE_SECRET_KEY en el entorno de Render."
+                    if SUPABASE_SUBSCRIPTIONS_STATUS == "incomplete"
+                    else "Supabase no está configurado; se muestra el respaldo local."
+                )
             SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
             return False
         try:
@@ -1009,6 +1171,7 @@ def _supabase_sincronizar_suscripciones(force=False):
                     continue
                 if clave[0] in ("paid", "free") and clave[1] > 0:
                     remotos[clave] = fila
+            SUPABASE_SUBSCRIPTIONS_COUNTS["supabase"] = len(remotos)
 
             carga_incompleta = False
             for tipo, registro in locales:
@@ -1049,20 +1212,33 @@ def _supabase_sincronizar_suscripciones(force=False):
                     else:
                         carga_incompleta = True
 
+            SUPABASE_SUBSCRIPTIONS_COUNTS["supabase"] = len(remotos)
             for (tipo, _user_id), fila in remotos.items():
                 _supabase_aplicar_registro_local(tipo, fila)
             SUPABASE_SUBSCRIPTIONS_STATUS = (
-                "error" if carga_incompleta else "connected"
+                "error"
+                if carga_incompleta or preparacion_incompleta
+                else "connected"
             )
+            SUPABASE_SUBSCRIPTIONS_COUNTS.update({
+                "historial_pagado": _contar_registros_con_id(SUSCRIPCIONES_ARCHIVO),
+                "free_goldpass": _contar_registros_con_id(FreeGoldPasses),
+            })
+            if not carga_incompleta and not preparacion_incompleta:
+                SUPABASE_SUBSCRIPTIONS_ERROR = ""
+            elif not SUPABASE_SUBSCRIPTIONS_ERROR:
+                SUPABASE_SUBSCRIPTIONS_ERROR = (
+                    "La conexión respondió, pero no se completó la preparación "
+                    "de todos los registros locales."
+                )
             SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
-            return not carga_incompleta
+            return not carga_incompleta and not preparacion_incompleta
         except Exception as error:
             SUPABASE_SUBSCRIPTIONS_STATUS = "error"
             SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
-            app.logger.warning(
-                "No se pudo sincronizar el registro de suscripciones de Supabase "
-                "(error=%s).",
-                type(error).__name__,
+            _supabase_registrar_error(
+                error,
+                "No se pudo sincronizar el registro de suscripciones de Supabase",
             )
             return False
 
@@ -2335,6 +2511,49 @@ def registrar_actividad_stats(user_id, username):
     else:
         Estadisticas.insert({'id': user_id, 'username': username, 'puntos': 1, 'last_seen': str(datetime.now())})
 
+
+def registrar_inicio_bot_usuario(message):
+    if getattr(getattr(message, "chat", None), "type", None) != "private":
+        return False
+    usuario = getattr(message, "from_user", None)
+    try:
+        user_id = int(usuario.id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    actual = StartedBotUsers.get(STARTED_BOT_QUERY.id == user_id) or {}
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    StartedBotUsers.upsert(
+        {
+            "id": user_id,
+            "username": getattr(usuario, "username", None) or "",
+            "started_at": actual.get("started_at") or ahora,
+            "last_start_at": ahora,
+        },
+        STARTED_BOT_QUERY.id == user_id,
+    )
+    return True
+
+
+def usuario_ya_inicio_bot(user_id):
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if user_id <= 0:
+        return False
+    try:
+        if StartedBotUsers.get(STARTED_BOT_QUERY.id == user_id):
+            return True
+        # Existing private panels prove the bot previously replied to that user.
+        return bool(PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == str(user_id)))
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo verificar si el usuario inició el bot (error=%s).",
+            type(error).__name__,
+        )
+        return False
+
+
 def _usuario_en_lista_negra(user_id, chat_id=None):
     registros = Blacklist.search(User.id == int(user_id))
     for registro in registros:
@@ -2920,6 +3139,7 @@ def editar_o_enviar_media_panel(
             "video": types.InputMediaVideo,
             "document": types.InputMediaDocument,
             "audio": types.InputMediaAudio,
+            "animation": types.InputMediaAnimation,
         }[media_type]
         try:
             input_media = input_media_cls(
@@ -3455,6 +3675,22 @@ def mostrar_menu_free_goldpass_usuario(chat_id, user_id, registro=None):
             _etiqueta_boton_inicio("freepass_start", language),
             callback_data="free_goldpass_claim",
         ))
+    try:
+        sent = _enviar_mensaje_inicio_con_media(
+            chat_id,
+            "freepass",
+            texto,
+            markup,
+            parse_mode=None,
+        )
+        if sent:
+            return sent
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo enviar el adjunto de un mensaje Free Gold Pass "
+            "(clase=%s).",
+            type(error).__name__,
+        )
     return editar_o_enviar_panel(
         chat_id,
         texto,
@@ -3559,6 +3795,22 @@ def mostrar_metodos_pago(chat_id, aviso=None, language=None):
         )
     if aviso:
         texto = f"ℹ️ {html.escape(aviso)}\n\n{texto}"
+    try:
+        sent = _enviar_mensaje_inicio_con_media(
+            chat_id,
+            "payment_cta",
+            texto,
+            markup,
+            parse_mode="HTML",
+        )
+        if sent:
+            return sent
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo enviar el adjunto de la llamada a métodos de pago "
+            "(clase=%s).",
+            type(error).__name__,
+        )
     photo_id = cargar_config_pagos().get("portada_file_id")
     if photo_id:
         try:
@@ -3972,38 +4224,118 @@ def _normalizar_suscripcion_legacy(registro):
 
 
 def _sincronizar_suscripciones_pagadas():
-    # Migra filas pagadas válidas del archivo anterior antes de la fuente actual.
-    # Así, si un ID aparece en ambos, prevalece el registro vigente de usuarios.json.
+    conteos = {
+        "usuarios_default": 0,
+        "usuarios_tablas": 0,
+        "legacy": 0,
+        "errores_fuente": [],
+    }
+    tablas_no_suscriptor = {
+        "_default",
+        "free_goldpass",
+        "paneles_privados",
+        "teclados_privados",
+    }
+    tablas_usuarios = {
+        "user",
+        "users",
+        "usuario",
+        "usuarios",
+        "subscriber",
+        "subscribers",
+        "suscriptor",
+        "suscriptores",
+        "subscription",
+        "subscriptions",
+        "suscripciones",
+        "paid",
+        "paid_subscriptions",
+        "pagados",
+    }
+
+    # Migra primero el archivo viejo. Solo se importan filas que tengan señales
+    # concretas de una suscripción pagada, nunca evidencia o moderación de grupo.
+    def importar_legacy(registro):
+        normalizado = _normalizar_suscripcion_legacy(registro)
+        if not normalizado:
+            return
+        _guardar_archivo_suscripcion(
+            normalizado, persistir=False, touch_updated=False
+        )
+        conteos["legacy"] += 1
+
     try:
-        registros_legacy = group_db.all()
+        for registro in group_db.all():
+            importar_legacy(registro)
+        for nombre_tabla in group_db.tables():
+            if nombre_tabla == "_default":
+                continue
+            for registro in group_db.table(nombre_tabla).all():
+                importar_legacy(registro)
     except json.JSONDecodeError:
-        registros_legacy = []
-    except Exception as error:
-        registros_legacy = []
+        conteos["errores_fuente"].append("database.json")
         app.logger.warning(
-            "No se pudo leer la base anterior de suscripciones (error=%s).",
+            "El archivo heredado de suscripciones no contiene JSON válido."
+        )
+    except Exception as error:
+        conteos["errores_fuente"].append("database.json")
+        app.logger.warning(
+            "No se pudo leer el archivo heredado de suscripciones (clase=%s).",
             type(error).__name__,
         )
-    for registro in registros_legacy:
-        normalizado = _normalizar_suscripcion_legacy(registro)
-        if normalizado:
-            _guardar_archivo_suscripcion(
-                normalizado, persistir=False, touch_updated=False
-            )
 
-    # La tabla principal de usuarios.json es la fuente actual; copiar todos los
-    # usuarios con ID evita ocultar registros que aún no tengan fecha normalizada.
+    # usuarios.json puede guardar los suscriptores en la tabla principal o en
+    # una tabla TinyDB nombrada. Se excluyen las tablas de estado del bot y los
+    # pases gratis para no mezclarlos con las suscripciones pagadas.
     for registro in db.all():
-        if isinstance(registro, dict) and registro.get("id"):
-            _guardar_archivo_suscripcion(
-                registro, persistir=False, touch_updated=False
-            )
+        if isinstance(registro, dict) and str(registro.get("id", "")).isdigit():
+            user_id = int(registro.get("id", 0))
+            if user_id > 0:
+                _guardar_archivo_suscripcion(
+                    dict(registro), persistir=False, touch_updated=False
+                )
+                conteos["usuarios_default"] += 1
+
+    try:
+        for nombre_tabla in db.tables():
+            nombre_normalizado = str(nombre_tabla).strip().lower()
+            if nombre_normalizado in tablas_no_suscriptor:
+                continue
+            for registro in db.table(nombre_tabla).all():
+                if not isinstance(registro, dict):
+                    continue
+                if nombre_normalizado in tablas_usuarios:
+                    if not str(registro.get("id", "")).isdigit():
+                        continue
+                    user_id = int(registro.get("id", 0))
+                    if user_id <= 0:
+                        continue
+                    candidato = dict(registro)
+                else:
+                    candidato = _normalizar_suscripcion_legacy(registro)
+                    if not candidato:
+                        continue
+                _guardar_archivo_suscripcion(
+                    candidato, persistir=False, touch_updated=False
+                )
+                conteos["usuarios_tablas"] += 1
+    except Exception as error:
+        app.logger.warning(
+            "No se pudieron revisar las tablas nombradas de usuarios.json "
+            "(clase=%s).",
+            type(error).__name__,
+        )
+        raise
+
+    return conteos
 
 
 def _estado_panel_suscripcion(registro, ahora):
     vence = _parsear_fecha_suscripcion(registro.get("vence"))
-    estado_original = registro.get("status") or registro.get("estado")
-    if estado_original == "pending":
+    estado_original = registro.get("estado") or registro.get("status")
+    if estado_original in ("expired", "cancelled", "revoked"):
+        estado = "vencido"
+    elif estado_original == "pending":
         estado = "pendiente"
     elif estado_original in ("kick_pending", "expiry_pending", "expiring"):
         estado = "expirando"
@@ -4262,6 +4594,25 @@ def markup_lista_suscripciones(registros, pagina, tamano=8):
     return markup
 
 
+def _resumen_fuentes_suscripciones():
+    conteos = SUPABASE_SUBSCRIPTIONS_COUNTS
+    archivos = conteos.get("archivos", {})
+    return (
+        "📊 Fuentes: usuarios.json "
+        f"{conteos.get('usuarios_default', 0)} principal + "
+        f"{conteos.get('usuarios_tablas', 0)} en tablas nombradas; "
+        f"archivo pagado {conteos.get('historial_pagado', 0)}; "
+        f"Free Gold Pass {conteos.get('free_goldpass', 0)}; "
+        f"Supabase {conteos.get('supabase', 0)}.\n"
+        "📁 Archivos: usuarios.json "
+        f"{html.escape(str(archivos.get('usuarios.json', 'sin comprobar')))}; "
+        "suscripciones.json "
+        f"{html.escape(str(archivos.get('suscripciones.json', 'sin comprobar')))}; "
+        "database.json "
+        f"{html.escape(str(archivos.get('database.json', 'sin comprobar')))}."
+    )
+
+
 def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
     registros = _lista_suscripciones_admin()
     tamano = 8
@@ -4286,17 +4637,36 @@ def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
             "Aún no hay suscripciones registradas."
         )
     if SUPABASE_SUBSCRIPTIONS_STATUS == "connected":
-        texto += "\n\n☁️ Registro persistente: Supabase conectado."
+        texto += (
+            "\n\n☁️ Registro persistente: Supabase conectado.\n"
+            + _resumen_fuentes_suscripciones()
+        )
     elif SUPABASE_SUBSCRIPTIONS_STATUS in ("error", "incomplete"):
         texto += (
-            "\n\n⚠️ Supabase no pudo sincronizarse; se muestra el respaldo local. "
-            "Revisa la tabla y las variables de conexión en Render."
+            "\n\n⚠️ La sincronización está incompleta; se muestran los registros "
+            "disponibles en Supabase y en el respaldo local. "
+            + html.escape(
+                SUPABASE_SUBSCRIPTIONS_ERROR
+                or "La sincronización con Supabase no se completó."
+            )
+            + "\n"
+            + _resumen_fuentes_suscripciones()
         )
     else:
         texto += (
-            "\n\n⚠️ Supabase no está configurado para suscripciones; "
-            "se muestra el respaldo local."
+            "\n\n⚠️ "
+            + html.escape(
+                SUPABASE_SUBSCRIPTIONS_ERROR
+                or "Supabase no está configurado; se muestra el respaldo local."
+            )
+            + "\n"
+            + _resumen_fuentes_suscripciones()
         )
+    texto += (
+        "\n\nℹ️ Telegram no permite que el bot descargue la lista histórica "
+        "completa de miembros del canal. Solo aparecen usuarios ya registrados "
+        "en archivos o en Supabase."
+    )
     return editar_o_enviar_panel(
         chat_id,
         texto,
@@ -5148,7 +5518,156 @@ def _foto_bienvenida_inicio_pago():
     return None
 
 
-def _markup_admin_start_photos():
+def _media_mensaje_inicio(slot, config=None):
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        return None
+    settings = config if isinstance(config, dict) else cargar_config()
+    media_por_mensaje = settings.get("payment_start_message_media", {})
+    if not isinstance(media_por_mensaje, dict):
+        return None
+    media = media_por_mensaje.get(slot)
+    if not isinstance(media, dict):
+        return None
+    media_type = media.get("type")
+    file_id = media.get("file_id")
+    if (
+        media_type not in START_MESSAGE_MEDIA_TYPE_LABELS
+        or not isinstance(file_id, str)
+        or not file_id.strip()
+    ):
+        return None
+    return {"type": media_type, "file_id": file_id.strip()}
+
+
+def _guardar_media_mensaje_inicio(slot, media=None):
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        raise ValueError("El mensaje de /start no es válido.")
+
+    def actualizar(config):
+        actual = config.get("payment_start_message_media", {})
+        adjuntos = dict(actual) if isinstance(actual, dict) else {}
+        if media is None:
+            adjuntos.pop(slot, None)
+        else:
+            adjuntos[slot] = dict(media)
+        config["payment_start_message_media"] = adjuntos
+
+    config_guardada = actualizar_config(actualizar)
+    return _media_mensaje_inicio(slot, config_guardada)
+
+
+def _enviar_mensaje_inicio_con_media(
+    chat_id, slot, caption, reply_markup=None, parse_mode=None
+):
+    media = _media_mensaje_inicio(slot)
+    if not media:
+        return None
+    sender = getattr(bot, f"send_{media['type']}", None)
+    if not callable(sender):
+        raise RuntimeError("El envío de este tipo de multimedia no está disponible.")
+    return sender(
+        chat_id,
+        media["file_id"],
+        caption=caption,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+        protect_content=True,
+    )
+
+
+def _respaldo_media_mensaje_inicio(slot):
+    if slot == "welcome":
+        return "Al quitarlo, se usará la foto general de bienvenida, si está configurada."
+    if slot == "payment_cta":
+        return "Al quitarlo, se usará la foto general del menú de pagos, si está configurada."
+    return "Al quitarlo, el mensaje volverá a enviarse solo con texto."
+
+
+def _markup_admin_media_mensaje_inicio(slot, tiene_media):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        "📎 Cambiar o agregar multimedia",
+        callback_data=f"admin_start_media_replace|{slot}",
+    ))
+    if tiene_media:
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Quitar adjunto y restaurar",
+            callback_data=f"admin_start_media_remove|{slot}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a Fotos",
+        callback_data=f"admin_start_media_back|{slot}",
+    ))
+    return markup
+
+
+def mostrar_admin_start_media_slot(
+    chat_id, slot, message=None, message_id=None, aviso=None
+):
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        return mostrar_admin_start_photos(
+            chat_id,
+            message=message,
+            message_id=message_id,
+            aviso="No encontré ese mensaje.",
+        )
+    media = _media_mensaje_inicio(slot)
+    titulo = START_MESSAGE_MEDIA_SLOTS[slot]
+    tipo = (
+        START_MESSAGE_MEDIA_TYPE_LABELS.get(media["type"], "")
+        if media
+        else ""
+    )
+    estado = (
+        f"Adjunto actual: <b>{html.escape(tipo)}</b>."
+        if media
+        else "Todavía no hay un adjunto personalizado."
+    )
+    texto = (
+        f"🎞 <b>{html.escape(titulo)}</b>\n\n"
+        f"{estado}\n"
+        "La multimedia aparecerá con el texto que Gemini genere en el idioma "
+        "elegido y mantendrá los botones actuales.\n\n"
+        f"{html.escape(_respaldo_media_mensaje_inicio(slot))}"
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    markup = _markup_admin_media_mensaje_inicio(slot, bool(media))
+    if media:
+        try:
+            sender = getattr(bot, f"send_{media['type']}")
+            return sender(
+                chat_id,
+                media["file_id"],
+                caption=texto,
+                parse_mode="HTML",
+                reply_markup=markup,
+                protect_content=True,
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo mostrar la vista previa del adjunto de /start "
+                "(tipo=%s, clase=%s).",
+                media["type"],
+                type(error).__name__,
+            )
+            texto = (
+                f"⚠️ No pude cargar la vista previa; el archivo sigue guardado.\n\n"
+                f"{texto}"
+            )
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def _markup_admin_start_photos(config=None):
+    config = config if isinstance(config, dict) else cargar_config()
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(
@@ -5160,6 +5679,17 @@ def _markup_admin_start_photos():
             callback_data="admin_pagos_cambiar_foto",
         ),
     )
+    for slot, title in START_MESSAGE_MEDIA_SLOTS.items():
+        media = _media_mensaje_inicio(slot, config)
+        tipo = (
+            START_MESSAGE_MEDIA_TYPE_LABELS.get(media["type"])
+            if media
+            else "sin adjunto"
+        )
+        markup.add(types.InlineKeyboardButton(
+            f"🎞 {title} · {tipo}",
+            callback_data=f"admin_start_media|{slot}",
+        ))
     markup.add(
         types.InlineKeyboardButton(
             "👀 Vista previa de bienvenida",
@@ -5206,14 +5736,17 @@ def mostrar_admin_start_photos(
         "🖼️ <b>Fotos del recorrido /start</b>\n\n"
         f"Bienvenida después de elegir idioma: <b>{bienvenida}</b>.\n"
         f"Menú de métodos de pago: <b>{pagos}</b>.\n\n"
-        "Son dos imágenes independientes. Cambiar una no modifica la otra."
+        "Las cuatro opciones de abajo permiten adjuntar una foto, video, documento, "
+        "audio o animación a cada mensaje de Gemini. El adjunto se muestra junto al "
+        "texto traducido y conserva sus botones. Cada mensaje mantiene su archivo "
+        "por separado."
     )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n" + texto
     return editar_o_enviar_panel(
         chat_id,
         texto,
-        _markup_admin_start_photos(),
+        _markup_admin_start_photos(config),
         message=message,
         message_id=message_id,
         protect_content=True,
@@ -5230,7 +5763,7 @@ def mostrar_admin_start_messages(
             "Saludo después de elegir idioma",
             config.get("payment_start_welcome_instructions"),
         ),
-        ("Presentación Gold Pass", config.get("payment_goldpass_offer_instructions")),
+        ("Presentación GoldPass", config.get("payment_goldpass_offer_instructions")),
         ("Llamada al menú de pago", config.get("payment_start_cta_instructions")),
         ("Mensajes de Free Gold Pass", config.get("payment_start_freepass_instructions")),
     )
@@ -5255,7 +5788,7 @@ def mostrar_admin_start_messages(
             callback_data="admin_start_welcome_instructions",
         ),
         types.InlineKeyboardButton(
-            "🎟️ Presentación Gold Pass",
+            "🎟️ Presentación GoldPass",
             callback_data="admin_start_offer_instructions",
         ),
         types.InlineKeyboardButton(
@@ -6315,6 +6848,206 @@ def admin_cancelar_foto_bienvenida_pago(call):
 
 
 @bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_media|")
+)
+def admin_abrir_media_mensaje_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    slot = call.data.split("|", 1)[1]
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        bot.answer_callback_query(call.id, "Ese mensaje no está disponible.")
+        return
+    bot.answer_callback_query(call.id)
+    mostrar_admin_start_media_slot(
+        call.message.chat.id,
+        slot,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_media_replace|")
+)
+def admin_pedir_media_mensaje_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    slot = call.data.split("|", 1)[1]
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        bot.answer_callback_query(call.id, "Ese mensaje no está disponible.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_media_mensaje_start",
+        "media_slot": slot,
+        "panel_message_id": call.message.message_id,
+    }
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Cancelar",
+            callback_data=f"admin_start_media_cancel|{slot}",
+        )
+    )
+    editar_o_enviar_panel(
+        call.message.chat.id,
+        f"📎 <b>Adjuntar multimedia: "
+        f"{html.escape(START_MESSAGE_MEDIA_SLOTS[slot])}</b>\n\n"
+        "Envía un solo archivo: foto, video, documento, audio o animación. "
+        "Se guardará en Supabase junto a este mensaje de Gemini y no cambiará "
+        "sus botones ni reglas. También puedes escribir /cancelar.",
+        markup,
+        message=call.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_media_cancel|")
+)
+def admin_cancelar_media_mensaje_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    slot = call.data.split("|", 1)[1]
+    estado = admin_estado.get(call.from_user.id, {})
+    if (
+        estado.get("paso") == "esperando_media_mensaje_start"
+        and estado.get("media_slot") == slot
+    ):
+        admin_estado.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "No se guardaron cambios.")
+    mostrar_admin_start_media_slot(
+        call.message.chat.id,
+        slot,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_media_remove|")
+)
+def admin_quitar_media_mensaje_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    slot = call.data.split("|", 1)[1]
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        bot.answer_callback_query(call.id, "Ese mensaje no está disponible.")
+        return
+    try:
+        _guardar_media_mensaje_inicio(slot, None)
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo quitar el adjunto de un mensaje de /start "
+            "(clase=%s).",
+            type(error).__name__,
+        )
+        bot.answer_callback_query(call.id, "No pude guardar el cambio.")
+        mostrar_admin_start_media_slot(
+            call.message.chat.id,
+            slot,
+            message=call.message,
+            aviso="No se pudo quitar el adjunto. Revisa la conexión de Supabase.",
+        )
+        return
+    bot.answer_callback_query(call.id, "Adjunto quitado.")
+    mostrar_admin_start_media_slot(
+        call.message.chat.id,
+        slot,
+        message=call.message,
+        aviso="Adjunto quitado; se restauró el comportamiento normal.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_media_back|")
+)
+def admin_volver_fotos_desde_media_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    estado = admin_estado.get(call.from_user.id, {})
+    if estado.get("paso") == "esperando_media_mensaje_start":
+        admin_estado.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id)
+    mostrar_admin_start_photos(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.message_handler(
+    func=lambda message: (
+        getattr(getattr(message, "chat", None), "type", None) == "private"
+        and str(getattr(getattr(message, "from_user", None), "id", ""))
+        == str(ADMIN_ID)
+        and admin_estado.get(message.from_user.id, {}).get("paso")
+        == "esperando_media_mensaje_start"
+    ),
+    content_types=["photo", "video", "document", "audio", "animation"],
+)
+def recibir_media_mensaje_inicio(message):
+    estado = admin_estado.get(message.from_user.id, {})
+    slot = estado.get("media_slot")
+    panel_message_id = estado.get("panel_message_id")
+    if slot not in START_MESSAGE_MEDIA_SLOTS:
+        eliminar_mensaje_disparador(message)
+        admin_estado.pop(message.from_user.id, None)
+        mostrar_admin_start_photos(
+            message.chat.id,
+            message_id=panel_message_id,
+            aviso="La selección ya no está disponible.",
+        )
+        return
+    media_type = getattr(message, "content_type", "")
+    archivo = getattr(message, media_type, None)
+    if media_type == "photo":
+        archivo = message.photo[-1] if getattr(message, "photo", None) else None
+    file_id = getattr(archivo, "file_id", None)
+    if media_type not in START_MESSAGE_MEDIA_TYPE_LABELS or not file_id:
+        eliminar_mensaje_disparador(message)
+        mostrar_admin_start_media_slot(
+            message.chat.id,
+            slot,
+            message_id=panel_message_id,
+            aviso="Ese archivo no se pudo reconocer. Envía otro adjunto compatible.",
+        )
+        return
+    try:
+        guardado = _guardar_media_mensaje_inicio(
+            slot,
+            {"type": media_type, "file_id": str(file_id)},
+        )
+        if not guardado or guardado.get("file_id") != str(file_id):
+            raise RuntimeError("La referencia multimedia no quedó guardada.")
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo guardar multimedia para un mensaje de /start "
+            "(tipo=%s, clase=%s).",
+            media_type,
+            type(error).__name__,
+        )
+        eliminar_mensaje_disparador(message)
+        mostrar_admin_start_media_slot(
+            message.chat.id,
+            slot,
+            message_id=panel_message_id,
+            aviso="No pude guardarlo. Verifica Supabase e inténtalo otra vez.",
+        )
+        return
+    admin_estado.pop(message.from_user.id, None)
+    eliminar_mensaje_disparador(message)
+    mostrar_admin_start_media_slot(
+        message.chat.id,
+        slot,
+        message_id=panel_message_id,
+        aviso=f"{START_MESSAGE_MEDIA_TYPE_LABELS[media_type].capitalize()} guardado.",
+    )
+
+
+@bot.callback_query_handler(
     func=lambda call: call.data == "admin_start_welcome_back"
 )
 def admin_volver_bienvenida_inicio_pago(call):
@@ -7276,19 +8009,27 @@ def markup_tiene_botones(markup):
 
 
 def validar_media_items(media_items):
-    if len(media_items) > 10:
-        raise ValueError("Telegram permite hasta 10 archivos en una publicación.")
+    if not isinstance(media_items, list):
+        raise ValueError("La lista de archivos multimedia no es válida.")
+    tipos_permitidos = {"photo", "video", "document", "audio", "animation"}
+    if any(
+        not isinstance(item, dict)
+        or item.get("media_type") not in tipos_permitidos
+        or not item.get("media_id")
+        for item in media_items
+    ):
+        raise ValueError("Hay un archivo multimedia no compatible.")
+    if len(media_items) > 3:
+        raise ValueError("Esta publicación admite hasta 3 fotos o videos.")
     if len(media_items) < 2:
         return
 
     tipos = {item["media_type"] for item in media_items}
     if tipos <= {"photo", "video"}:
         return
-    if len(tipos) == 1 and tipos <= {"audio", "document"}:
-        return
     raise ValueError(
-        "Para enviar varios archivos juntos, mezcla solo fotos/videos "
-        "o usa archivos todos del mismo tipo (audio o documento)."
+        "Solo puedes combinar varias fotos y videos. "
+        "Documentos, audios y animaciones se envían como archivo único."
     )
 
 
@@ -9644,6 +10385,25 @@ def es_grupo_autorizado(chat_id):
     try: return int(chat_id) in _grupos_configurados()
     except (ValueError,TypeError): return False
 
+
+def _chats_autorizados_bot():
+    """Chats guardados y canales fijos que necesita el flujo de acceso."""
+    permitidos = set(_grupos_configurados())
+    for chat_id in (CANAL_ID, CanaL_ID, FREE_GOLDPASS_PROMO_CHAT_ID):
+        try:
+            permitidos.add(int(chat_id))
+        except (TypeError, ValueError):
+            continue
+    return permitidos
+
+
+def es_chat_bot_autorizado(chat_id):
+    try:
+        return int(chat_id) in _chats_autorizados_bot()
+    except (TypeError, ValueError):
+        return False
+
+
 def _guardar_chat_seleccionado(chat_id, title, tipo, username=None):
     chat_id=int(chat_id); tipo="canal" if tipo=="canal" else "grupo"
     cfg=cargar_config(); destinos=cfg.setdefault("destinos", {})
@@ -9664,6 +10424,70 @@ def _destino_por_key(key):
         if isinstance(info,dict):
             return {"chat_id":cid,"nombre":info.get("title") or info.get("nombre") or cid,"tipo":info.get("type") or "grupo"}
     return None
+
+
+def _destino_publicacion_autorizado(key):
+    if not isinstance(key, str) or not key or key.startswith("private:"):
+        return None
+    cfg = cargar_config()
+    destino = cfg.get("destinos", {}).get(key)
+    if isinstance(destino, dict):
+        if destino.get("archivado"):
+            return None
+        resultado = dict(destino)
+    elif key.startswith("group:"):
+        chat_id = key.split(":", 1)[1]
+        archived = any(
+            isinstance(item, dict)
+            and item.get("archivado")
+            and str(item.get("chat_id")) == str(chat_id)
+            for item in cfg.get("destinos", {}).values()
+        )
+        if archived:
+            return None
+        info = cfg.get("group_settings", {}).get(chat_id)
+        if not isinstance(info, dict):
+            return None
+        resultado = {
+            "chat_id": chat_id,
+            "nombre": info.get("title") or info.get("nombre") or chat_id,
+            "tipo": info.get("type") or "grupo",
+        }
+    else:
+        return None
+
+    try:
+        chat_id = int(resultado.get("chat_id"))
+    except (TypeError, ValueError):
+        return None
+    tipo = str(resultado.get("tipo") or "").lower()
+    if tipo not in ("grupo", "group", "supergroup", "canal", "channel"):
+        return None
+    resultado["chat_id"] = str(chat_id)
+    return resultado
+
+
+def _destino_publicacion_desde_estado(estado):
+    if not isinstance(estado, dict):
+        return None
+    if estado.get("destino_tipo") == "privado":
+        try:
+            user_id = int(estado.get("recipient_id"))
+        except (TypeError, ValueError):
+            return None
+        if not usuario_ya_inicio_bot(user_id):
+            return None
+        nombre = estado.get("recipient_name") or str(user_id)
+        username = str(estado.get("recipient_username") or "").strip().lstrip("@")
+        if username:
+            nombre = f"{nombre} (@{username})"
+        return {
+            "chat_id": user_id,
+            "nombre": nombre,
+            "tipo": "privado",
+            "user_id": user_id,
+        }
+    return _destino_publicacion_autorizado(estado.get("dest_key"))
 
 
 def _registros_grupo(tabla, chat_id, legacy_principal=False, globales=False):
@@ -10118,6 +10942,122 @@ def markup_publicacion_goldpass():
     return markup
 
 
+PUBLICATION_BUTTON_LIMIT = 8
+PUBLICATION_BUTTON_TEXT_LIMIT = 64
+PUBLICATION_BUTTON_URL_LIMIT = 512
+
+
+def validar_texto_boton_publicacion(valor):
+    texto = str(valor or "").strip()
+    if (
+        not texto
+        or len(texto) > PUBLICATION_BUTTON_TEXT_LIMIT
+        or "\n" in texto
+        or "\r" in texto
+        or any(ord(caracter) < 32 for caracter in texto)
+    ):
+        raise ValueError("El texto del botón debe tener entre 1 y 64 caracteres, en una sola línea.")
+    return texto
+
+
+def validar_url_boton_publicacion(valor):
+    url = str(valor or "").strip()
+    if (
+        not url
+        or len(url) > PUBLICATION_BUTTON_URL_LIMIT
+        or any(caracter.isspace() for caracter in url)
+    ):
+        raise ValueError("El enlace debe tener como máximo 512 caracteres y no incluir espacios.")
+    try:
+        partes = urllib.parse.urlsplit(url)
+        puerto = partes.port
+    except ValueError as error:
+        raise ValueError("El enlace no tiene un formato válido.") from error
+    if (
+        partes.scheme.lower() != "https"
+        or not partes.hostname
+        or partes.username
+        or partes.password
+        or (puerto is not None and not 1 <= puerto <= 65535)
+    ):
+        raise ValueError("Usa un enlace HTTPS válido, por ejemplo https://t.me/...")
+    return url
+
+
+def _validar_botones_publicacion(botones):
+    if not isinstance(botones, list):
+        raise ValueError("La lista de botones no es válida.")
+    if len(botones) > PUBLICATION_BUTTON_LIMIT:
+        raise ValueError(f"Puedes añadir hasta {PUBLICATION_BUTTON_LIMIT} botones por publicación.")
+    normalizados = []
+    for boton in botones:
+        if not isinstance(boton, dict):
+            raise ValueError("Hay un botón incompleto.")
+        texto = validar_texto_boton_publicacion(
+            boton.get("texto") or boton.get("text")
+        )
+        url = validar_url_boton_publicacion(boton.get("url"))
+        normalizados.append({"texto": texto, "url": url})
+    return normalizados
+
+
+def _markup_botones_publicacion(botones):
+    normalizados = _validar_botones_publicacion(botones or [])
+    if not normalizados:
+        return None
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for boton in normalizados:
+        markup.add(
+            types.InlineKeyboardButton(boton["texto"], url=boton["url"])
+        )
+    return markup
+
+
+def _markup_previa_publicacion(botones, dest_key, destino=None):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for boton in _validar_botones_publicacion(botones or []):
+        markup.add(
+            types.InlineKeyboardButton(boton["texto"], url=boton["url"])
+        )
+    if destino and destino.get("tipo") == "privado":
+        etiqueta = str(
+            destino.get("username")
+            or destino.get("nombre")
+            or destino.get("chat_id")
+        ).strip().lstrip("@")
+        aceptar = f"✅ Enviar a {etiqueta}"[:64]
+    else:
+        aceptar = "✅ Aceptar y publicar"
+    markup.add(
+        types.InlineKeyboardButton(
+            aceptar,
+            callback_data=f"destpub_accept|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "✏️ Modificar",
+            callback_data=f"destpub_modify|{dest_key}",
+        ),
+    )
+    markup.add(
+        types.InlineKeyboardButton(
+            "❌ Cancelar",
+            callback_data=f"destpub_cancel|{dest_key}",
+        )
+    )
+    return markup
+
+
+def _botones_iniciales_publicacion():
+    try:
+        return _validar_botones_publicacion(botones_fijos_publicacion_goldpass())
+    except (OSError, ValueError, TypeError):
+        app.logger.warning(
+            "No se pudieron cargar los botones fijos de publicaciones; "
+            "el editor comenzará sin botones."
+        )
+        return []
+
+
 def markup_flujo_publicacion_destino(dest_key, estado=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     media_items = (
@@ -10198,44 +11138,35 @@ def _construir_album_publicacion(media_items, caption):
 
 
 def mostrar_previa_publicacion_destino(chat_id, estado):
-    destino = _destino_por_key(estado.get("dest_key", ""))
+    destino = _destino_publicacion_desde_estado(estado)
     if not destino:
-        raise ValueError("El canal elegido ya no está guardado.")
+        raise ValueError(
+            "El destino ya no está disponible o el usuario no ha iniciado el bot."
+        )
     media_items = media_items_de_estado_publicacion(estado)
     if not media_items:
         raise ValueError("Añade una foto o video antes de preparar la vista previa.")
     validar_media_items(media_items)
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton(
-            "✅ Aceptar y publicar",
-            callback_data=f"destpub_accept|{estado['dest_key']}",
-        ),
-        types.InlineKeyboardButton(
-            "✏️ Modificar",
-            callback_data=f"destpub_modify|{estado['dest_key']}",
-        ),
+    botones = _validar_botones_publicacion(estado.get("botones") or [])
+    markup = _markup_previa_publicacion(
+        botones, estado["dest_key"], destino=destino
     )
     caption = html.escape(str(estado.get("descripcion") or ""))
     eliminar_previa_album_publicacion(chat_id, estado)
     if len(media_items) == 1:
         adjunto = media_items[0]
-        caption_previa = (
-            f"👁️ <b>Vista previa · "
-            f"{html.escape(str(destino.get('nombre') or 'Canal'))}</b>\n\n"
-            f"{caption}"
-        )
         panel = enviar_media_panel_publicacion(
             chat_id,
             adjunto["media_type"],
             adjunto["media_id"],
-            caption_previa,
+            caption,
             markup,
         )
         estado["preview_media_message_ids"] = []
     else:
-        # Telegram no permite adjuntar botones al álbum; se muestran en un
-        # mensaje de control inmediatamente debajo de la vista previa.
+        # Telegram no permite adjuntar botones al álbum. Cuando la publicación
+        # lleva botones, la descripción ocupa el mensaje que va debajo del álbum,
+        # igual que en la publicación final.
         previo = None
         if int(chat_id) > 0:
             with PANEL_LOCK:
@@ -10247,14 +11178,21 @@ def mostrar_previa_publicacion_destino(chat_id, estado):
                 pass
             with PANEL_LOCK:
                 PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == str(chat_id))
-        album = _construir_album_publicacion(media_items, caption)
+        album_caption = "" if botones else caption
+        album = _construir_album_publicacion(media_items, album_caption)
         mensajes_album = bot.send_media_group(chat_id, album)
         try:
             panel = bot.send_message(
                 chat_id,
-                f"👁️ <b>Vista previa · "
-                f"{html.escape(str(destino.get('nombre') or 'Canal'))}</b>\n\n"
-                "El álbum está arriba. ¿Quieres aceptar o modificar la publicación?",
+                (
+                    caption
+                    if botones
+                    else (
+                        f"👁️ Vista previa para "
+                        f"{html.escape(str(destino.get('nombre') or destino.get('chat_id')))}. "
+                        "El álbum está arriba; confirma, modifica o cancela."
+                    )
+                ),
                 parse_mode="HTML",
                 reply_markup=markup,
                 protect_content=True,
@@ -10302,6 +11240,11 @@ def mostrar_menu_modificar_publicacion(chat_id, estado, message=None):
             callback_data=f"destpub_edit_desc|{dest_key}",
         ),
         types.InlineKeyboardButton(
+            f"🔗 Administrar botones ({len(estado.get('botones') or [])}/"
+            f"{PUBLICATION_BUTTON_LIMIT})",
+            callback_data=f"destpub_buttons|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
             "👁️ Volver a la vista previa",
             callback_data=f"destpub_show_preview|{dest_key}",
         ),
@@ -10314,7 +11257,10 @@ def mostrar_menu_modificar_publicacion(chat_id, estado, message=None):
         chat_id,
         "✏️ <b>Modificar publicación</b>\n\n"
         f"Multimedia actual: <b>{len(media_items_de_estado_publicacion(estado))}/3</b>\n"
-        "Elige si quieres añadir, reemplazar o editar solo la descripción.",
+        f"Botones inline: <b>{len(estado.get('botones') or [])}/"
+        f"{PUBLICATION_BUTTON_LIMIT}</b>\n"
+        "Puedes añadir o reemplazar multimedia, editar la descripción y "
+        "administrar los botones HTTPS. Nada se publica hasta que lo confirmes.",
         markup,
         message=message,
         message_id=estado.get("panel_message_id"),
@@ -10322,6 +11268,78 @@ def mostrar_menu_modificar_publicacion(chat_id, estado, message=None):
         forzar_texto=True,
     )
     estado["paso"] = "menu_modificacion_publicacion_destino"
+    estado["panel_message_id"] = panel.message_id
+    return panel
+
+
+def mostrar_gestion_botones_publicacion(chat_id, estado, message=None, aviso=None):
+    dest_key = estado["dest_key"]
+    botones = _validar_botones_publicacion(estado.get("botones") or [])
+    estado["botones"] = botones
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    for indice, boton in enumerate(botones):
+        markup.add(
+            types.InlineKeyboardButton(
+                f"✏️ Editar {indice + 1}: {boton['texto'][:24]}",
+                callback_data=f"destpub_button_edit|{dest_key}|{indice}",
+            ),
+            types.InlineKeyboardButton(
+                "🗑️",
+                callback_data=f"destpub_button_remove|{dest_key}|{indice}",
+            ),
+        )
+    if len(botones) < PUBLICATION_BUTTON_LIMIT:
+        markup.add(
+            types.InlineKeyboardButton(
+                "➕ Agregar botón",
+                callback_data=f"destpub_button_add|{dest_key}",
+            )
+        )
+    markup.add(
+        types.InlineKeyboardButton(
+            "🔙 Volver a modificar",
+            callback_data=f"destpub_buttons_back|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "👁️ Vista previa",
+            callback_data=f"destpub_show_preview|{dest_key}",
+        ),
+    )
+    markup.add(
+        types.InlineKeyboardButton(
+            "❌ Cancelar publicación",
+            callback_data=f"destpub_cancel|{dest_key}",
+        )
+    )
+    if botones:
+        lineas = []
+        for indice, boton in enumerate(botones):
+            url_visible = boton["url"]
+            if len(url_visible) > 100:
+                url_visible = f"{url_visible[:97]}..."
+            lineas.append(
+                f"{indice + 1}. <b>{html.escape(boton['texto'])}</b>\n"
+                f"   <code>{html.escape(url_visible)}</code>"
+            )
+        lista = "\n".join(lineas)
+    else:
+        lista = "Todavía no hay botones. Puedes añadir hasta 8 enlaces HTTPS."
+    texto = (
+        "🔗 <b>Botones de la publicación</b>\n\n"
+        f"{lista}\n\n"
+        "Los botones aparecen en la vista previa y se publican solo al confirmar."
+    )
+    if aviso:
+        texto = f"ℹ️ {html.escape(str(aviso))}\n\n{texto}"
+    panel = editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=estado.get("panel_message_id"),
+        protect_content=True,
+        forzar_texto=True,
+    )
     estado["panel_message_id"] = panel.message_id
     return panel
 
@@ -10359,13 +11377,13 @@ def mostrar_panel_control_grupo(
             callback_data=f"mod_seccion|{dest_key}|publicaciones|0",
         ),
     )
-    if str(destino.get("tipo") or "").lower() in ("canal", "channel"):
-        markup.add(
-            types.InlineKeyboardButton(
-                "📣 Enviar publicación",
-                callback_data=f"destpub_start|{dest_key}",
-            )
-        )
+    if str(destino.get("tipo") or "").lower() in (
+        "grupo", "group", "supergroup", "canal", "channel"
+    ):
+        markup.add(types.InlineKeyboardButton(
+            "📣 Enviar publicación",
+            callback_data=f"destpub_start|{dest_key}",
+        ))
     if _destino_muestra_palabras_prohibidas(cid):
         markup.add(types.InlineKeyboardButton(
             "🚫 Palabras prohibidas",
@@ -10662,21 +11680,101 @@ def cb_destdel(c):
 @bot.callback_query_handler(func=lambda c: c.data.startswith("destkeyboard|"))
 def cb_destkeyboard(c):
     if not es_admin_privado(c): bot.answer_callback_query(c.id,"⛔ Sin permiso."); return
-    key=c.data.split("|",1)[1]; d=_destino_por_key(key)
+    key=c.data.split("|",1)[1]
+    d=_destino_publicacion_autorizado(key)
     if not d: bot.answer_callback_query(c.id,"Destino no disponible."); return
-    if d.get("tipo") == "canal":
-        bot.answer_callback_query(
-            c.id,
-            "Telegram no admite teclados de respuesta en canales; publica botones en línea en una publicación.",
-            show_alert=True,
+    bot.answer_callback_query(c.id)
+    mostrar_menu_botones_publicaciones(
+        c.message.chat.id, key, d, message=c.message
+    )
+
+
+def mostrar_menu_botones_publicaciones(
+    chat_id, dest_key, destino, message=None, message_id=None, aviso=None
+):
+    destino = _destino_publicacion_autorizado(dest_key)
+    if not destino:
+        return None
+    tipo = str(destino.get("tipo") or "").lower()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "📝 Crear publicación con botones",
+            callback_data=f"destpub_start|{dest_key}",
+        ),
+        types.InlineKeyboardButton(
+            "📩 Preparar envío privado",
+            callback_data=f"destpub_private|{dest_key}",
+        ),
+    )
+    if tipo in ("grupo", "group", "supergroup"):
+        markup.add(
+            types.InlineKeyboardButton(
+                "⌨️ Publicar barra de comandos",
+                callback_data=f"destkeyboard_send|{dest_key}",
+            )
         )
+    markup.add(
+        types.InlineKeyboardButton(
+            "🔙 Volver al destino",
+            callback_data=f"destinfo|{dest_key}",
+        )
+    )
+    texto = (
+        f"🎛️ <b>Botones y publicaciones · "
+        f"{html.escape(str(destino.get('nombre') or destino.get('chat_id')))}</b>\n\n"
+        "Crea una publicación con multimedia, descripción y enlaces inline. "
+        "La vista previa permite editarla; solo se envía cuando pulsas "
+        "«Aceptar y publicar».\n\n"
+        "El envío privado está limitado a una persona por vez y solo se habilita "
+        "para usuarios que ya iniciaron este bot."
+    )
+    if aviso:
+        texto = f"ℹ️ {html.escape(str(aviso))}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("destkeyboard_send|"))
+def cb_destkeyboard_send(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    key = c.data.split("|", 1)[1]
+    destino = _destino_publicacion_autorizado(key)
+    if not destino or str(destino.get("tipo") or "").lower() not in (
+        "grupo", "group", "supergroup"
+    ):
+        bot.answer_callback_query(c.id, "La barra de comandos solo se publica en grupos.")
         return
     try:
-        bot.send_message(int(d["chat_id"]),"🏹 Accesos rápidos disponibles para el grupo:",reply_markup=obtener_teclado_cuadritos())
-        bot.answer_callback_query(c.id,"Botonera publicada.")
+        bot.send_message(
+            int(destino["chat_id"]),
+            "🏹 Accesos rápidos disponibles para el grupo:",
+            reply_markup=obtener_teclado_cuadritos(),
+        )
+        bot.answer_callback_query(c.id, "Botonera publicada.")
+        mostrar_menu_botones_publicaciones(
+            c.message.chat.id,
+            key,
+            destino,
+            message=c.message,
+            aviso="La barra de comandos se publicó en el grupo.",
+        )
     except Exception:
         app.logger.exception("No se pudo publicar la botonera en un destino.")
-        bot.answer_callback_query(c.id,"No se pudo publicar; revisa que el bot tenga permiso para enviar mensajes.",show_alert=True)
+        bot.answer_callback_query(
+            c.id,
+            "No se pudo publicar; revisa que el bot tenga permiso para enviar mensajes.",
+            show_alert=True,
+        )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("dest_rules|"))
 def cb_dest_rules(c):
@@ -10702,13 +11800,10 @@ def cb_destpub_start(c):
         bot.answer_callback_query(c.id, "⛔ Sin permiso.")
         return
     dest_key = c.data.split("|", 1)[1]
-    destino = _destino_por_key(dest_key)
-    if (
-        not destino
-        or str(destino.get("tipo") or "").lower() not in ("canal", "channel")
-    ):
+    destino = _destino_publicacion_autorizado(dest_key)
+    if not destino:
         bot.answer_callback_query(
-            c.id, "La publicación directa está disponible para canales."
+            c.id, "Este grupo o canal ya no está guardado para el bot."
         )
         return
 
@@ -10716,9 +11811,12 @@ def cb_destpub_start(c):
     estado = {
         "paso": "esperando_media_dest_publicacion",
         "dest_key": dest_key,
+        "destino_tipo": "destino",
+        "source_dest_key": dest_key,
         "panel_message_id": c.message.message_id,
         "media_items": [],
         "media_message_ids": [],
+        "botones": _botones_iniciales_publicacion(),
     }
     admin_estado[uid] = estado
     bot.answer_callback_query(c.id)
@@ -10726,12 +11824,83 @@ def cb_destpub_start(c):
         c.message.chat.id,
         estado,
         "📣 <b>Nueva publicación</b>\n\n"
-        f"Canal: <b>{html.escape(str(destino.get('nombre') or ''))}</b>\n"
+        f"Destino: <b>{html.escape(str(destino.get('nombre') or ''))}</b>\n"
         "Envía hasta 3 fotos o videos juntos como álbum. También puedes enviar "
         "un documento, audio o animación como archivo único. Después añadirás "
-        "la descripción y revisarás la vista previa.",
+        "la descripción y revisarás la vista previa.\n\n"
+        f"Botones iniciales: {len(estado['botones'])}. "
+        "Puedes editarlos antes de publicar.",
         message=c.message,
     )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_private|")
+)
+def cb_destpub_private(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    source_key = c.data.split("|", 1)[1]
+    destino = _destino_publicacion_autorizado(source_key)
+    if not destino:
+        bot.answer_callback_query(c.id, "Destino no disponible.")
+        return
+    admin_estado[c.from_user.id] = {
+        "paso": "esperando_destinatario_privado_publicacion",
+        "source_dest_key": source_key,
+        "panel_message_id": c.message.message_id,
+    }
+    try:
+        asegurar_teclado_admin_privado(c.message.chat.id)
+    except Exception:
+        app.logger.exception("No se pudo asegurar el atajo de selección de usuarios.")
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Volver",
+            callback_data=f"destpub_private_cancel|{source_key}",
+        )
+    )
+    bot.answer_callback_query(c.id)
+    editar_o_enviar_panel(
+        c.message.chat.id,
+        "📩 <b>Preparar envío privado</b>\n\n"
+        "Pulsa <b>Consultar usuario</b> en la barra inferior y selecciona "
+        "una sola persona. El bot verificará que esa persona ya lo haya "
+        "iniciado. El mensaje no se enviará hasta que revises la vista previa "
+        "y confirmes.",
+        markup,
+        message=c.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_private_cancel|")
+)
+def cb_destpub_private_cancel(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    source_key = c.data.split("|", 1)[1]
+    state = admin_estado.get(c.from_user.id, {})
+    if (
+        state.get("paso") == "esperando_destinatario_privado_publicacion"
+        and state.get("source_dest_key") == source_key
+    ):
+        admin_estado.pop(c.from_user.id, None)
+    destino = _destino_publicacion_autorizado(source_key)
+    bot.answer_callback_query(c.id, "Selección cancelada.")
+    if destino:
+        mostrar_menu_botones_publicaciones(
+            c.message.chat.id,
+            source_key,
+            destino,
+            message=c.message,
+        )
+    else:
+        mostrar_panel_admin(c.message.chat.id, message=c.message)
 
 
 @bot.callback_query_handler(
@@ -10743,29 +11912,55 @@ def cb_destpub_cancel(c):
         return
     dest_key = c.data.split("|", 1)[1]
     estado = admin_estado.get(c.from_user.id, {})
-    if estado.get("dest_key") == dest_key and str(
+    matching_state = estado.get("dest_key") == dest_key
+    if matching_state and estado.get("paso") == "publicando_publicacion_destino":
+        bot.answer_callback_query(
+            c.id,
+            "La publicación ya se está enviando y no se puede cancelar ahora.",
+        )
+        return
+    target = (
+        _destino_publicacion_desde_estado(estado)
+        if matching_state
+        else None
+    )
+    if matching_state and str(
         estado.get("paso", "")
     ).startswith(("esperando_media_dest_publicacion",
                   "esperando_descripcion_dest_publicacion",
                   "anadiendo_media_dest_publicacion",
                   "menu_modificacion_publicacion_destino",
-                  "revision_publicacion_destino")):
+                  "revision_publicacion_destino",
+                  "esperando_texto_boton_publicacion",
+                  "esperando_url_boton_publicacion")):
         eliminar_previa_album_publicacion(c.message.chat.id, estado)
         admin_estado.pop(c.from_user.id, None)
-    destino = _destino_por_key(dest_key)
     bot.answer_callback_query(c.id, "Edición cancelada.")
-    if destino:
+    if matching_state and estado.get("destino_tipo") == "privado":
+        source_key = estado.get("source_dest_key")
+        source = _destino_publicacion_autorizado(source_key)
+        if source:
+            mostrar_menu_botones_publicaciones(
+                c.message.chat.id,
+                source_key,
+                source,
+                message=c.message,
+                aviso="Publicación privada cancelada; no se envió nada.",
+            )
+        else:
+            mostrar_panel_admin(c.message.chat.id, message=c.message)
+    elif target:
         mostrar_panel_control_grupo(
             c.message.chat.id,
             dest_key,
-            destino,
+            target,
             message=c.message,
             aviso="Publicación cancelada; no se envió al canal.",
         )
     else:
         editar_o_enviar_panel(
             c.message.chat.id,
-            "El canal ya no está guardado.",
+            "El grupo o canal ya no está guardado.",
             _markup_grupos_admin(),
             message=c.message,
             protect_content=True,
@@ -10782,7 +11977,18 @@ def cb_destpub_modify(c):
         return
     dest_key = c.data.split("|", 1)[1]
     estado = admin_estado.get(c.from_user.id, {})
-    destino = _destino_por_key(dest_key)
+    destino = (
+        _destino_publicacion_desde_estado(estado)
+        if estado.get("dest_key") == dest_key
+        else None
+    )
+    if (
+        destino
+        and estado.get("dest_key") == dest_key
+        and estado.get("paso") == "publicando_publicacion_destino"
+    ):
+        bot.answer_callback_query(c.id, "La publicación ya se está enviando.")
+        return
     if (
         not destino
         or estado.get("dest_key") != dest_key
@@ -10800,10 +12006,14 @@ def cb_destpub_modify(c):
     )
 
 
-def _obtener_estado_revision_publicacion(call):
-    dest_key = call.data.split("|", 1)[1]
+def _obtener_estado_revision_publicacion(call, dest_key=None):
+    dest_key = dest_key or call.data.split("|", 1)[1]
     estado = admin_estado.get(call.from_user.id, {})
-    destino = _destino_por_key(dest_key)
+    destino = (
+        _destino_publicacion_desde_estado(estado)
+        if estado.get("dest_key") == dest_key
+        else None
+    )
     if (
         not destino
         or estado.get("dest_key") != dest_key
@@ -10811,6 +12021,182 @@ def _obtener_estado_revision_publicacion(call):
     ):
         return dest_key, None, None
     return dest_key, estado, destino
+
+
+def _mostrar_prompt_boton_publicacion(chat_id, estado, aviso=None):
+    paso = estado.get("paso")
+    if paso == "esperando_texto_boton_publicacion":
+        texto = (
+            "🔗 <b>Texto del botón</b>\n\n"
+            "Envía el nombre que verá la persona (máximo 64 caracteres, "
+            "en una sola línea)."
+        )
+    else:
+        texto = (
+            "🌐 <b>Enlace del botón</b>\n\n"
+            "Envía una URL HTTPS completa, por ejemplo "
+            "<code>https://t.me/tu_canal</code> (máximo 512 caracteres)."
+        )
+    if aviso:
+        texto = f"⚠️ {html.escape(str(aviso))}\n\n{texto}"
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "↩️ Cancelar edición del botón",
+            callback_data=f"destpub_button_cancel|{estado['dest_key']}",
+        )
+    )
+    panel = editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message_id=estado.get("panel_message_id"),
+        protect_content=True,
+        forzar_texto=True,
+    )
+    estado["panel_message_id"] = panel.message_id
+    return panel
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_buttons|")
+)
+def cb_destpub_buttons(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c, dest_key)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    bot.answer_callback_query(c.id)
+    mostrar_gestion_botones_publicacion(
+        c.message.chat.id, estado, message=c.message
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_buttons_back|")
+)
+def cb_destpub_buttons_back(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c, dest_key)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    bot.answer_callback_query(c.id)
+    mostrar_menu_modificar_publicacion(
+        c.message.chat.id, estado, message=c.message
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_button_add|")
+)
+def cb_destpub_button_add(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c, dest_key)
+    if not estado:
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    if len(estado.get("botones") or []) >= PUBLICATION_BUTTON_LIMIT:
+        bot.answer_callback_query(
+            c.id, f"El máximo es {PUBLICATION_BUTTON_LIMIT} botones."
+        )
+        return
+    estado["button_edit_index"] = None
+    estado.pop("button_pending_text", None)
+    estado["paso"] = "esperando_texto_boton_publicacion"
+    bot.answer_callback_query(c.id)
+    _mostrar_prompt_boton_publicacion(c.message.chat.id, estado)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_button_edit|")
+)
+def cb_destpub_button_edit(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, dest_key, raw_index = c.data.split("|", 2)
+        indice = int(raw_index)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "Botón inválido.")
+        return
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c, dest_key)
+    botones = estado.get("botones") or [] if estado else []
+    if not estado or not 0 <= indice < len(botones):
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    estado["button_edit_index"] = indice
+    estado.pop("button_pending_text", None)
+    estado["paso"] = "esperando_texto_boton_publicacion"
+    bot.answer_callback_query(c.id)
+    _mostrar_prompt_boton_publicacion(
+        c.message.chat.id,
+        estado,
+        aviso=f"Actualizando el botón {indice + 1}; también podrás cambiar su enlace.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_button_remove|")
+)
+def cb_destpub_button_remove(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, dest_key, raw_index = c.data.split("|", 2)
+        indice = int(raw_index)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "Botón inválido.")
+        return
+    dest_key, estado, destino = _obtener_estado_revision_publicacion(c, dest_key)
+    botones = estado.get("botones") or [] if estado else []
+    if not estado or not 0 <= indice < len(botones):
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    botones.pop(indice)
+    estado["botones"] = botones
+    bot.answer_callback_query(c.id, "Botón eliminado.")
+    mostrar_gestion_botones_publicacion(
+        c.message.chat.id, estado, message=c.message, aviso="Botón eliminado."
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("destpub_button_cancel|")
+)
+def cb_destpub_button_cancel(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.")
+        return
+    dest_key = c.data.split("|", 1)[1]
+    estado = admin_estado.get(c.from_user.id, {})
+    if (
+        estado.get("dest_key") != dest_key
+        or estado.get("paso") not in (
+            "esperando_texto_boton_publicacion",
+            "esperando_url_boton_publicacion",
+        )
+    ):
+        bot.answer_callback_query(c.id, "La edición ya no está disponible.")
+        return
+    estado.pop("button_edit_index", None)
+    estado.pop("button_pending_text", None)
+    estado["paso"] = "menu_modificacion_publicacion_destino"
+    bot.answer_callback_query(c.id, "Edición del botón cancelada.")
+    mostrar_gestion_botones_publicacion(
+        c.message.chat.id, estado, message=c.message
+    )
 
 
 @bot.callback_query_handler(
@@ -10960,7 +12346,18 @@ def cb_destpub_accept(c):
         return
     dest_key = c.data.split("|", 1)[1]
     estado = admin_estado.get(c.from_user.id, {})
-    destino = _destino_por_key(dest_key)
+    destino = (
+        _destino_publicacion_desde_estado(estado)
+        if estado.get("dest_key") == dest_key
+        else None
+    )
+    if (
+        destino
+        and estado.get("dest_key") == dest_key
+        and estado.get("paso") == "publicando_publicacion_destino"
+    ):
+        bot.answer_callback_query(c.id, "La publicación ya se está enviando.")
+        return
     if (
         not destino
         or estado.get("dest_key") != dest_key
@@ -10969,8 +12366,18 @@ def cb_destpub_accept(c):
         bot.answer_callback_query(c.id, "La vista previa ya no está disponible.")
         return
 
+    with PUBLICATION_SEND_LOCK:
+        if (
+            admin_estado.get(c.from_user.id) is not estado
+            or estado.get("paso") != "revision_publicacion_destino"
+        ):
+            bot.answer_callback_query(c.id, "Esta publicación ya se está procesando.")
+            return
+        estado["paso"] = "publicando_publicacion_destino"
+
     try:
-        markup = markup_publicacion_goldpass()
+        botones = _validar_botones_publicacion(estado.get("botones") or [])
+        markup = _markup_botones_publicacion(botones)
         enviar_publicacion_con_botones(
             destino["chat_id"],
             html.escape(str(estado.get("descripcion") or "")),
@@ -10979,25 +12386,65 @@ def cb_destpub_accept(c):
         )
     except Exception:
         app.logger.exception(
-            "No se pudo publicar la multimedia en el canal %s.", dest_key
+            "No se pudo enviar la publicación al destino %s.", dest_key
         )
+        with PUBLICATION_SEND_LOCK:
+            if (
+                admin_estado.get(c.from_user.id) is estado
+                and estado.get("paso") == "publicando_publicacion_destino"
+            ):
+                estado["paso"] = "revision_publicacion_destino"
+        if destino.get("tipo") == "privado":
+            aviso_error = (
+                "No se pudo enviar el mensaje privado. Comprueba que la persona "
+                "no haya bloqueado el bot y que el chat siga disponible."
+            )
+        else:
+            aviso_error = (
+                "No se publicó. Revisa que el bot pueda enviar mensajes "
+                "en el grupo o canal."
+            )
         bot.answer_callback_query(
             c.id,
-            "No se publicó. Revisa el permiso para publicar mensajes y los enlaces de X/OnlyFans.",
+            aviso_error,
             show_alert=True,
         )
         return
 
     eliminar_previa_album_publicacion(c.message.chat.id, estado)
-    admin_estado.pop(c.from_user.id, None)
+    with PUBLICATION_SEND_LOCK:
+        if admin_estado.get(c.from_user.id) is estado:
+            admin_estado.pop(c.from_user.id, None)
     bot.answer_callback_query(c.id, "Publicación enviada.")
-    mostrar_panel_control_grupo(
-        c.message.chat.id,
-        dest_key,
-        destino,
-        message=c.message,
-        aviso="Publicación enviada al canal con los botones fijos de X y OnlyFans.",
-    )
+    if destino.get("tipo") == "privado":
+        source_key = estado.get("source_dest_key")
+        source = _destino_publicacion_autorizado(source_key)
+        if source:
+            mostrar_menu_botones_publicaciones(
+                c.message.chat.id,
+                source_key,
+                source,
+                message=c.message,
+                aviso=(
+                    "Publicación enviada a "
+                    f"{destino.get('nombre')}; solo se contactó a esa persona."
+                ),
+            )
+        else:
+            mostrar_panel_admin(
+                c.message.chat.id,
+                message=c.message,
+            )
+    else:
+        mostrar_panel_control_grupo(
+            c.message.chat.id,
+            dest_key,
+            destino,
+            message=c.message,
+            aviso=(
+                f"Publicación enviada con {len(botones)} botón(es) inline."
+            ),
+        )
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("mod_home|"))
@@ -11496,6 +12943,81 @@ def recibir_media_publicacion_destino(message):
 def recibir_usuario_compartido(message):
     if str(message.from_user.id)!=str(ADMIN_ID) or message.chat.type!="private": return
     shared=message.users_shared; users=getattr(shared,"users",[]) or []
+    estado=admin_estado.get(message.from_user.id,{})
+    if estado.get("paso")=="esperando_destinatario_privado_publicacion":
+        eliminar_mensaje_seguro(message.chat.id,message.message_id)
+        source_key=estado.get("source_dest_key")
+        if len(users)!=1:
+            markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "🔙 Volver",
+                    callback_data=f"destpub_private_cancel|{source_key}",
+                )
+            )
+            editar_o_enviar_panel(
+                message.chat.id,
+                "Selecciona una sola persona con el botón "
+                "<b>Consultar usuario</b> de la barra inferior.",
+                markup,
+                message_id=estado.get("panel_message_id"),
+                protect_content=True,
+                forzar_texto=True,
+            )
+            return
+        seleccionado=users[0]
+        try:
+            user_id=int(getattr(seleccionado,"user_id",None))
+        except (TypeError,ValueError):
+            user_id=0
+        if not usuario_ya_inicio_bot(user_id):
+            markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "🔙 Volver",
+                    callback_data=f"destpub_private_cancel|{source_key}",
+                )
+            )
+            editar_o_enviar_panel(
+                message.chat.id,
+                "🔒 No se puede enviar a esta persona: todavía no ha iniciado "
+                "el bot o no existe un registro de inicio. Pídele que pulse "
+                "<b>Start</b> y vuelve a seleccionarla. No se envió ningún mensaje.",
+                markup,
+                message_id=estado.get("panel_message_id"),
+                protect_content=True,
+                forzar_texto=True,
+            )
+            return
+
+        nombre=" ".join(filter(None,(
+            getattr(seleccionado,"first_name",None),
+            getattr(seleccionado,"last_name",None),
+        ))) or f"ID {user_id}"
+        username=getattr(seleccionado,"username",None) or ""
+        dest_key=f"private:{user_id}"
+        estado.update({
+            "paso":"esperando_media_dest_publicacion",
+            "dest_key":dest_key,
+            "destino_tipo":"privado",
+            "recipient_id":user_id,
+            "recipient_name":nombre,
+            "recipient_username":username,
+            "media_items":[],
+            "media_message_ids":[],
+            "botones":[],
+        })
+        admin_estado[message.from_user.id]=estado
+        mostrar_paso_publicacion_destino(
+            message.chat.id,
+            estado,
+            "📩 <b>Nueva publicación privada</b>\n\n"
+            f"Destinatario: <b>{html.escape(nombre)}</b>"
+            + (f" (@{html.escape(username)})" if username else "")
+            + "\n\nEnvía hasta 3 fotos o videos juntos, o un documento, audio "
+            "o animación como archivo único. Después añade una descripción "
+            "y botones HTTPS opcionales. Solo se enviará después de tu "
+            "confirmación.",
+        )
+        return
     eliminar_mensaje_seguro(message.chat.id,message.message_id)
     summary=[]
     markup=types.InlineKeyboardMarkup(row_width=1)
@@ -11681,10 +13203,27 @@ def _texto_oferta_goldpass(language):
 def _mostrar_oferta_goldpass(chat_id, user_id, language, message=None):
     language = language if language in PAYMENT_LANGUAGES else "es"
     PAYMENT_USER_LANGUAGE[int(user_id)] = language
+    texto = _texto_oferta_goldpass(language)
+    markup = _markup_oferta_goldpass(user_id, language)
+    try:
+        sent = _enviar_mensaje_inicio_con_media(
+            chat_id,
+            "goldpass_offer",
+            texto,
+            markup,
+            parse_mode=None,
+        )
+        if sent:
+            return sent
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo enviar el adjunto de la oferta GoldPass (clase=%s).",
+            type(error).__name__,
+        )
     return editar_o_enviar_panel(
         chat_id,
-        _texto_oferta_goldpass(language),
-        _markup_oferta_goldpass(user_id, language),
+        texto,
+        markup,
         message=message,
         protect_content=True,
         parse_mode=None,
@@ -11854,6 +13393,21 @@ def _iniciar_inicio_pago_con_recuperacion(chat_id, user_id, payload=""):
 def _enviar_bienvenida_inicio_pago(chat_id, user_id, language, text):
     text = _garantizar_llamada_boton_bienvenida(text, language)
     markup = _markup_confirmar_metodos_pago(user_id, language)
+    try:
+        sent = _enviar_mensaje_inicio_con_media(
+            chat_id,
+            "welcome",
+            text,
+            markup,
+            parse_mode=None,
+        )
+        if sent:
+            return sent
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo enviar el adjunto del saludo de /start (clase=%s).",
+            type(error).__name__,
+        )
     photo = _foto_bienvenida_inicio_pago()
     if photo:
         try:
@@ -12156,6 +13710,13 @@ def start_payment(message):
         enviar_aviso_acceso_grupo(chat_id)
         return
     if message.chat.type!="private": return
+    try:
+        registrar_inicio_bot_usuario(message)
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo registrar el inicio del usuario (error=%s).",
+            type(error).__name__,
+        )
     payload=(message.text or "").split(maxsplit=1)
     if len(payload)>1 and payload[1].strip().lower().startswith("reporte"):
         partes = payload[1].strip().lower().split("_", 1)
@@ -12203,7 +13764,38 @@ def flujo_admin_pago(message):
     paso=state.get("paso")
     if not paso: return
     text=(message.text or "").strip()
+    if paso == "publicando_publicacion_destino":
+        eliminar_mensaje_seguro(message.chat.id,message.message_id)
+        return
     if text.lower()=="/cancelar" or text in ("❌ Cancelar", "🔙 Volver"):
+        if paso == "esperando_destinatario_privado_publicacion":
+            source_key=state.get("source_dest_key")
+            admin_estado.pop(message.from_user.id,None)
+            eliminar_mensaje_seguro(message.chat.id,message.message_id)
+            source=_destino_publicacion_autorizado(source_key)
+            if source:
+                mostrar_menu_botones_publicaciones(
+                    message.chat.id,
+                    source_key,
+                    source,
+                    message_id=state.get("panel_message_id"),
+                    aviso="Selección cancelada; no se contactó a nadie.",
+                )
+            else:
+                mostrar_panel_admin(message.chat.id)
+            return
+        if paso in (
+            "esperando_texto_boton_publicacion",
+            "esperando_url_boton_publicacion",
+        ):
+            state["paso"]="menu_modificacion_publicacion_destino"
+            state.pop("button_edit_index",None)
+            state.pop("button_pending_text",None)
+            eliminar_mensaje_seguro(message.chat.id,message.message_id)
+            mostrar_gestion_botones_publicacion(
+                message.chat.id,state,aviso="Edición del botón cancelada."
+            )
+            return
         if paso in (
             "esperando_media_dest_publicacion",
             "esperando_descripcion_dest_publicacion",
@@ -12212,10 +13804,23 @@ def flujo_admin_pago(message):
             "revision_publicacion_destino",
         ):
             eliminar_previa_album_publicacion(message.chat.id, state)
+            destino = _destino_publicacion_desde_estado(state)
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
-            destino = _destino_por_key(state.get("dest_key", ""))
-            if destino:
+            if state.get("destino_tipo") == "privado":
+                source_key=state.get("source_dest_key")
+                source=_destino_publicacion_autorizado(source_key)
+                if source:
+                    mostrar_menu_botones_publicaciones(
+                        message.chat.id,
+                        source_key,
+                        source,
+                        message_id=state.get("panel_message_id"),
+                        aviso="Publicación privada cancelada; no se envió nada.",
+                    )
+                else:
+                    mostrar_panel_admin(message.chat.id)
+            elif destino:
                 mostrar_panel_control_grupo(
                     message.chat.id,
                     state["dest_key"],
@@ -12226,7 +13831,7 @@ def flujo_admin_pago(message):
             else:
                 editar_o_enviar_panel(
                     message.chat.id,
-                    "El canal ya no está guardado.",
+                    "El grupo o canal ya no está guardado.",
                     _markup_grupos_admin(),
                     message_id=state.get("panel_message_id"),
                     protect_content=True,
@@ -12262,6 +13867,16 @@ def flujo_admin_pago(message):
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
             mostrar_admin_start_photos(
                 message.chat.id,
+                message_id=state.get("panel_message_id"),
+                aviso="No se guardaron cambios.",
+            )
+            return
+        if paso == "esperando_media_mensaje_start":
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_admin_start_media_slot(
+                message.chat.id,
+                state.get("media_slot"),
                 message_id=state.get("panel_message_id"),
                 aviso="No se guardaron cambios.",
             )
@@ -12506,6 +14121,98 @@ def flujo_admin_pago(message):
             "Para cancelar, escribe /cancelar.",
             parse_mode=None,
             protect_content=True,
+        )
+        return
+    if paso == "esperando_media_mensaje_start":
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_admin_start_media_slot(
+            message.chat.id,
+            state.get("media_slot"),
+            message_id=state.get("panel_message_id"),
+            aviso=(
+                "Envía una foto, video, documento, audio o animación, "
+                "o escribe /cancelar."
+            ),
+        )
+        return
+    if paso == "esperando_destinatario_privado_publicacion":
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        source_key=state.get("source_dest_key")
+        markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                "🔙 Volver",
+                callback_data=f"destpub_private_cancel|{source_key}",
+            )
+        )
+        editar_o_enviar_panel(
+            message.chat.id,
+            "Pulsa <b>Consultar usuario</b> en la barra inferior y elige "
+            "una sola persona. Solo se aceptan usuarios que ya iniciaron el bot.",
+            markup,
+            message_id=state.get("panel_message_id"),
+            protect_content=True,
+            forzar_texto=True,
+        )
+        return
+    if paso == "esperando_texto_boton_publicacion":
+        try:
+            texto_boton=validar_texto_boton_publicacion(text)
+        except ValueError as error:
+            eliminar_mensaje_seguro(message.chat.id,message.message_id)
+            _mostrar_prompt_boton_publicacion(
+                message.chat.id,state,aviso=str(error)
+            )
+            return
+        state["button_pending_text"]=texto_boton
+        state["paso"]="esperando_url_boton_publicacion"
+        eliminar_mensaje_seguro(message.chat.id,message.message_id)
+        _mostrar_prompt_boton_publicacion(message.chat.id,state)
+        return
+    if paso == "esperando_url_boton_publicacion":
+        try:
+            url=validar_url_boton_publicacion(text)
+        except ValueError as error:
+            eliminar_mensaje_seguro(message.chat.id,message.message_id)
+            _mostrar_prompt_boton_publicacion(
+                message.chat.id,state,aviso=str(error)
+            )
+            return
+        botones=state.get("botones") or []
+        indice=state.get("button_edit_index")
+        nuevo_boton={
+            "texto":state.get("button_pending_text") or "",
+            "url":url,
+        }
+        try:
+            nuevo_boton={
+                "texto":validar_texto_boton_publicacion(nuevo_boton["texto"]),
+                "url":validar_url_boton_publicacion(nuevo_boton["url"]),
+            }
+            if isinstance(indice,int):
+                if not 0 <= indice < len(botones):
+                    raise ValueError("Ese botón ya no está disponible.")
+                botones[indice]=nuevo_boton
+                aviso="Botón actualizado."
+            else:
+                if len(botones) >= PUBLICATION_BUTTON_LIMIT:
+                    raise ValueError(
+                        f"El máximo es {PUBLICATION_BUTTON_LIMIT} botones."
+                    )
+                botones.append(nuevo_boton)
+                aviso="Botón agregado."
+            state["botones"]=_validar_botones_publicacion(botones)
+        except ValueError as error:
+            eliminar_mensaje_seguro(message.chat.id,message.message_id)
+            _mostrar_prompt_boton_publicacion(
+                message.chat.id,state,aviso=str(error)
+            )
+            return
+        state.pop("button_edit_index",None)
+        state.pop("button_pending_text",None)
+        state["paso"]="menu_modificacion_publicacion_destino"
+        eliminar_mensaje_seguro(message.chat.id,message.message_id)
+        mostrar_gestion_botones_publicacion(
+            message.chat.id,state,aviso=aviso
         )
         return
     if paso == "esperando_media_dest_publicacion":
@@ -12930,6 +14637,7 @@ def procesar_comprobante_admin(message, file_id, file_type):
             "esperando_foto_asistente_compartir",
         "esperando_foto_metodos_pago",
         "esperando_foto_bienvenida_pago",
+        "esperando_media_mensaje_start",
         "esperando_datos_metodo_pago",
         "esperando_comprobante_aprobacion",
         "esperando_comprobante_suscriptor",
@@ -12938,6 +14646,15 @@ def procesar_comprobante_admin(message, file_id, file_type):
 )
 def admin_media_payment_fallback(message):
     estado = admin_estado.get(message.from_user.id, {})
+    if estado.get("paso") == "esperando_media_mensaje_start":
+        eliminar_mensaje_disparador(message)
+        mostrar_admin_start_media_slot(
+            message.chat.id,
+            estado.get("media_slot"),
+            message_id=estado.get("panel_message_id"),
+            aviso="No pude reconocer ese archivo. Envía otro tipo de multimedia o /cancelar.",
+        )
+        return
     if estado.get("paso") in (
         "esperando_comprobante_aprobacion",
         "esperando_comprobante_suscriptor",
@@ -13221,29 +14938,150 @@ def registrar_miembro_suscripcion_goldpass(update):
 
 @bot.my_chat_member_handler()
 def guardian_autorizacion(update):
-    chat = update.chat
+    chat = getattr(update, "chat", None)
+    if not chat:
+        return
     # Private-chat membership updates include users blocking/unblocking the bot.
     # They are not group/channel invitations and must never trigger guardian logic.
     if getattr(chat, "type", None) == "private":
         return
-    new=getattr(update.new_chat_member,"status","")
-    if new not in ("member","administrator"): return
-    actor=getattr(update,"from_user",None)
-    if actor and str(actor.id)==str(ADMIN_ID):
-        title=getattr(chat,"title",None) or str(chat.id)
-        _guardar_chat_seleccionado(chat.id,title,"canal" if chat.type=="channel" else "grupo")
-        if chat.type in ("group","supergroup"):
-            try: bot.send_message(chat.id,"🔱 Bot conectado. Accesos rápidos:",reply_markup=obtener_teclado_cuadritos())
-            except Exception: app.logger.exception("No se pudo publicar la botonera inicial del grupo.")
-        else:
-            try: bot.send_message(int(ADMIN_ID),f"✅ Canal guardado: {html.escape(str(title))} · ID <code>{chat.id}</code>. Los teclados de respuesta son para grupos; usa botones en línea al publicar en canales.",parse_mode="HTML",protect_content=True)
-            except Exception: app.logger.exception("No se pudo confirmar el canal al administrador.")
+    nuevo_miembro = getattr(update, "new_chat_member", None)
+    nuevo_estado = getattr(nuevo_miembro, "status", "")
+    if nuevo_estado not in ("member", "administrator"):
         return
-    if es_grupo_autorizado(chat.id): return
-    try: bot.leave_chat(chat.id)
-    except Exception: pass
-    try: bot.send_message(int(ADMIN_ID),f"🔒 Intento de agregar el bot a un chat no autorizado (ID {chat.id}); se retiró.",parse_mode="HTML")
-    except Exception: pass
+    actor = getattr(update, "from_user", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        return
+    title = getattr(chat, "title", None) or str(chat_id)
+    tipo_chat = getattr(chat, "type", "")
+    tipo = {
+        "group": "grupo",
+        "supergroup": "supergrupo",
+        "channel": "canal",
+    }.get(tipo_chat, str(tipo_chat or "chat"))
+
+    if actor and str(getattr(actor, "id", "")) == str(ADMIN_ID):
+        try:
+            _guardar_chat_seleccionado(
+                chat_id,
+                title,
+                "canal" if tipo_chat == "channel" else "grupo",
+                getattr(chat, "username", None),
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo guardar el destino añadido por el administrador "
+                "(clase=%s, código=%s).",
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
+            try:
+                bot.leave_chat(chat_id)
+            except Exception as leave_error:
+                app.logger.warning(
+                    "No se pudo retirar el bot tras fallar el guardado "
+                    "(clase=%s, código=%s).",
+                    type(leave_error).__name__,
+                    getattr(leave_error, "error_code", "n/a"),
+                )
+            try:
+                bot.send_message(
+                    int(ADMIN_ID),
+                    "⚠️ No pude guardar este destino; el bot intentó salir. "
+                    "Vuelve a añadirlo desde Grupos y canales.",
+                    protect_content=True,
+                )
+            except Exception as notify_error:
+                app.logger.warning(
+                    "No se pudo avisar al administrador del error de guardado "
+                    "(clase=%s, código=%s).",
+                    type(notify_error).__name__,
+                    getattr(notify_error, "error_code", "n/a"),
+                )
+            return
+        if tipo_chat in ("group", "supergroup"):
+            try:
+                bot.send_message(
+                    chat_id,
+                    "🔱 Bot conectado. Accesos rápidos:",
+                    reply_markup=obtener_teclado_cuadritos(),
+                )
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo publicar la botonera inicial del grupo "
+                    "(clase=%s, código=%s).",
+                    type(error).__name__,
+                    getattr(error, "error_code", "n/a"),
+                )
+        else:
+            try:
+                bot.send_message(
+                    int(ADMIN_ID),
+                    f"✅ Canal guardado: {html.escape(str(title))} · "
+                    f"ID <code>{html.escape(str(chat_id))}</code>. "
+                    "Usa botones en línea al publicar en canales.",
+                    parse_mode="HTML",
+                    protect_content=True,
+                )
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo confirmar el canal al administrador "
+                    "(clase=%s, código=%s).",
+                    type(error).__name__,
+                    getattr(error, "error_code", "n/a"),
+                )
+        return
+
+    destino_guardado = es_chat_bot_autorizado(chat_id)
+    try:
+        bot.leave_chat(chat_id)
+        salida = "El bot salió automáticamente."
+    except Exception as error:
+        salida = "No pudo salir automáticamente; retíralo manualmente."
+        app.logger.warning(
+            "No se pudo retirar el bot de un chat no autorizado "
+            "(tipo=%s, clase=%s, código=%s).",
+            tipo,
+            type(error).__name__,
+            getattr(error, "error_code", "n/a"),
+        )
+
+    try:
+        actor_text = ""
+        if actor:
+            actor_username = getattr(actor, "username", None)
+            actor_name = " ".join(
+                filter(
+                    None,
+                    (
+                        getattr(actor, "first_name", None),
+                        getattr(actor, "last_name", None),
+                    ),
+                )
+            )
+            if actor_username:
+                actor_text = f"\nAñadido por: @{html.escape(str(actor_username))}"
+            elif actor_name:
+                actor_text = f"\nAñadido por: {html.escape(str(actor_name))}"
+        bot.send_message(
+            int(ADMIN_ID),
+            "🚨 <b>Intentaron agregar o promover el bot sin tu autorización</b>\n\n"
+            f"Tipo: {html.escape(tipo)}\n"
+            f"Nombre: {html.escape(str(title))}\n"
+            f"ID: <code>{html.escape(str(chat_id))}</code>"
+            f"\nDestino guardado: {'sí' if destino_guardado else 'no'}"
+            f"{actor_text}\n\n{salida}",
+            parse_mode="HTML",
+            protect_content=True,
+        )
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo notificar al administrador del intento de adición "
+            "(clase=%s, código=%s).",
+            type(error).__name__,
+            getattr(error, "error_code", "n/a"),
+        )
 
 
 def teclado_menu_miembro(chat_id=None):
@@ -13935,11 +15773,18 @@ if __name__ == "__main__":
         else:
             app.logger.warning(
                 "No se pudo sincronizar suscripciones con Supabase; "
-                "el bot conservará el respaldo local."
+                "se conservará el respaldo local (diagnóstico=%s).",
+                SUPABASE_SUBSCRIPTIONS_ERROR
+                or "la sincronización no informó un detalle adicional",
             )
     elif SUPABASE_URL or SUPABASE_SECRET_KEY:
+        SUPABASE_SUBSCRIPTIONS_STATUS = "incomplete"
+        SUPABASE_SUBSCRIPTIONS_ERROR = (
+            "Falta SUPABASE_URL o SUPABASE_SECRET_KEY en el entorno de Render."
+        )
         app.logger.warning(
-            "La configuración de Supabase está incompleta; faltan variables de entorno."
+            "La configuración de Supabase está incompleta; "
+            "verifica las variables requeridas en Render."
         )
     elif os.environ.get("BOT_DATA_DIR", "").strip():
         app.logger.info(

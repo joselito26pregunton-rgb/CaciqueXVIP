@@ -3093,12 +3093,46 @@ def obtener_teclado_cuadritos():
         resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True,
+        selective=False,
         input_field_placeholder="Selecciona una acción... 🏹",
     )
     markup.row(types.KeyboardButton("🏠 /start"), types.KeyboardButton("🏹 /menu"))
     markup.row(types.KeyboardButton("📜 /reglas"), types.KeyboardButton("🚀 /compartir"))
     markup.row(types.KeyboardButton("👤 /admin"), types.KeyboardButton("🔥 /vchat"))
     return markup
+
+
+GROUP_KEYBOARD_LOCK = threading.RLock()
+
+
+def publicar_teclado_grupo(chat_id):
+    """Refresh the shared group keyboard while retaining one anchor message."""
+    chat_key = str(int(chat_id))
+    with GROUP_KEYBOARD_LOCK:
+        cfg = cargar_config()
+        group = cfg.setdefault("group_settings", {}).setdefault(chat_key, {})
+        previous_id = group.get("reply_keyboard_message_id")
+        mensaje = bot.send_message(
+            int(chat_id),
+            "🔱 Atajos del grupo",
+            reply_markup=obtener_teclado_cuadritos(),
+            disable_notification=True,
+        )
+        group["reply_keyboard_message_id"] = mensaje.message_id
+        try:
+            guardar_config(cfg)
+        except Exception:
+            app.logger.exception(
+                "No se pudo guardar el ancla del teclado del grupo %s.",
+                chat_key,
+            )
+        if previous_id and str(previous_id) != str(mensaje.message_id):
+            try:
+                bot.delete_message(int(chat_id), int(previous_id))
+            except Exception:
+                pass
+        return mensaje
+
 
 def obtener_emoji_link(url):
     url = url.lower()
@@ -12313,11 +12347,7 @@ def cb_destkeyboard_send(c):
         bot.answer_callback_query(c.id, "La barra de comandos solo se publica en grupos.")
         return
     try:
-        bot.send_message(
-            int(destino["chat_id"]),
-            "🏹 Accesos rápidos disponibles para el grupo:",
-            reply_markup=obtener_teclado_cuadritos(),
-        )
+        publicar_teclado_grupo(int(destino["chat_id"]))
         bot.answer_callback_query(c.id, "Botonera publicada.")
         mostrar_menu_botones_publicaciones(
             c.message.chat.id,
@@ -15534,6 +15564,38 @@ def registrar_miembro_suscripcion_goldpass(update):
         _procesar_ingreso_vip_individual(update, usuario.id)
 
 
+@bot.chat_member_handler()
+def actualizar_teclado_al_entrar_miembro(update):
+    chat = getattr(update, "chat", None)
+    if (
+        not chat
+        or getattr(chat, "type", None) not in ("group", "supergroup")
+        or not es_grupo_autorizado(chat.id)
+    ):
+        return
+    nuevo = getattr(update, "new_chat_member", None)
+    anterior = getattr(update, "old_chat_member", None)
+    usuario = getattr(nuevo, "user", None)
+    if not usuario or getattr(usuario, "is_bot", False):
+        return
+    estado_nuevo = getattr(nuevo, "status", "")
+    estado_anterior = getattr(anterior, "status", "")
+    if (
+        estado_nuevo not in ("member", "administrator")
+        or estado_anterior not in ("left", "kicked")
+    ):
+        return
+    try:
+        publicar_teclado_grupo(chat.id)
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo actualizar el teclado tras entrar un miembro "
+            "(clase=%s, código=%s).",
+            type(error).__name__,
+            getattr(error, "error_code", "n/a"),
+        )
+
+
 @bot.my_chat_member_handler()
 def guardian_autorizacion(update):
     chat = getattr(update, "chat", None)
@@ -15600,11 +15662,7 @@ def guardian_autorizacion(update):
             return
         if tipo_chat in ("group", "supergroup"):
             try:
-                bot.send_message(
-                    chat_id,
-                    "🔱 Bot conectado. Accesos rápidos:",
-                    reply_markup=obtener_teclado_cuadritos(),
-                )
+                publicar_teclado_grupo(chat_id)
             except Exception as error:
                 app.logger.warning(
                     "No se pudo publicar la botonera inicial del grupo "
@@ -15754,6 +15812,15 @@ def enviar_menu_miembro(chat_id):
 def group_menu_command(message):
     if message.chat.type in ("group", "supergroup"):
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        try:
+            publicar_teclado_grupo(message.chat.id)
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo actualizar el teclado al abrir /menu "
+                "(clase=%s, código=%s).",
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
     enviar_menu_miembro(message.chat.id)
 
 
@@ -16361,6 +16428,25 @@ def proceso_obtener_usuario_reporte(message):
 
 
 if __name__ == "__main__":
+    try:
+        bot.set_my_commands(
+            commands=[
+                types.BotCommand("start", "Abrir acceso y métodos de pago"),
+                types.BotCommand("menu", "Acciones de la comunidad"),
+                types.BotCommand("reglas", "Ver el reglamento"),
+                types.BotCommand("compartir", "Invitar a la comunidad"),
+                types.BotCommand("admin", "Contactar al administrador"),
+                types.BotCommand("vchat", "Abrir la guía del videochat"),
+            ],
+            scope=types.BotCommandScopeAllGroupChats(),
+        )
+    except Exception as error:
+        app.logger.warning(
+            "No se pudieron registrar los comandos de grupo "
+            "(clase=%s, código=%s).",
+            type(error).__name__,
+            getattr(error, "error_code", "n/a"),
+        )
     if _supabase_configurado():
         app.logger.info(
             "Supabase está configurado para conservar los ajustes de fotos "

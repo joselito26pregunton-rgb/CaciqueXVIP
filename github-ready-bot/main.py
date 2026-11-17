@@ -2506,6 +2506,7 @@ def guardar_metodo_pago(metodo, texto, reemplazar_indice=None):
         elif not isinstance(opciones, list):
             opciones = []
         opciones = [opcion for opcion in opciones if isinstance(opcion, str) and opcion.strip()]
+        cantidad_anterior = len(opciones)
         if (
             isinstance(reemplazar_indice, int)
             and 0 <= reemplazar_indice < len(opciones)
@@ -2514,6 +2515,23 @@ def guardar_metodo_pago(metodo, texto, reemplazar_indice=None):
         else:
             opciones.append(texto)
         datos[grupo][metodo] = opciones
+        if metodo == "pago_pm":
+            etiquetas_por_metodo = datos.setdefault("etiquetas_botones", {})
+            etiquetas = etiquetas_por_metodo.get(metodo, [])
+            if not isinstance(etiquetas, list):
+                etiquetas = []
+            while len(etiquetas) < len(opciones):
+                etiquetas.append("")
+            etiquetas_por_metodo[metodo] = etiquetas[: len(opciones)]
+            visibilidad_por_metodo = datos.setdefault("opciones_visibles", {})
+            visibilidad = visibilidad_por_metodo.get(metodo, [])
+            if not isinstance(visibilidad, list):
+                visibilidad = []
+            while len(visibilidad) < cantidad_anterior:
+                visibilidad.append(True)
+            if len(opciones) > cantidad_anterior:
+                visibilidad.append(False)
+            visibilidad_por_metodo[metodo] = visibilidad[: len(opciones)]
 
     actualizar_config_pagos(actualizar)
 
@@ -2943,14 +2961,115 @@ def _opciones_guardadas_pago(metodo):
     return [opcion for opcion in opciones if isinstance(opcion, str) and opcion.strip()]
 
 
+def _etiqueta_pago_movil(indice, texto_opcion=None):
+    config_pagos = cargar_config_pagos()
+    etiquetas = config_pagos.get("etiquetas_botones", {}).get("pago_pm", [])
+    if isinstance(etiquetas, list) and 0 <= indice < len(etiquetas):
+        etiqueta = etiquetas[indice]
+        if isinstance(etiqueta, str) and etiqueta.strip():
+            return re.sub(
+                r"\bbanca\s+amiga\b",
+                "Bancamiga",
+                etiqueta.strip(),
+                flags=re.IGNORECASE,
+            )
+    if texto_opcion is None:
+        opciones = _opciones_guardadas_pago("pago_pm")
+        texto_opcion = opciones[indice] if 0 <= indice < len(opciones) else ""
+    normalizado = str(texto_opcion).casefold()
+    if "0102" in normalizado or "venezuela" in normalizado:
+        return "🇻🇪 Banco de Venezuela"
+    if any(token in normalizado for token in ("0172", "bancamiga", "banca amiga")):
+        return "🏦 Bancamiga"
+    return f"🇻🇪 Opción {indice + 1}"
+
+
+def _opcion_pago_movil_visible(indice):
+    opciones = _opciones_guardadas_pago("pago_pm")
+    if not 0 <= indice < len(opciones):
+        return False
+    visibilidad = cargar_config_pagos().get("opciones_visibles", {}).get(
+        "pago_pm", []
+    )
+    if not isinstance(visibilidad, list) or indice >= len(visibilidad):
+        return True
+    return bool(visibilidad[indice])
+
+
+def guardar_visibilidad_pago_movil(indice, visible):
+    def actualizar(datos):
+        opciones = datos.setdefault("metodos", {}).get("pago_pm", [])
+        if isinstance(opciones, str):
+            opciones = [opciones] if opciones.strip() else []
+        if not isinstance(opciones, list) or not 0 <= indice < len(opciones):
+            raise ValueError("Esa opción de Pago Móvil ya no está disponible.")
+        ajustes_visibilidad = datos.setdefault("opciones_visibles", {})
+        visibilidad = ajustes_visibilidad.get("pago_pm", [])
+        if not isinstance(visibilidad, list):
+            visibilidad = []
+        while len(visibilidad) < len(opciones):
+            visibilidad.append(True)
+        visibilidad[indice] = bool(visible)
+        ajustes_visibilidad["pago_pm"] = visibilidad[: len(opciones)]
+
+    actualizar_config_pagos(actualizar)
+
+
+def guardar_etiqueta_pago_movil(indice, etiqueta):
+    etiqueta = re.sub(
+        r"\bbanca\s+amiga\b",
+        "Bancamiga",
+        str(etiqueta).strip(),
+        flags=re.IGNORECASE,
+    )
+
+    def actualizar(datos):
+        opciones = datos.setdefault("metodos", {}).get("pago_pm", [])
+        if isinstance(opciones, str):
+            opciones = [opciones] if opciones.strip() else []
+        if not isinstance(opciones, list) or not 0 <= indice < len(opciones):
+            raise ValueError("Esa opción de Pago Móvil ya no está disponible.")
+        etiquetas_por_metodo = datos.setdefault("etiquetas_botones", {})
+        etiquetas = etiquetas_por_metodo.get("pago_pm", [])
+        if not isinstance(etiquetas, list):
+            etiquetas = []
+        while len(etiquetas) < len(opciones):
+            etiquetas.append("")
+        etiquetas[indice] = etiqueta
+        etiquetas_por_metodo["pago_pm"] = etiquetas
+
+    actualizar_config_pagos(actualizar)
+
+
 def markup_opciones_metodo_pago(metodo):
     markup = types.InlineKeyboardMarkup(row_width=1)
-    cantidad = len(_opciones_guardadas_pago(metodo))
+    opciones = _opciones_guardadas_pago(metodo)
+    cantidad = len(opciones)
     for indice in range(cantidad):
-        markup.add(types.InlineKeyboardButton(
-            f"✏️ Actualizar opción {indice + 1}",
+        actualizar = types.InlineKeyboardButton(
+            f"✏️ Datos {indice + 1}",
             callback_data=f"admin_pagos_actualizar|{metodo}|{indice}",
-        ))
+        )
+        if metodo == "pago_pm":
+            markup.row(
+                actualizar,
+                types.InlineKeyboardButton(
+                    f"🏷️ Nombre {indice + 1}",
+                    callback_data=f"admin_pagos_nombre|{indice}",
+                ),
+            )
+            visible = _opcion_pago_movil_visible(indice)
+            markup.add(types.InlineKeyboardButton(
+                "👁️ Ocultar botón al usuario"
+                if visible
+                else "➕ Mostrar botón al usuario",
+                callback_data=f"admin_pagos_visibilidad|{indice}|{int(not visible)}",
+            ))
+        else:
+            markup.add(types.InlineKeyboardButton(
+                f"✏️ Actualizar opción {indice + 1}",
+                callback_data=f"admin_pagos_actualizar|{metodo}|{indice}",
+            ))
     markup.add(
         types.InlineKeyboardButton(
             "➕ Agregar otro pago",
@@ -3904,6 +4023,121 @@ def mostrar_opciones_metodo_pago(
     )
 
 
+def _markup_preguntar_nombre_pago_movil(indice):
+    return types.InlineKeyboardMarkup(row_width=1).add(
+        types.InlineKeyboardButton(
+            "🏷️ Configurar nombre del botón",
+            callback_data=f"admin_pagos_nombre|{indice}",
+        ),
+        types.InlineKeyboardButton(
+            "✅ Mantener nombre y volver",
+            callback_data=f"admin_pagos_nombre_cancelar|{indice}",
+        ),
+    )
+
+
+def _mostrar_prompt_nombre_pago_movil(
+    chat_id, indice, message=None, message_id=None, aviso=None
+):
+    opciones = _opciones_guardadas_pago("pago_pm")
+    if not 0 <= indice < len(opciones):
+        return mostrar_opciones_metodo_pago(
+            chat_id,
+            "pago_pm",
+            message=message,
+            message_id=message_id,
+            aviso="Esa opción de Pago Móvil ya no existe.",
+        )
+    actual = _etiqueta_pago_movil(indice, opciones[indice])
+    texto = (
+        "🏷️ <b>Nombre del botón de Pago Móvil</b>\n\n"
+        "Este texto aparecerá como botón para que el usuario elija el banco. "
+        "Puedes cambiarlo sin modificar los datos de pago.\n\n"
+        f"Nombre actual: <b>{html.escape(actual)}</b>\n\n"
+        "Envía el nuevo nombre en un mensaje. Máximo 48 caracteres."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n{texto}"
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                "🔙 Volver sin cambiar",
+                callback_data=f"admin_pagos_nombre_cancelar|{indice}",
+            )
+        ),
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def _mostrar_pregunta_nombre_pago_movil(
+    chat_id, indice, message_id=None, aviso=None
+):
+    opciones = _opciones_guardadas_pago("pago_pm")
+    if not 0 <= indice < len(opciones):
+        return mostrar_opciones_metodo_pago(
+            chat_id,
+            "pago_pm",
+            message_id=message_id,
+            aviso="Los datos se guardaron, pero la opción ya no está disponible.",
+        )
+    actual = _etiqueta_pago_movil(indice, opciones[indice])
+    texto = (
+        "✅ <b>Información de Pago Móvil guardada.</b>\n\n"
+        f"El usuario verá el botón <b>{html.escape(actual)}</b>. "
+        "¿Quieres cambiar el nombre que aparece en ese botón?"
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        _markup_preguntar_nombre_pago_movil(indice),
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def _mostrar_pregunta_agregar_boton_pago_movil(
+    chat_id, indice, message_id=None
+):
+    opciones = _opciones_guardadas_pago("pago_pm")
+    if not 0 <= indice < len(opciones):
+        return mostrar_opciones_metodo_pago(
+            chat_id,
+            "pago_pm",
+            message_id=message_id,
+            aviso="Los datos se guardaron, pero la opción ya no está disponible.",
+        )
+    etiqueta = _etiqueta_pago_movil(indice, opciones[indice])
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "➕ Agregar botón para usuarios",
+            callback_data=f"admin_pagos_visibilidad|{indice}|1",
+        ),
+        types.InlineKeyboardButton(
+            "⏸️ No agregar botón ahora",
+            callback_data=f"admin_pagos_visibilidad|{indice}|0",
+        ),
+    )
+    return editar_o_enviar_panel(
+        chat_id,
+        "✅ <b>Información de Pago Móvil guardada.</b>\n\n"
+        f"¿Quieres que el usuario vea un botón nuevo para esta opción? "
+        f"El nombre sugerido es <b>{html.escape(etiqueta)}</b>.",
+        markup,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
 def _estado_persistencia_admin():
     if _supabase_configurado():
         if SUPABASE_SETTINGS_STATUS == "connected":
@@ -4843,6 +5077,101 @@ def admin_editar_metodo_pago(call):
         metodo,
         message=call.message,
     )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_pagos_nombre|")
+)
+def admin_configurar_nombre_pago_movil(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        indice = int(call.data.split("|", 1)[1])
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Opción no válida.")
+        return
+    opciones = _opciones_guardadas_pago("pago_pm")
+    if not 0 <= indice < len(opciones):
+        bot.answer_callback_query(call.id, "Esa opción ya no existe.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_nombre_boton_pago",
+        "metodo_pago": "pago_pm",
+        "indice_boton": indice,
+        "panel_message_id": call.message.message_id,
+    }
+    _mostrar_prompt_nombre_pago_movil(
+        call.message.chat.id,
+        indice,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_pagos_nombre_cancelar|")
+)
+def admin_cancelar_nombre_pago_movil(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        indice = int(call.data.split("|", 1)[1])
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Opción no válida.")
+        return
+    admin_estado.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id)
+    mostrar_opciones_metodo_pago(
+        call.message.chat.id,
+        "pago_pm",
+        message=call.message,
+        aviso="Se mantuvo el nombre actual del botón.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_pagos_visibilidad|")
+)
+def admin_cambiar_visibilidad_pago_movil(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, raw_indice, raw_visible = call.data.split("|", 2)
+        indice = int(raw_indice)
+        visible = raw_visible == "1"
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Opción no válida.")
+        return
+    if raw_visible not in ("0", "1"):
+        bot.answer_callback_query(call.id, "Opción no válida.")
+        return
+    try:
+        guardar_visibilidad_pago_movil(indice, visible)
+    except ValueError as error:
+        bot.answer_callback_query(call.id, str(error), show_alert=True)
+        return
+    admin_estado.pop(call.from_user.id, None)
+    bot.answer_callback_query(
+        call.id,
+        "Botón visible para usuarios." if visible else "Botón oculto para usuarios.",
+    )
+    if visible:
+        _mostrar_pregunta_nombre_pago_movil(
+            call.message.chat.id,
+            indice,
+            message_id=call.message.message_id,
+            aviso="El botón quedó visible para los usuarios.",
+        )
+    else:
+        mostrar_opciones_metodo_pago(
+            call.message.chat.id,
+            "pago_pm",
+            message=call.message,
+            aviso="La opción se conserva, pero su botón quedó oculto.",
+        )
 
 
 @bot.callback_query_handler(
@@ -6800,14 +7129,8 @@ def solicitud_pago_visa_mc(call):
 def _opciones_pago_movil_nombradas():
     salida = []
     for indice, texto in enumerate(_opciones_guardadas_pago("pago_pm")):
-        normalizado = texto.lower()
-        if "0102" in normalizado or "venezuela" in normalizado:
-            banco = "🇻🇪 Banco de Venezuela"
-        elif "0172" in normalizado or "bancamiga" in normalizado or "banca amiga" in normalizado:
-            banco = "🏦 Banca Amiga"
-        else:
-            banco = f"🇻🇪 Opción {indice + 1}"
-        salida.append((indice, banco))
+        if _opcion_pago_movil_visible(indice):
+            salida.append((indice, _etiqueta_pago_movil(indice, texto)))
     return salida
 
 
@@ -9802,6 +10125,66 @@ def _iniciar_inicio_pago(chat_id, user_id, payload=""):
     return _mostrar_selector_idioma_pago(chat_id)
 
 
+def _iniciar_inicio_pago_con_recuperacion(chat_id, user_id, payload=""):
+    try:
+        resultado = _iniciar_inicio_pago(chat_id, user_id, payload)
+        if resultado is not None:
+            return resultado
+        error_principal = RuntimeError("el panel de inicio no se pudo enviar")
+    except Exception as error:
+        error_principal = error
+        app.logger.exception(
+            "Falló la respuesta de /start; se reconstruirá el panel privado."
+        )
+
+    try:
+        chat_key = str(int(chat_id))
+    except (TypeError, ValueError):
+        return None
+    with PANEL_LOCK:
+        anterior = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
+    if anterior and anterior.get("message_id"):
+        try:
+            bot.delete_message(chat_id, int(anterior["message_id"]))
+        except Exception:
+            pass
+    with PANEL_LOCK:
+        PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == chat_key)
+
+    language = PAYMENT_USER_LANGUAGE.get(int(user_id), "es")
+    fallback = {
+        "es": "👑 Pulsa /start para volver a abrir el menú de acceso.",
+        "en": "👑 Tap /start to reopen the access menu.",
+        "pt": "👑 Toque em /start para abrir novamente o menu de acesso.",
+        "it": "👑 Premi /start per riaprire il menu di accesso.",
+    }.get(language, "👑 Pulsa /start para volver a abrir el menú de acceso.")
+    try:
+        sent = _SEND_MESSAGE_ORIGINAL(
+            chat_id,
+            fallback,
+            parse_mode=None,
+            protect_content=True,
+        )
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.upsert(
+                {
+                    "chat_id": chat_key,
+                    "message_id": sent.message_id,
+                    "tipo": "texto",
+                    "protect_content": True,
+                },
+                PANEL_QUERY.chat_id == chat_key,
+            )
+        return sent
+    except Exception as error_respaldo:
+        app.logger.warning(
+            "No se pudo responder a /start ni reconstruir el panel (principal=%s, respaldo=%s).",
+            type(error_principal).__name__,
+            type(error_respaldo).__name__,
+        )
+        return None
+
+
 def _enviar_bienvenida_inicio_pago(chat_id, user_id, language, text):
     text = _garantizar_llamada_boton_bienvenida(text, language)
     markup = _markup_confirmar_metodos_pago(user_id, language)
@@ -10133,7 +10516,7 @@ def start_payment(message):
     if message.chat.type != "private":
         return
     start_payload = payload[1].strip() if len(payload) > 1 else ""
-    _iniciar_inicio_pago(chat_id, uid, start_payload)
+    _iniciar_inicio_pago_con_recuperacion(chat_id, uid, start_payload)
     if str(uid) == str(ADMIN_ID):
         try:
             asegurar_teclado_admin_privado(chat_id)
@@ -10206,6 +10589,16 @@ def flujo_admin_pago(message):
                 message.chat.id,
                 message_id=state.get("panel_message_id"),
                 aviso="No se guardaron cambios.",
+            )
+            return
+        if paso == "esperando_nombre_boton_pago":
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_opciones_metodo_pago(
+                message.chat.id,
+                "pago_pm",
+                message_id=state.get("panel_message_id"),
+                aviso="Se mantuvo el nombre anterior.",
             )
             return
         admin_estado.pop(message.from_user.id,None); eliminar_mensaje_seguro(message.chat.id,message.message_id)
@@ -10403,6 +10796,12 @@ def flujo_admin_pago(message):
             admin_estado.pop(message.from_user.id,None)
             eliminar_mensaje_seguro(message.chat.id,message.message_id); mostrar_opciones_metodo_pago(message.chat.id,metodo,message_id=state.get("panel_message_id"),aviso="Texto vacío o demasiado largo; pulsa «Agregar otro pago» para reintentarlo."); return
         indice_reemplazo = state.get("reemplazar_indice")
+        opciones_anteriores = _opciones_guardadas_pago(metodo)
+        indice_guardado = (
+            indice_reemplazo
+            if isinstance(indice_reemplazo, int)
+            else len(opciones_anteriores)
+        )
         guardar_metodo_pago(metodo, text, indice_reemplazo)
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
         admin_estado.pop(message.from_user.id, None)
@@ -10411,11 +10810,73 @@ def flujo_admin_pago(message):
             if isinstance(indice_reemplazo, int)
             else "Opción agregada."
         )
+        if metodo == "pago_pm":
+            if isinstance(indice_reemplazo, int):
+                _mostrar_pregunta_nombre_pago_movil(
+                    message.chat.id,
+                    indice_guardado,
+                    message_id=state.get("panel_message_id"),
+                    aviso=aviso,
+                )
+            else:
+                _mostrar_pregunta_agregar_boton_pago_movil(
+                    message.chat.id,
+                    indice_guardado,
+                    message_id=state.get("panel_message_id"),
+                )
+            return
         mostrar_opciones_metodo_pago(
             message.chat.id,
             metodo,
             message_id=state.get("panel_message_id"),
             aviso=aviso,
+        )
+        return
+    if paso == "esperando_nombre_boton_pago":
+        metodo = state.get("metodo_pago")
+        indice = state.get("indice_boton")
+        if metodo != "pago_pm" or not isinstance(indice, int):
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_lista_metodos_pago(message.chat.id)
+            return
+        if not text or len(text) > 48:
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            markup = types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "🔙 Volver sin cambiar",
+                    callback_data=f"admin_pagos_nombre_cancelar|{indice}",
+                )
+            )
+            editar_o_enviar_panel(
+                message.chat.id,
+                "El nombre debe tener entre 1 y 48 caracteres. "
+                "Envía otro nombre o pulsa Volver.",
+                markup,
+                message_id=state.get("panel_message_id"),
+                protect_content=True,
+                forzar_texto=True,
+            )
+            return
+        try:
+            guardar_etiqueta_pago_movil(indice, text)
+        except Exception:
+            app.logger.exception("No se pudo guardar el nombre del botón de Pago Móvil.")
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            _mostrar_prompt_nombre_pago_movil(
+                message.chat.id,
+                indice,
+                message_id=state.get("panel_message_id"),
+                aviso="No se pudo guardar; el nombre anterior se mantiene.",
+            )
+            return
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_opciones_metodo_pago(
+            message.chat.id,
+            "pago_pm",
+            message_id=state.get("panel_message_id"),
+            aviso="Nombre del botón actualizado.",
         )
         return
     if paso=="esperando_link_pago":
@@ -10948,7 +11409,12 @@ def registrar_miembro_suscripcion_goldpass(update):
 
 @bot.my_chat_member_handler()
 def guardian_autorizacion(update):
-    chat=update.chat; new=getattr(update.new_chat_member,"status","")
+    chat = update.chat
+    # Private-chat membership updates include users blocking/unblocking the bot.
+    # They are not group/channel invitations and must never trigger guardian logic.
+    if getattr(chat, "type", None) == "private":
+        return
+    new=getattr(update.new_chat_member,"status","")
     if new not in ("member","administrator"): return
     actor=getattr(update,"from_user",None)
     if actor and str(actor.id)==str(ADMIN_ID):
@@ -11176,7 +11642,11 @@ def motor_principal(message):
         elif message.chat.type == "private":
             partes_start = message.text.split(maxsplit=1)
             payload_start = partes_start[1].strip() if len(partes_start) > 1 else ""
-            _iniciar_inicio_pago(chat_id, uid, payload_start)
+            _iniciar_inicio_pago_con_recuperacion(
+                chat_id,
+                uid,
+                payload_start,
+            )
             if str(uid) == str(ADMIN_ID):
                 try:
                     asegurar_teclado_admin_privado(chat_id)

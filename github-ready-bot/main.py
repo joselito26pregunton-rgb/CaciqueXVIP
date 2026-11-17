@@ -413,8 +413,16 @@ def telegram_webhook():
         return "Unauthorized", 403
     if not request.is_json:
         return "Expected JSON", 415
-    update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-    bot.process_new_updates([update])
+    try:
+        update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+        message = getattr(update, "message", None)
+        texto = getattr(message, "text", "") if message else ""
+        if texto and texto.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/start":
+            app.logger.warning("Diagnóstico: el webhook recibió un comando /start.")
+        bot.process_new_updates([update])
+    except Exception:
+        app.logger.exception("No se pudo procesar una actualización del webhook de Telegram.")
+        return "Update processing failed", 500
     return "OK", 200
 
 
@@ -3147,17 +3155,135 @@ def _guardar_archivo_suscripcion(
                 "comprobante_fecha": comprobante.get("received_at")
                 or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+        else:
+            for campo in (
+                "comprobante_file_id",
+                "comprobante_tipo",
+                "comprobante_fecha",
+                "receipt_file_id",
+            ):
+                if registro.get(campo):
+                    guardado[campo] = registro[campo]
         SUSCRIPCIONES_ARCHIVO.upsert(guardado, Query().id == user_id)
         return guardado
 
 
+def _normalizar_suscripcion_legacy(registro):
+    """Reconoce solo filas de suscripción del archivo anterior, no datos de grupo."""
+    if not isinstance(registro, dict):
+        return None
+    try:
+        user_id = int(registro.get("id"))
+    except (TypeError, ValueError):
+        return None
+    if user_id <= 0:
+        return None
+
+    vence = registro.get("vence")
+    if not _parsear_fecha_suscripcion(vence):
+        for campo in ("expires_at", "expiry", "expiration", "fecha_expiracion"):
+            candidato = registro.get(campo)
+            if _parsear_fecha_suscripcion(candidato):
+                vence = candidato
+                break
+    tipo_origen = str(
+        registro.get("tipo")
+        or registro.get("subscription_type")
+        or registro.get("tipo_suscripcion")
+        or ""
+    ).strip().lower()
+    tiene_marca_pago = bool(
+        _parsear_fecha_suscripcion(vence)
+        or registro.get("metodo_pago")
+        or registro.get("payment_method")
+        or registro.get("comprobante_file_id")
+        or registro.get("receipt_file_id")
+        or registro.get("subscription_id")
+        or registro.get("suscripcion_id")
+        or registro.get("joined_at")
+        or registro.get("fecha_entrada")
+        or registro.get("fecha_ingreso")
+        or registro.get("in_channel") is True
+        or tipo_origen in {
+            "paid",
+            "pagada",
+            "goldpass",
+            "goldpass vip",
+            "vip",
+            "suscripcion",
+            "suscripción",
+        }
+    )
+    if not tiene_marca_pago:
+        return None
+
+    normalizado = {
+        "id": user_id,
+        "username": registro.get("username") or registro.get("usuario") or "",
+        "vence": str(vence or ""),
+        "metodo_pago": registro.get("metodo_pago") or registro.get("payment_method") or "",
+    }
+    fecha_entrada = (
+        registro.get("joined_at")
+        or registro.get("fecha_entrada")
+        or registro.get("fecha_ingreso")
+    )
+    if fecha_entrada:
+        normalizado["joined_at"] = str(fecha_entrada)
+    if "in_channel" in registro:
+        normalizado["in_channel"] = bool(registro.get("in_channel"))
+    for campo in (
+        "comprobante_file_id",
+        "comprobante_tipo",
+        "comprobante_fecha",
+        "receipt_file_id",
+    ):
+        if registro.get(campo):
+            normalizado[campo] = registro[campo]
+    return normalizado
+
+
 def _sincronizar_suscripciones_pagadas():
-    # La tabla principal de usuarios.json es la fuente de verdad de los accesos
-    # pagados; copiar todos los usuarios con ID evita ocultar registros antiguos
-    # que todavía no tengan fecha de vencimiento normalizada.
+    # Migra filas pagadas válidas del archivo anterior antes de la fuente actual.
+    # Así, si un ID aparece en ambos, prevalece el registro vigente de usuarios.json.
+    try:
+        registros_legacy = group_db.all()
+    except json.JSONDecodeError:
+        registros_legacy = []
+    except Exception as error:
+        registros_legacy = []
+        app.logger.warning(
+            "No se pudo leer la base anterior de suscripciones (error=%s).",
+            type(error).__name__,
+        )
+    for registro in registros_legacy:
+        normalizado = _normalizar_suscripcion_legacy(registro)
+        if normalizado:
+            _guardar_archivo_suscripcion(normalizado)
+
+    # La tabla principal de usuarios.json es la fuente actual; copiar todos los
+    # usuarios con ID evita ocultar registros que aún no tengan fecha normalizada.
     for registro in db.all():
         if isinstance(registro, dict) and registro.get("id"):
             _guardar_archivo_suscripcion(registro)
+
+
+def _estado_panel_suscripcion(registro, ahora):
+    vence = _parsear_fecha_suscripcion(registro.get("vence"))
+    estado_original = registro.get("status") or registro.get("estado")
+    if estado_original == "pending":
+        estado = "pendiente"
+    elif estado_original in ("kick_pending", "expiry_pending", "expiring"):
+        estado = "expirando"
+    elif not vence:
+        estado = "sin_fecha"
+    elif vence > ahora:
+        estado = "activo"
+    else:
+        estado = "vencido"
+    registro["estado_panel"] = estado
+    registro["_vence_dt"] = vence or datetime.min
+    return registro
 
 
 def _lista_suscripciones_admin():
@@ -3180,19 +3306,7 @@ def _lista_suscripciones_admin():
 
     ahora = datetime.now()
     for registro in registros:
-        vence = _parsear_fecha_suscripcion(registro.get("vence"))
-        estado_original = registro.get("status") or registro.get("estado")
-        if estado_original == "pending":
-            registro["estado_panel"] = "pendiente"
-        elif estado_original in ("kick_pending", "expiry_pending", "expiring"):
-            registro["estado_panel"] = "expirando"
-        elif not vence:
-            registro["estado_panel"] = "sin_fecha"
-        elif vence and vence > ahora:
-            registro["estado_panel"] = "activo"
-        else:
-            registro["estado_panel"] = "vencido"
-        registro["_vence_dt"] = vence or datetime.min
+        _estado_panel_suscripcion(registro, ahora)
     prioridad_estado = {
         "activo": 0,
         "pendiente": 1,
@@ -3200,6 +3314,55 @@ def _lista_suscripciones_admin():
         "sin_fecha": 3,
         "vencido": 4,
     }
+    por_usuario = {}
+    for registro in registros:
+        try:
+            user_id = int(registro.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if user_id <= 0:
+            continue
+        vencimiento = registro.get("_vence_dt") or datetime.min
+        numero_vencimiento = (
+            vencimiento.toordinal() * 86400
+            + vencimiento.hour * 3600
+            + vencimiento.minute * 60
+            + vencimiento.second
+        )
+        clave = (
+            prioridad_estado.get(registro.get("estado_panel"), 5),
+            -numero_vencimiento,
+            0 if registro.get("tipo") == "paid" else 1,
+        )
+        anterior = por_usuario.get(user_id)
+        if not anterior or clave < anterior[0]:
+            elegido = dict(registro)
+            otro = anterior[1] if anterior else None
+            if otro:
+                for campo in (
+                    "username",
+                    "metodo_pago",
+                    "comprobante_file_id",
+                    "comprobante_tipo",
+                    "comprobante_fecha",
+                    "receipt_file_id",
+                ):
+                    if not elegido.get(campo) and otro.get(campo):
+                        elegido[campo] = otro[campo]
+            por_usuario[user_id] = (clave, elegido)
+        elif anterior:
+            elegido = anterior[1]
+            for campo in (
+                "username",
+                "metodo_pago",
+                "comprobante_file_id",
+                "comprobante_tipo",
+                "comprobante_fecha",
+                "receipt_file_id",
+            ):
+                if not elegido.get(campo) and registro.get(campo):
+                    elegido[campo] = registro[campo]
+    registros = [item[1] for item in por_usuario.values()]
     registros.sort(
         key=lambda item: (
             prioridad_estado.get(item.get("estado_panel"), 5),
@@ -3215,7 +3378,23 @@ def _obtener_suscripcion_admin(tipo, user_id):
     user_id = int(user_id)
     if tipo == "free":
         registro = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
-        return dict(registro) if registro else None
+        if not registro:
+            return None
+        actual = dict(registro)
+        _sincronizar_suscripciones_pagadas()
+        pagada = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
+        if pagada:
+            for campo in (
+                "username",
+                "metodo_pago",
+                "comprobante_file_id",
+                "comprobante_tipo",
+                "comprobante_fecha",
+                "receipt_file_id",
+            ):
+                if not actual.get(campo) and pagada.get(campo):
+                    actual[campo] = pagada[campo]
+        return actual
     if tipo != "paid":
         return None
     _sincronizar_suscripciones_pagadas()
@@ -10125,7 +10304,28 @@ def _iniciar_inicio_pago(chat_id, user_id, payload=""):
     return _mostrar_selector_idioma_pago(chat_id)
 
 
+def _descartar_panel_privado_antes_de_start(chat_id):
+    """Quita el panel anterior para que el nuevo /start aparezca al final del chat."""
+    try:
+        chat_key = str(int(chat_id))
+    except (TypeError, ValueError):
+        return
+    with PANEL_LOCK:
+        anterior = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
+    if anterior and anterior.get("message_id"):
+        try:
+            bot.delete_message(chat_id, int(anterior["message_id"]))
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo borrar el panel anterior al iniciar de nuevo (error=%s).",
+                type(error).__name__,
+            )
+    with PANEL_LOCK:
+        PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == chat_key)
+
+
 def _iniciar_inicio_pago_con_recuperacion(chat_id, user_id, payload=""):
+    _descartar_panel_privado_antes_de_start(chat_id)
     try:
         resultado = _iniciar_inicio_pago(chat_id, user_id, payload)
         if resultado is not None:
@@ -10516,7 +10716,14 @@ def start_payment(message):
     if message.chat.type != "private":
         return
     start_payload = payload[1].strip() if len(payload) > 1 else ""
-    _iniciar_inicio_pago_con_recuperacion(chat_id, uid, start_payload)
+    app.logger.warning("Diagnóstico: el manejador privado de /start se ejecutó.")
+    resultado = _iniciar_inicio_pago_con_recuperacion(
+        chat_id, uid, start_payload
+    )
+    if resultado is None:
+        app.logger.warning("El manejador de /start no pudo enviar una respuesta.")
+    else:
+        app.logger.warning("Diagnóstico: el manejador de /start completó el envío.")
     if str(uid) == str(ADMIN_ID):
         try:
             asegurar_teclado_admin_privado(chat_id)
@@ -12153,6 +12360,7 @@ if __name__ == "__main__":
     mode=os.environ.get("BOT_MODE","webhook").strip().lower()
     port=int(os.environ.get("PORT","10000"))
     if mode=="polling":
+        app.logger.warning("Modo de recepción polling iniciado.")
         bot.delete_webhook(drop_pending_updates=False)
         threading.Thread(target=lambda: bot.infinity_polling(skip_pending=False,allowed_updates=WEBHOOK_ALLOWED_UPDATES),daemon=True).start()
     elif mode=="webhook":
@@ -12160,5 +12368,6 @@ if __name__ == "__main__":
         if not base: raise RuntimeError("Falta RENDER_EXTERNAL_URL o WEBHOOK_URL para registrar el webhook.")
         if not bot.set_webhook(url=base+WEBHOOK_PATH,secret_token=WEBHOOK_SECRET,allowed_updates=WEBHOOK_ALLOWED_UPDATES):
             raise RuntimeError("Telegram no aceptó el registro del webhook.")
+        app.logger.warning("Webhook de Telegram registrado; actualizaciones de mensajes habilitadas.")
     else: raise RuntimeError("BOT_MODE debe ser webhook o polling.")
     app.run(host="0.0.0.0",port=port,threaded=True,use_reloader=False)

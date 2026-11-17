@@ -52,6 +52,7 @@ GROUP_ADMIN_CONTACT_URL = "https://t.me/Ja2610X"
 CANAL_INVITE_LINK = "https://t.me/+U7Kk_sC9pToxZjIx"
 LINK_GRUPO = "https://t.me/+DT-eLLYZ0g8wNmMx"
 LINK_CANAL_GRATUITO = "https://t.me/+c6gutVsBfRw4YWUx"
+ONLYFANS_URL = "https://onlyfans.com/joseale1"
 VIDEOCHAT_INVITE_URLS = {
     "cxhotgochat": "https://t.me/CXHOTGOChat?videochat=a627e2ca16ca8e697d",
 }
@@ -73,11 +74,82 @@ WEBHOOK_ALLOWED_UPDATES = [
 app = Flask(__name__)
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown", skip_pending=False)
 _send_original = bot.send_message
+_send_photo_original = bot.send_photo
+_send_video_original = bot.send_video
+_send_document_original = bot.send_document
+_send_audio_original = bot.send_audio
+
+
+def _chat_privado_panelizable(chat_id, kwargs):
+    """No intercepta grupos/canales ni mensajes enviados en nombre de Business."""
+    if kwargs.get("business_connection_id") or kwargs.get("reply_to_message_id"):
+        return False
+    try:
+        return int(chat_id) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _send_compat(*args, **kwargs):
+    """Mantiene las respuestas privadas de texto en el panel activo del chat."""
     kwargs.pop("_force_new_message", None)
-    return _send_original(*args, **kwargs)
+    chat_id = args[0] if args else kwargs.get("chat_id")
+    text = args[1] if len(args) > 1 else kwargs.get("text")
+    if text is None or not _chat_privado_panelizable(chat_id, kwargs):
+        return _send_original(*args, **kwargs)
+    return editar_o_enviar_panel(
+        chat_id,
+        text,
+        reply_markup=kwargs.get("reply_markup"),
+        protect_content=bool(kwargs.get("protect_content", False)),
+        parse_mode=kwargs.get("parse_mode", getattr(bot, "parse_mode", "Markdown")),
+        disable_web_page_preview=bool(
+            kwargs.get("disable_web_page_preview", True)
+        ),
+    )
+
+
+def _send_media_compat(sender, media_type, *args, **kwargs):
+    """Reemplaza el panel privado por una sola pieza multimedia activa."""
+    chat_id = args[0] if args else kwargs.get("chat_id")
+    media = args[1] if len(args) > 1 else kwargs.get(media_type)
+    if media is None or not _chat_privado_panelizable(chat_id, kwargs):
+        return sender(*args, **kwargs)
+    return editar_o_enviar_media_panel(
+        chat_id,
+        media_type,
+        media,
+        caption=kwargs.get("caption"),
+        reply_markup=kwargs.get("reply_markup"),
+        protect_content=bool(kwargs.get("protect_content", False)),
+        parse_mode=kwargs.get("parse_mode", getattr(bot, "parse_mode", "Markdown")),
+        sender=sender,
+    )
+
+
+def _send_photo_compat(*args, **kwargs):
+    return _send_media_compat(_send_photo_original, "photo", *args, **kwargs)
+
+
+def _send_video_compat(*args, **kwargs):
+    return _send_media_compat(_send_video_original, "video", *args, **kwargs)
+
+
+def _send_document_compat(*args, **kwargs):
+    return _send_media_compat(_send_document_original, "document", *args, **kwargs)
+
+
+def _send_audio_compat(*args, **kwargs):
+    return _send_media_compat(_send_audio_original, "audio", *args, **kwargs)
+
+
 bot.send_message = _send_compat
-_SEND_MESSAGE_ORIGINAL = bot.send_message
+bot.send_photo = _send_photo_compat
+bot.send_video = _send_video_compat
+bot.send_document = _send_document_compat
+bot.send_audio = _send_audio_compat
+# Panel helpers must always use the unwrapped API methods to avoid recursion.
+_SEND_MESSAGE_ORIGINAL = _send_original
 
 
 def _editar_compat(original):
@@ -125,6 +197,7 @@ SUPABASE_SETTINGS_SEED_ATTEMPTED = False
 SUPABASE_START_CONFIG_KEYS = (
     "payment_start_photo_file_id",
     "payment_start_welcome_instructions",
+    "payment_goldpass_offer_instructions",
 )
 SUPABASE_PAYMENT_CONFIG_KEY = "payment_menu_photo_file_id"
 db = TinyDB(_state_path("usuarios.json"))
@@ -190,8 +263,12 @@ PAYMENT_MENU_COPY = {
         "express": "🎟️ <b>¡HAY UN PASE EXPRÉS GRATUITO DISPONIBLE!</b> 🎟️",
         "choose_express": "Pulsa abajo para elegir un método o activar el <b>Pase Exprés gratuito</b> 👆",
         "confirm": "💳 Ver métodos de pago",
+        "free_club": "🔱FreeClub CX Hub🔱",
+        "offer_yes": "✅ Sí, continuar",
+        "offer_no": "⏳ No, quizás más tarde",
+        "onlyfans": "💙 Ver OnlyFans",
         "welcome_fallback": "¡Ey, bienvenido! Soy Cacique X. ¿Te gustaría conocer un poco más de mí? Cuéntame qué te interesa y conversamos.",
-        "welcome_cta": "Cuando quieras ver las opciones, pulsa el botón de abajo y te muestro los métodos de pago.",
+        "welcome_cta": "Cuando quieras, pulsa uno de los botones de abajo: conoce el Gold Pass o entra gratis a 🔱FreeClub CX Hub🔱.",
         "reply_fallback": "Se me trabó la conexión un momento, pero aquí sigo. Cuéntame un poco más o, cuando quieras, pulsa el botón para ver las opciones.",
     },
     "en": {
@@ -201,8 +278,12 @@ PAYMENT_MENU_COPY = {
         "express": "🎟️ <b>A FREE EXPRESS PASS IS AVAILABLE!</b> 🎟️",
         "choose_express": "Tap below to choose a payment method or claim the <b>free Express Pass</b> 👆",
         "confirm": "💳 Show payment methods",
+        "free_club": "🔱FreeClub CX Hub🔱",
+        "offer_yes": "✅ Yes, continue",
+        "offer_no": "⏳ No, maybe later",
+        "onlyfans": "💙 Visit OnlyFans",
         "welcome_fallback": "Hey, welcome! I’m Cacique X. Want to get to know me a little better? Tell me what you’re curious about and we can chat.",
-        "welcome_cta": "Whenever you’re ready, tap the button below to see the available payment methods.",
+        "welcome_cta": "Whenever you’re ready, tap one of the buttons below to learn about Gold Pass or join 🔱FreeClub CX Hub🔱 for free.",
         "reply_fallback": "My connection glitched for a moment, but I’m still here. Tell me a little more, or tap the button whenever you want to see the options.",
     },
     "pt": {
@@ -212,8 +293,12 @@ PAYMENT_MENU_COPY = {
         "express": "🎟️ <b>HÁ UM PASSE EXPRESSO GRÁTIS DISPONÍVEL!</b> 🎟️",
         "choose_express": "Toque abaixo para escolher uma forma de pagamento ou ativar o <b>Passe Expresso grátis</b> 👆",
         "confirm": "💳 Ver formas de pagamento",
+        "free_club": "🔱FreeClub CX Hub🔱",
+        "offer_yes": "✅ Sim, continuar",
+        "offer_no": "⏳ Não, talvez depois",
+        "onlyfans": "💙 Ver OnlyFans",
         "welcome_fallback": "Ei, seja bem-vindo! Sou o Cacique X. Quer me conhecer um pouco melhor? Me conta o que você quer saber e a gente conversa.",
-        "welcome_cta": "Quando quiser ver as opções, toque no botão abaixo para conferir as formas de pagamento.",
+        "welcome_cta": "Quando quiser, toque em um dos botões abaixo para conhecer o Gold Pass ou entrar grátis no 🔱FreeClub CX Hub🔱.",
         "reply_fallback": "Minha conexão deu uma falhada, mas continuo por aqui. Me conta mais um pouco ou toque no botão quando quiser ver as opções.",
     },
     "it": {
@@ -223,10 +308,40 @@ PAYMENT_MENU_COPY = {
         "express": "🎟️ <b>È DISPONIBILE UN PASS EXPRESS GRATUITO!</b> 🎟️",
         "choose_express": "Tocca qui sotto per scegliere un metodo o attivare il <b>Pass Express gratuito</b> 👆",
         "confirm": "💳 Mostra i metodi di pagamento",
+        "free_club": "🔱FreeClub CX Hub🔱",
+        "offer_yes": "✅ Sì, continua",
+        "offer_no": "⏳ No, magari più tardi",
+        "onlyfans": "💙 Vai su OnlyFans",
         "welcome_fallback": "Ehi, benvenuto! Sono Cacique X. Ti va di conoscermi un po’ meglio? Dimmi cosa ti incuriosisce e facciamo due chiacchiere.",
-        "welcome_cta": "Quando vuoi vedere le opzioni, premi il pulsante qui sotto per scoprire i metodi di pagamento.",
+        "welcome_cta": "Quando vuoi, premi uno dei pulsanti qui sotto per conoscere il Gold Pass o entrare gratis nel 🔱FreeClub CX Hub🔱.",
         "reply_fallback": "La connessione si è bloccata un attimo, ma sono ancora qui. Raccontami qualcosa in più oppure premi il pulsante quando vuoi vedere le opzioni.",
     },
+}
+
+GOLDPASS_OFFER_FACTS = {
+    "es": (
+        "🎟️ Gold Pass mensual: $2 USD. El canal privado es nuevo y su catálogo "
+        "todavía está creciendo. Encontrarás fragmentos de contenido adulto explícito "
+        "y sin censura, de unos 2–3 minutos, tomados de videos más largos. "
+        "Las versiones completas están en OnlyFans."
+    ),
+    "en": (
+        "🎟️ Gold Pass is $2 USD per month. The private channel is new, so its catalog "
+        "is still growing. It features uncensored explicit adult-content clips, around "
+        "2–3 minutes long, taken from longer videos. Full versions are on OnlyFans."
+    ),
+    "pt": (
+        "🎟️ O Gold Pass custa US$ 2 por mês. O canal privado é novo e o catálogo ainda "
+        "está crescendo. Você encontrará trechos explícitos e sem censura de conteúdo "
+        "adulto, com cerca de 2–3 minutos, extraídos de vídeos mais longos. "
+        "As versões completas estão no OnlyFans."
+    ),
+    "it": (
+        "🎟️ Il Gold Pass costa 2 USD al mese. Il canale privato è nuovo e il catalogo "
+        "sta ancora crescendo. Troverai clip esplicite e senza censure di contenuti "
+        "per adulti, di circa 2–3 minuti, tratte da video più lunghi. "
+        "Le versioni complete sono su OnlyFans."
+    ),
 }
 PAYMENT_CHAT_SESSIONS = {}
 PAYMENT_USER_LANGUAGE = {}
@@ -1025,8 +1140,9 @@ def _generar_respuesta_chat_pago(language, history, texto_usuario=None, inicio=F
                     "cálida y breve, preséntate en primera persona como Cacique X, "
                     "pregunta con naturalidad si le gustaría conocerte un poco más y "
                     "abre una conversación relajada. No menciones precios ni solicites "
-                    "un pago; al final indica con naturalidad que puede tocar el botón "
-                    "de abajo para ver los métodos disponibles cuando quiera."
+                    "un pago; al final invítala con naturalidad a usar el botón para "
+                    "conocer el Gold Pass o el botón Free Club para entrar al canal "
+                    "gratuito."
                 )
             }],
         }]
@@ -1143,12 +1259,125 @@ def _generar_respuesta_chat_pago(language, history, texto_usuario=None, inicio=F
     return reply[:450], parsed.get("ready_for_payment") is True, contents
 
 
+def _gemini_texto_breve(language, system_instruction, user_prompt, max_tokens=160):
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("falta GEMINI_API_KEY")
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    body = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.8,
+        },
+    }
+    model = urllib.parse.quote(GEMINI_MODEL, safe="-_.")
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    for intento in range(2):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=GEMINI_TIMEOUT_SECONDS
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            if error.code == 503 and intento == 0:
+                time.sleep(1)
+                continue
+            raise RuntimeError(f"Gemini HTTP {error.code}") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            reason = getattr(error, "reason", None)
+            error_kind = (
+                type(reason).__name__ if reason is not None else type(error).__name__
+            )
+            raise RuntimeError(f"Gemini conexión ({error_kind})") from None
+
+    candidates = result.get("candidates") or []
+    parts = (
+        candidates[0].get("content", {}).get("parts", [])
+        if candidates and isinstance(candidates[0], dict)
+        else []
+    )
+    text = " ".join(
+        part.get("text", "").strip()
+        for part in parts
+        if isinstance(part, dict) and part.get("text", "").strip()
+    ).strip()
+    text = re.sub(r"^```(?:text)?\s*|\s*```$", "", text, flags=re.I).strip()
+    if (
+        len(text) < 12
+        or len(text) > 450
+        or re.search(r"https?://|t\.me/|@\w+", text, re.I)
+    ):
+        raise RuntimeError("Gemini devolvió un texto breve no válido")
+    return text
+
+
+def _generar_intro_oferta_goldpass(language):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    config = cargar_config()
+    instrucciones = (
+        config.get("payment_goldpass_offer_instructions", "") or ""
+    ).strip()[:600]
+    system_instruction = (
+        "Escribes la introducción de una oferta para un creador adulto de contenido. "
+        f"Usa {PAYMENT_LANGUAGES[language]} con tono cálido, coloquial, atractivo y "
+        "respetuoso; no suenes corporativo ni uses descripciones sexuales gráficas. "
+        "Escribe solo 1 o 2 frases breves que presenten la información que aparecerá "
+        "debajo y animen a elegir un botón. No escribas precios, URLs, usernames ni "
+        "métodos de pago. No inventes condiciones o reglas. El precio, los datos del "
+        "contenido y las opciones están fijados por el bot."
+    )
+    if instrucciones:
+        system_instruction += (
+            "\nOrientación adicional del administrador: "
+            f"{instrucciones}\n"
+            "Úsala solo para el tono o para expresar condiciones que el administrador "
+            "haya proporcionado; no contradigas los datos fijados por el bot."
+        )
+    prompt = (
+        "Presenta de forma natural el Gold Pass y di que puede revisar la información "
+        "y continuar si le interesa. El texto fijo de la oferta se añadirá debajo. "
+        "No repitas ni inventes detalles."
+    )
+    return _gemini_texto_breve(
+        language, system_instruction, prompt, max_tokens=120
+    )
+
+
+def _generar_respuesta_no_goldpass(language):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    system_instruction = (
+        "Eres Cacique X, un creador adulto, y respondes con calidez, tono coloquial "
+        f"y sin presión en {PAYMENT_LANGUAGES[language]}. La persona indicó que quizá "
+        "lo dejará para más tarde. Agradécele y dile brevemente que puede conocer el "
+        "canal gratuito usando los botones. No intentes convencerla de pagar, no "
+        "menciones precios ni inventes enlaces o condiciones. Escribe solo 1 o 2 frases."
+    )
+    prompt = (
+        "Responde con naturalidad a «No, quizás más tarde». Hazle saber que no hay "
+        "prisa y que puede visitar Free Club si le apetece."
+    )
+    return _gemini_texto_breve(
+        language, system_instruction, prompt, max_tokens=100
+    )
+
+
 def _mensaje_menciona_boton(language, text):
     patrones = {
         "es": r"\b(?:pulsa|presiona|toca|oprime|elige)\b.{0,70}\b(?:bot[oó]n|abajo|debajo)\b",
         "en": r"\b(?:tap|press|click|choose|pick)\b.{0,70}\b(?:button|below)\b",
         "pt": r"\b(?:toque|clique|pressione|escolha)\b.{0,70}\b(?:bot[aã]o|abaixo)\b",
-        "it": r"\b(?:premi|tocca|clicca|scegli)\b.{0,70}\b(?:pulsante|qui sotto|sotto)\b",
+        "it": r"\b(?:premi|tocca|clicca|scegli)\b.{0,70}\b(?:pulsant[ei]|qui sotto|sotto)\b",
     }
     return bool(
         re.search(patrones.get(language, patrones["es"]), text or "", re.I)
@@ -1987,65 +2216,144 @@ def editar_o_enviar_panel(
             )
     return nuevo
 
+def editar_o_enviar_media_panel(
+    chat_id,
+    media_type,
+    media,
+    caption=None,
+    reply_markup=None,
+    protect_content=False,
+    parse_mode="HTML",
+    sender=None,
+):
+    """Conserva un único mensaje activo al cambiar texto o multimedia."""
+    sender = sender or {
+        "photo": _send_photo_original,
+        "video": _send_video_original,
+        "document": _send_document_original,
+        "audio": _send_audio_original,
+    }.get(media_type)
+    if sender is None:
+        raise ValueError(f"Tipo de multimedia de panel no admitido: {media_type}")
+
+    try:
+        chat_key = str(int(chat_id))
+    except (TypeError, ValueError):
+        return sender(
+            chat_id,
+            media,
+            caption=caption,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+            protect_content=protect_content,
+        )
+
+    with PANEL_LOCK:
+        registro = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
+    message_id = registro.get("message_id") if registro else None
+    tipo_previo = (registro or {}).get("tipo", "")
+    tipo_previo = "photo" if tipo_previo == "foto" else tipo_previo
+
+    if (
+        registro
+        and message_id
+        and protect_content
+        and not registro.get("protect_content")
+    ):
+        try:
+            bot.delete_message(chat_id, int(message_id))
+        except Exception:
+            pass
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == chat_key)
+        registro = None
+        message_id = None
+        tipo_previo = ""
+
+    if registro and message_id and tipo_previo == media_type:
+        input_media_cls = {
+            "photo": types.InputMediaPhoto,
+            "video": types.InputMediaVideo,
+            "document": types.InputMediaDocument,
+            "audio": types.InputMediaAudio,
+        }[media_type]
+        try:
+            input_media = input_media_cls(
+                media=media,
+                caption=caption or "",
+                parse_mode=parse_mode,
+            )
+            actualizado = bot.edit_message_media(
+                input_media,
+                chat_id=chat_id,
+                message_id=int(message_id),
+                reply_markup=reply_markup,
+            )
+            with PANEL_LOCK:
+                PANELES_PRIVADOS.upsert(
+                    {
+                        "chat_id": chat_key,
+                        "message_id": int(message_id),
+                        "tipo": media_type,
+                        "protect_content": bool(
+                            protect_content or registro.get("protect_content")
+                        ),
+                    },
+                    PANEL_QUERY.chat_id == chat_key,
+                )
+            return actualizado
+        except Exception as error:
+            if "message is not modified" in str(error).lower():
+                return SimpleNamespace(message_id=int(message_id))
+            app.logger.info(
+                "No se pudo editar la multimedia del panel privado %s; "
+                "se reemplazará.",
+                message_id,
+            )
+
+    if registro and message_id:
+        try:
+            bot.delete_message(chat_id, int(message_id))
+        except Exception:
+            pass
+        with PANEL_LOCK:
+            PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == chat_key)
+
+    nuevo = sender(
+        chat_id,
+        media,
+        caption=caption,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+        protect_content=protect_content,
+    )
+    with PANEL_LOCK:
+        PANELES_PRIVADOS.upsert(
+            {
+                "chat_id": chat_key,
+                "message_id": nuevo.message_id,
+                "tipo": media_type,
+                "protect_content": bool(protect_content),
+            },
+            PANEL_QUERY.chat_id == chat_key,
+        )
+    return nuevo
+
+
 def enviar_foto_panel(
     chat_id, photo, caption, reply_markup=None, forzar_reemplazo=False
 ):
-    registro = None
-    if int(chat_id) > 0:
-        with PANEL_LOCK:
-            registro = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == str(chat_id))
-
-    if registro:
-        message_id = registro.get("message_id")
-        if registro.get("tipo") == "foto" and not forzar_reemplazo:
-            try:
-                actualizado = bot.edit_message_caption(
-                    caption=caption,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                )
-                if int(chat_id) > 0:
-                    with PANEL_LOCK:
-                        PANELES_PRIVADOS.upsert(
-                            {
-                                "chat_id": str(chat_id),
-                                "message_id": message_id,
-                                "tipo": "foto",
-                                "protect_content": True,
-                            },
-                            PANEL_QUERY.chat_id == str(chat_id),
-                        )
-                return actualizado
-            except Exception as error:
-                if "message is not modified" in str(error).lower():
-                    return None
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception:
-            pass
-
-    nuevo = bot.send_photo(
+    return editar_o_enviar_media_panel(
         chat_id,
+        "photo",
         photo,
         caption=caption,
         reply_markup=reply_markup,
-        parse_mode="HTML",
         protect_content=True,
+        parse_mode="HTML",
+        sender=_send_photo_original,
     )
-    if int(chat_id) > 0:
-        with PANEL_LOCK:
-            PANELES_PRIVADOS.upsert(
-                {
-                    "chat_id": str(chat_id),
-                    "message_id": nuevo.message_id,
-                    "tipo": "foto",
-                    "protect_content": True,
-                },
-                PANEL_QUERY.chat_id == str(chat_id),
-            )
-    return nuevo
+
 
 def eliminar_mensaje_disparador(message):
     try:
@@ -2543,7 +2851,6 @@ def mostrar_metodos_pago(chat_id, aviso=None, language=None):
                 photo_id,
                 texto,
                 markup,
-                forzar_reemplazo=True,
             )
         except Exception:
             app.logger.exception("No se pudo cargar la portada configurada de pagos.")
@@ -2555,7 +2862,6 @@ def mostrar_metodos_pago(chat_id, aviso=None, language=None):
                 photo,
                 texto,
                 markup,
-                forzar_reemplazo=True,
             )
     except OSError:
         return editar_o_enviar_panel(
@@ -3690,7 +3996,11 @@ def _foto_bienvenida_inicio_pago():
     return None
 
 
-def _markup_admin_bienvenida_inicio_pago(foto_personalizada, hay_instrucciones):
+def _markup_admin_bienvenida_inicio_pago(
+    foto_personalizada,
+    hay_instrucciones,
+    hay_instrucciones_oferta=False,
+):
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton(
@@ -3704,6 +4014,16 @@ def _markup_admin_bienvenida_inicio_pago(foto_personalizada, hay_instrucciones):
     )
     markup.add(
         types.InlineKeyboardButton(
+            "✍️ Estilo de oferta Gold Pass",
+            callback_data="admin_start_offer_instructions",
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa de oferta",
+            callback_data="admin_start_offer_preview",
+        ),
+    )
+    markup.add(
+        types.InlineKeyboardButton(
             "👀 Vista previa en español",
             callback_data="admin_start_welcome_preview",
         )
@@ -3713,6 +4033,13 @@ def _markup_admin_bienvenida_inicio_pago(foto_personalizada, hay_instrucciones):
             types.InlineKeyboardButton(
                 "♻️ Restablecer instrucciones",
                 callback_data="admin_start_welcome_reset",
+            )
+        )
+    if hay_instrucciones_oferta:
+        markup.add(
+            types.InlineKeyboardButton(
+                "♻️ Restablecer oferta Gold Pass",
+                callback_data="admin_start_offer_reset",
             )
         )
     if foto_personalizada:
@@ -3732,42 +4059,63 @@ def _markup_admin_bienvenida_inicio_pago(foto_personalizada, hay_instrucciones):
 
 
 def mostrar_admin_bienvenida_inicio_pago(
-    chat_id, message=None, message_id=None, aviso=None, preview_text=None
+    chat_id,
+    message=None,
+    message_id=None,
+    aviso=None,
+    preview_text=None,
+    preview_label="👀 Vista previa · Español",
 ):
     config = cargar_config()
     instrucciones = (
         config.get("payment_start_welcome_instructions", "") or ""
+    ).strip()
+    instrucciones_oferta = (
+        config.get("payment_goldpass_offer_instructions", "") or ""
     ).strip()
     foto_personalizada = config.get("payment_start_photo_file_id")
     foto = _foto_bienvenida_inicio_pago()
     markup = _markup_admin_bienvenida_inicio_pago(
         bool(foto_personalizada),
         bool(instrucciones),
+        bool(instrucciones_oferta),
     )
     if preview_text is not None:
         caption = (
-            "👀 <b>Vista previa · Español</b>\n\n"
+            f"{html.escape(preview_label)}\n\n"
             f"{html.escape(preview_text)}\n\n"
-            "<i>La bienvenida real se genera en el idioma que elija cada persona; "
-            "el precio y los métodos no se cambian con Gemini.</i>"
+            "<i>La vista previa conserva los botones y el flujo real de acceso. "
+            "Gemini no cambia precios, métodos ni permisos.</i>"
         )
     else:
         estado_foto = "personalizada" if foto_personalizada else "foto original"
         estado_texto = "instrucciones personalizadas" if instrucciones else "estilo predeterminado"
+        estado_oferta = (
+            "instrucciones personalizadas"
+            if instrucciones_oferta
+            else "estilo predeterminado"
+        )
         caption = (
             "👋 <b>Bienvenida del /start</b>\n\n"
             "Esta foto y el estilo de la bienvenida son independientes de la foto "
             "del menú de pagos y del saludo de Telegram Business.\n\n"
             f"Foto: <b>{estado_foto}</b>.\n"
-            f"Texto de Gemini: <b>{estado_texto}</b>.\n"
-            "La respuesta se adapta al idioma elegido y menciona el botón para ver "
-            "los métodos; el precio y el flujo de pago se mantienen fijos.\n\n"
+            f"Saludo de Gemini: <b>{estado_texto}</b>.\n"
+            f"Oferta Gold Pass de Gemini: <b>{estado_oferta}</b>.\n"
+            "La bienvenida incluye Free Club. Antes de mostrar los pagos, el bot "
+            "explica el contenido y espera una confirmación. Los datos fijos y el "
+            "flujo de pago no se pueden cambiar con Gemini.\n\n"
             f"{html.escape(_estado_persistencia_admin())}"
         )
         if instrucciones:
             caption += (
-                "\n\n<b>Instrucciones guardadas:</b>\n"
-                f"{html.escape(instrucciones[:500])}"
+                "\n\n<b>Estilo de bienvenida guardado:</b>\n"
+                f"{html.escape(instrucciones[:300])}"
+            )
+        if instrucciones_oferta:
+            caption += (
+                "\n\n<b>Estilo/condiciones de oferta guardadas:</b>\n"
+                f"{html.escape(instrucciones_oferta[:300])}"
             )
     if aviso:
         caption = f"✅ {html.escape(aviso)}\n\n{caption}"
@@ -3822,6 +4170,30 @@ def _mostrar_prompt_instrucciones_bienvenida_pago(
         "pregunta para iniciar conversación».\n\n"
         "Se aplica solo al saludo inicial: no puede cambiar el idioma elegido, "
         "el precio, los métodos de pago ni el acceso. Máximo 600 caracteres. "
+        "Escribe /cancelar para volver.",
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def _mostrar_prompt_instrucciones_oferta_goldpass(
+    chat_id, message=None, message_id=None
+):
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Volver",
+            callback_data="admin_start_welcome_back",
+        )
+    )
+    return editar_o_enviar_panel(
+        chat_id,
+        "✍️ <b>Estilo y condiciones de la oferta Gold Pass</b>\n\n"
+        "Escribe el tono que quieres que use Gemini o las condiciones reales que "
+        "quieres explicar. El precio ($2 USD al mes), el contenido descrito, los "
+        "botones y el flujo de pagos se mantienen protegidos. Máximo 600 caracteres. "
         "Escribe /cancelar para volver.",
         markup,
         message=message,
@@ -3904,6 +4276,69 @@ def admin_editar_instrucciones_bienvenida(call):
     _mostrar_prompt_instrucciones_bienvenida_pago(
         call.message.chat.id,
         message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_offer_instructions"
+)
+def admin_editar_instrucciones_oferta_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_instrucciones_oferta_goldpass",
+        "panel_message_id": call.message.message_id,
+    }
+    _mostrar_prompt_instrucciones_oferta_goldpass(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_offer_preview"
+)
+def admin_previsualizar_oferta_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id, "Preparando la vista previa…")
+    texto = _texto_oferta_goldpass("es")
+    mostrar_admin_bienvenida_inicio_pago(
+        call.message.chat.id,
+        message=call.message,
+        preview_text=texto,
+        preview_label="👀 Oferta Gold Pass · Español",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_offer_reset"
+)
+def admin_restaurar_instrucciones_oferta_goldpass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        actualizar_config(
+            lambda config: config.update(
+                {"payment_goldpass_offer_instructions": ""}
+            )
+        )
+    except Exception:
+        app.logger.exception(
+            "No se pudieron restablecer las instrucciones de oferta Gold Pass."
+        )
+        bot.answer_callback_query(call.id, "No se pudo guardar.")
+        return
+    admin_estado.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
+    mostrar_admin_bienvenida_inicio_pago(
+        call.message.chat.id,
+        message=call.message,
+        aviso="Instrucciones de oferta restablecidas.",
     )
 
 
@@ -4052,7 +4487,10 @@ def admin_volver_bienvenida_inicio_pago(call):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
     estado = admin_estado.get(call.from_user.id, {})
-    if estado.get("paso") == "esperando_instrucciones_bienvenida_pago":
+    if estado.get("paso") in (
+        "esperando_instrucciones_bienvenida_pago",
+        "esperando_instrucciones_oferta_goldpass",
+    ):
         admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "Edición cancelada.")
     mostrar_admin_config_pagos(
@@ -6309,6 +6747,10 @@ def _procesar_solicitud_link(call, metodo):
         types.InlineKeyboardButton("❌ Rechazar solicitud",
                                    callback_data=f"admin_no_{user_id}"),
     )
+    markup_admin.add(types.InlineKeyboardButton(
+        f"📥 Otras solicitudes ({len(_solicitudes_pago_pendientes()) + 1})",
+        callback_data="admin_payment_queue|0",
+    ))
 
     texto_admin = (
         f"🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n"
@@ -6337,6 +6779,7 @@ def _procesar_solicitud_link(call, metodo):
 
     solicitudes_info[user_id] = {
         'metodo': metodo, 'username': username,
+        'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'request_id': uuid.uuid4().hex,
         'notif_msg_id': notif_msg_id, 'datos_msg_id': None,
         'usuario_chat_id': call.message.chat.id,
@@ -6354,12 +6797,167 @@ def solicitud_pago_visa_mc(call):
     _procesar_solicitud_link(call, "pago_visa_mc")
 
 # ─── Resto de métodos de pago (genérico) ──────────────────────────
+def _opciones_pago_movil_nombradas():
+    salida = []
+    for indice, texto in enumerate(_opciones_guardadas_pago("pago_pm")):
+        normalizado = texto.lower()
+        if "0102" in normalizado or "venezuela" in normalizado:
+            banco = "🇻🇪 Banco de Venezuela"
+        elif "0172" in normalizado or "bancamiga" in normalizado or "banca amiga" in normalizado:
+            banco = "🏦 Banca Amiga"
+        else:
+            banco = f"🇻🇪 Opción {indice + 1}"
+        salida.append((indice, banco))
+    return salida
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "pago_pm")
+def elegir_banco_pago_movil(call):
+    chat = getattr(getattr(call, "message", None), "chat", None)
+    if (
+        getattr(chat, "type", None) != "private"
+        or str(getattr(chat, "id", "")) != str(call.from_user.id)
+    ):
+        bot.answer_callback_query(call.id, "Abre el bot en privado para elegir el banco.")
+        return
+    opciones = _opciones_pago_movil_nombradas()
+    if not opciones:
+        bot.answer_callback_query(call.id, "No hay datos de Pago Móvil configurados.", show_alert=True)
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for indice, banco in opciones:
+        markup.add(types.InlineKeyboardButton(
+            banco,
+            callback_data=f"pago_pm_option|{indice}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a métodos",
+        callback_data="volver_metodos_pago",
+    ))
+    bot.answer_callback_query(call.id)
+    editar_o_enviar_panel(
+        call.message.chat.id,
+        "🇻🇪 <b>Elige tu banco para Pago Móvil:</b>",
+        markup,
+        message=call.message,
+        protect_content=True,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pago_pm_option|"))
+def solicitar_pago_movil_seleccionado(call):
+    try:
+        indice = int(call.data.split("|", 1)[1])
+        opciones = _opciones_pago_movil_nombradas()
+        banco = next(etiqueta for item_indice, etiqueta in opciones if item_indice == indice)
+    except (IndexError, TypeError, ValueError, StopIteration):
+        bot.answer_callback_query(call.id, "Esa opción de banco ya no está disponible.", show_alert=True)
+        return
+    _procesar_solicitud_metodo_pago(call, "pago_pm", indice, banco)
+
+
+def _solicitudes_pago_pendientes():
+    salida = []
+    for user_id, info in solicitudes_info.items():
+        if not isinstance(info, dict) or not info.get("metodo"):
+            continue
+        if info.get("metodo") not in NOMBRE_METODO:
+            continue
+        if not info.get("usuario_chat_id"):
+            continue
+        salida.append((int(user_id), info))
+    salida.sort(key=lambda item: item[1].get("created_at", ""), reverse=True)
+    return salida
+
+
+def _markup_cola_solicitudes_pago():
+    pendientes = _solicitudes_pago_pendientes()
+    if not pendientes:
+        return types.InlineKeyboardMarkup()
+    return types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            f"📥 Solicitudes pendientes ({len(pendientes)})",
+            callback_data="admin_payment_queue|0",
+        )
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_payment_queue|"))
+def ver_cola_solicitudes_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    try:
+        pagina = max(0, int(call.data.split("|", 1)[1]))
+    except (IndexError, TypeError, ValueError):
+        pagina = 0
+    bot.answer_callback_query(call.id)
+    _mostrar_cola_solicitudes_pago(
+        call.message.chat.id,
+        pagina=pagina,
+        message=call.message,
+    )
+
+
+def _mostrar_cola_solicitudes_pago(chat_id, pagina=0, message=None, aviso=None):
+    pendientes = _solicitudes_pago_pendientes()
+    por_pagina = 8
+    paginas = max(1, (len(pendientes) + por_pagina - 1) // por_pagina)
+    pagina = min(pagina, paginas - 1)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    inicio = pagina * por_pagina
+    for user_id, info in pendientes[inicio:inicio + por_pagina]:
+        metodo = str(info.get("metodo") or "")
+        username = str(info.get("username") or "sin_usuario")
+        etiqueta = f"👤 {username} · {NOMBRE_METODO.get(metodo, metodo)}"
+        if info.get("payment_option_label"):
+            etiqueta += f" · {info['payment_option_label']}"
+        markup.add(types.InlineKeyboardButton(
+            etiqueta[:60],
+            callback_data=f"ac_{user_id}_{metodo}",
+        ))
+    navegacion = []
+    if pagina:
+        navegacion.append(types.InlineKeyboardButton("⬅️ Anterior", callback_data=f"admin_payment_queue|{pagina - 1}"))
+    if pagina + 1 < paginas:
+        navegacion.append(types.InlineKeyboardButton("Siguiente ➡️", callback_data=f"admin_payment_queue|{pagina + 1}"))
+    if navegacion:
+        markup.row(*navegacion)
+    markup.add(types.InlineKeyboardButton("🔙 Volver al panel", callback_data="admin_home"))
+    texto = (
+        f"📥 <b>Solicitudes de pago pendientes</b> · página {pagina + 1}/{paginas}\n\n"
+        "Selecciona una solicitud para revisar sus datos."
+        if pendientes
+        else "✅ No hay solicitudes de pago pendientes."
+    )
+    if aviso:
+        texto = f"ℹ️ {html.escape(str(aviso))}\n\n{texto}"
+    editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("pago_"))
 def solicitud_pago(call):
-    metodo   = call.data
+    _procesar_solicitud_metodo_pago(call, call.data)
+
+
+def _procesar_solicitud_metodo_pago(call, metodo, opcion_indice=None, opcion_etiqueta=None):
     user_id  = call.from_user.id
     username = call.from_user.username or "sin_usuario"
     nombre   = call.from_user.first_name or "Usuario"
+    opciones_configuradas = _opciones_guardadas_pago(metodo)
+    opcion_texto = (
+        opciones_configuradas[opcion_indice]
+        if isinstance(opcion_indice, int)
+        and 0 <= opcion_indice < len(opciones_configuradas)
+        else None
+    )
 
     bot.answer_callback_query(call.id)
     solicitudes_pendientes[user_id] = metodo
@@ -6395,6 +6993,10 @@ def solicitud_pago(call):
         types.InlineKeyboardButton("❌ Rechazar solicitud",
                                    callback_data=f"admin_no_{user_id}"),
     )
+    markup_admin.add(types.InlineKeyboardButton(
+        f"📥 Otras solicitudes ({len(_solicitudes_pago_pendientes()) + 1})",
+        callback_data="admin_payment_queue|0",
+    ))
 
     texto_admin = (
         f"🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n"
@@ -6402,6 +7004,10 @@ def solicitud_pago(call):
         f"🆔 ID: <code>{user_id}</code>\n"
         f"📛 Usuario: {'@' + username if tiene_username else '(sin @username)'}\n\n"
         f"💳 Método elegido: <b>{nombre_metodo}</b>"
+        + (
+            f"\n🏦 Banco solicitado: <b>{html.escape(opcion_etiqueta)}</b>"
+            if opcion_etiqueta else ""
+        )
     )
 
     try:
@@ -6428,6 +7034,10 @@ def solicitud_pago(call):
     solicitudes_info[user_id] = {
         'metodo':         metodo,
         'username':       username,
+        'payment_option_index': opcion_indice,
+        'payment_option_label': opcion_etiqueta,
+        'payment_option_data': opcion_texto,
+        'created_at':     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'request_id':     uuid.uuid4().hex,
         'notif_msg_id':   notif_msg_id,
         'datos_msg_id':   None,
@@ -6441,14 +7051,11 @@ def volver_metodos(call):
     bot.answer_callback_query(call.id)
     user_id = call.from_user.id
     solicitudes_pendientes.pop(user_id, None)
-    info = solicitudes_info.pop(user_id, {})
-    # Borrar notificación al admin si existe
-    notif_id = info.get('notif_msg_id')
-    if notif_id:
-        try:
-            bot.delete_message(int(ADMIN_ID), notif_id)
-        except:
-            pass
+    solicitudes_info.pop(user_id, None)
+    _mostrar_cola_solicitudes_pago(
+        int(ADMIN_ID),
+        aviso="El usuario volvió al menú de métodos.",
+    )
     mostrar_metodos_pago(call.message.chat.id)
 
 # ─── Cancelar solicitud: pedir motivo ────────────────────────────
@@ -6490,27 +7097,11 @@ def cancelar_solicitud_razon(call):
     razon = razon_map[call.data]
 
     solicitudes_pendientes.pop(user_id, None)
-    info = solicitudes_info.pop(user_id, {})
+    solicitudes_info.pop(user_id, None)
 
-    # Borrar notificación al admin si existe
-    notif_id = info.get('notif_msg_id')
-    if notif_id:
-        try:
-            bot.delete_message(int(ADMIN_ID), notif_id)
-        except:
-            pass
-
-    # Notificar al admin con el motivo
-    mencion_html   = f'<a href="tg://user?id={user_id}">{nombre}</a>'
-    tiene_username = username != "sin_usuario"
-    bot.send_message(
+    _mostrar_cola_solicitudes_pago(
         int(ADMIN_ID),
-        f"🚫 <b>SOLICITUD CANCELADA</b>\n\n"
-        f"👤 Nombre: {mencion_html}\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"📛 Usuario: {'@' + username if tiene_username else '(sin @username)'}\n\n"
-        f"📋 Razón: <b>{razon}</b>",
-        parse_mode="HTML"
+        aviso=f"El usuario canceló la solicitud: {razon}.",
     )
 
     # Actualizar el panel del usuario con la confirmación.
@@ -6551,80 +7142,151 @@ def admin_crear_enlace_link(call):
     )
 
 # ─── Ver datos para copiar ────────────────────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data.startswith("ac_"))
-def admin_ver_datos(call):
-    if str(call.from_user.id) != str(ADMIN_ID):
-        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
-        return
-    bot.answer_callback_query(call.id)
-
-    partes        = call.data.split("_")
-    user_id       = int(partes[1])
-    metodo        = "_".join(partes[2:])
-    opciones      = _opciones_guardadas_pago(metodo)
+def _mostrar_datos_pago_admin(user_id, metodo, indice=0, message=None):
+    info = solicitudes_info.get(user_id, {})
+    opcion_snapshot = info.get("payment_option_data")
+    opciones = (
+        [opcion_snapshot]
+        if isinstance(opcion_snapshot, str) and opcion_snapshot.strip()
+        else _opciones_guardadas_pago(metodo)
+    )
     nombre_metodo = NOMBRE_METODO.get(metodo, metodo)
     if not opciones:
-        bot.send_message(
+        return editar_o_enviar_panel(
             int(ADMIN_ID),
             f"⚠️ No hay información configurada para {html.escape(nombre_metodo)}. "
             "Ve a /admin → Métodos de pago e imagen para actualizarla.",
-            parse_mode="HTML",
+            _markup_cola_solicitudes_pago(),
+            message=message,
             protect_content=True,
+            forzar_texto=True,
         )
+
+    seleccion = info.get("payment_option_index")
+    if isinstance(opcion_snapshot, str) and opcion_snapshot.strip():
+        seleccion = 0
+        indice = 0
+    elif isinstance(seleccion, int):
+        indice = seleccion
+    indice = max(0, min(int(indice), len(opciones) - 1))
+    datos = texto_pago_con_aviso(opciones[indice])
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    try:
+        partes_copia = agregar_botones_copiar(
+            markup,
+            datos,
+            f"📋 Copiar opción {indice + 1}",
+        )
+    except Exception:
+        partes_copia = 0
+    markup.add(
+        types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
+        types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
+    )
+    if len(opciones) > 1 and not isinstance(seleccion, int):
+        navegacion = []
+        if indice > 0:
+            navegacion.append(types.InlineKeyboardButton(
+                "⬅️ Opción anterior",
+                callback_data=f"admin_payment_option|{user_id}|{indice - 1}",
+            ))
+        if indice + 1 < len(opciones):
+            navegacion.append(types.InlineKeyboardButton(
+                "Siguiente opción ➡️",
+                callback_data=f"admin_payment_option|{user_id}|{indice + 1}",
+            ))
+        if navegacion:
+            markup.row(*navegacion)
+    markup.add(types.InlineKeyboardButton(
+        f"📥 Ver solicitudes pendientes ({len(_solicitudes_pago_pendientes())})",
+        callback_data="admin_payment_queue|0",
+    ))
+    aviso_copia = (
+        "\n\n<i>El texto excede el límite de copia de Telegram; "
+        "copia cada parte y pégala en orden para conservarlo completo.</i>"
+        if partes_copia > 1
+        else ""
+    )
+    etiqueta_opcion = info.get("payment_option_label")
+    encabezado = (
+        f"📋 <b>DATOS — {html.escape(nombre_metodo)} "
+        f"({indice + 1}/{len(opciones)})</b>"
+    )
+    if etiqueta_opcion:
+        encabezado += f"\n🏦 Banco solicitado: <b>{html.escape(etiqueta_opcion)}</b>"
+    texto = (
+        f"{encabezado}\n\n<code>{html.escape(datos)}</code>{aviso_copia}\n\n"
+        f"Solicitud del usuario <code>{user_id}</code>."
+    )
+    panel = editar_o_enviar_panel(
+        int(ADMIN_ID),
+        texto,
+        markup,
+        message=message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+    info["datos_msg_id"] = panel.message_id
+    info["datos_msg_ids"] = [panel.message_id]
+    info["notif_msg_id"] = panel.message_id
+    return panel
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_payment_option|"))
+def admin_cambiar_opcion_datos_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
+    try:
+        _, raw_user_id, raw_index = call.data.split("|", 2)
+        user_id, indice = int(raw_user_id), int(raw_index)
+        info = solicitudes_info[user_id]
+        metodo = info["metodo"]
+    except (ValueError, KeyError, TypeError):
+        bot.answer_callback_query(call.id, "La solicitud ya no está disponible.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _mostrar_datos_pago_admin(
+        user_id,
+        metodo,
+        indice=indice,
+        message=call.message,
+    )
 
-    # Cada opción va en su propio mensaje para que varias cuentas no excedan
-    # el límite de Telegram. Todos los mensajes llevan protección de contenido.
-    ids_mensajes = []
-    for indice, opcion in enumerate(opciones, start=1):
-        datos = texto_pago_con_aviso(opcion)
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        try:
-            partes_copia = agregar_botones_copiar(
-                markup,
-                datos,
-                f"📋 Copiar opción {indice}",
-            )
-        except Exception:
-            partes_copia = 0
-        markup.add(
-            types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
-            types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
-        )
-        aviso_copia = (
-            "\n\n<i>El texto excede el límite de copia de Telegram; "
-            "copia cada parte y pégala en orden para conservar el texto completo.</i>"
-            if partes_copia > 1
-            else ""
-        )
-        datos_msg = bot.send_message(
-            int(ADMIN_ID),
-            f"📋 <b>DATOS — {html.escape(nombre_metodo)} "
-            f"({indice}/{len(opciones)})</b>\n\n"
-            f"<code>{html.escape(datos)}</code>{aviso_copia}",
-            parse_mode="HTML",
-            reply_markup=markup,
-            protect_content=True,
-        )
-        ids_mensajes.append(datos_msg.message_id)
 
-    # Al aprobar/rechazar se retiran todas las opciones mostradas.
-    if user_id in solicitudes_info:
-        solicitudes_info[user_id]["datos_msg_ids"] = ids_mensajes
-        solicitudes_info[user_id]["datos_msg_id"] = ids_mensajes[-1]
-    else:
-        solicitudes_info[user_id] = {
-            'metodo': metodo, 'username': 'sin_usuario',
-            'notif_msg_id': None, 'datos_msg_id': ids_mensajes[-1],
-            'datos_msg_ids': ids_mensajes,
-        }
+@bot.callback_query_handler(func=lambda call: call.data.startswith("ac_"))
+def admin_ver_datos(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        partes = call.data.split("_")
+        user_id = int(partes[1])
+        metodo = "_".join(partes[2:])
+    except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(call.id, "No pude identificar la solicitud.")
+        return
+    bot.answer_callback_query(call.id)
+    _mostrar_datos_pago_admin(
+        user_id,
+        metodo,
+        indice=0,
+        message=call.message,
+    )
 
 
 def borrar_mensajes_datos_pago(info):
     ids = info.get("datos_msg_ids") or []
     if not ids and info.get("datos_msg_id"):
         ids = [info["datos_msg_id"]]
+    with PANEL_LOCK:
+        panel_activo = PANELES_PRIVADOS.get(
+            PANEL_QUERY.chat_id == str(ADMIN_ID)
+        )
+    panel_id = str((panel_activo or {}).get("message_id") or "")
     for message_id in set(ids):
+        if str(message_id) == panel_id:
+            continue
         try:
             bot.delete_message(int(ADMIN_ID), message_id)
         except Exception:
@@ -6736,25 +7398,12 @@ def admin_aprobar(call):
             parse_mode="HTML"
         )
 
-    # Borrar todos los mensajes con opciones de pago del chat del admin.
+    # El panel compartido se reemplaza por la siguiente solicitud pendiente.
     borrar_mensajes_datos_pago(info)
-    try:
-        bot.delete_message(int(ADMIN_ID), call.message.message_id)
-    except Exception:
-        pass
-
-    # Borrar notificación original (en el chat del admin)
-    notif_id = info.get('notif_msg_id')
-    if notif_id:
-        try:
-            bot.delete_message(int(ADMIN_ID), notif_id)
-        except:
-            pass
-
-    bot.send_message(int(ADMIN_ID),
-        "✅ <b>Transacción completada con éxito.</b>\n"
-        f"Usuario <code>{user_id}</code> notificado.",
-        parse_mode="HTML"
+    _mostrar_cola_solicitudes_pago(
+        int(ADMIN_ID),
+        message=call.message,
+        aviso=f"Acceso aprobado; usuario {user_id} fue notificado.",
     )
 
 # ─── Rechazado (desde pantalla de datos) ─────────────────────────
@@ -6782,34 +7431,12 @@ def admin_rechazar_datos(call):
     except Exception as e:
         bot.send_message(int(ADMIN_ID), f"⚠️ No pude notificar al usuario: {e}")
 
-    # Borrar todos los mensajes con opciones de pago del chat del admin.
+    # Mantener el panel y mostrar la siguiente solicitud.
     borrar_mensajes_datos_pago(info)
-    try:
-        bot.delete_message(int(ADMIN_ID), call.message.message_id)
-    except Exception:
-        pass
-
-    # Borrar notificación original (en el chat del admin)
-    notif_id = info.get('notif_msg_id')
-    if notif_id:
-        try:
-            bot.delete_message(int(ADMIN_ID), notif_id)
-        except:
-            pass
-
-    # Borrar mensaje "Solicitud recibida" del chat del usuario
-    u_chat = info.get('usuario_chat_id')
-    u_msg  = info.get('usuario_msg_id')
-    if u_chat and u_msg:
-        try:
-            bot.delete_message(u_chat, u_msg)
-        except:
-            pass
-
-    bot.send_message(int(ADMIN_ID),
-        "❌ <b>Solicitud rechazada.</b>\n"
-        f"Usuario <code>{user_id}</code> notificado.",
-        parse_mode="HTML"
+    _mostrar_cola_solicitudes_pago(
+        int(ADMIN_ID),
+        message=call.message,
+        aviso=f"Solicitud de {user_id} rechazada.",
     )
 
 # ─── Rechazar desde la primera notificación ───────────────────────
@@ -6830,9 +7457,10 @@ def admin_rechazar_notif(call):
             "Por favor, intenta de nuevo más tarde.",
             parse_mode="HTML", protect_content=True
         )
-        bot.edit_message_text(
-            f"❌ <b>Solicitud rechazada</b> — <code>{user_id}</code>",
-            call.message.chat.id, call.message.message_id, parse_mode="HTML"
+        _mostrar_cola_solicitudes_pago(
+            int(ADMIN_ID),
+            message=call.message,
+            aviso=f"Solicitud de {user_id} rechazada.",
         )
     except Exception as e:
         bot.send_message(int(ADMIN_ID), f"❌ Error: {e}")
@@ -7018,6 +7646,31 @@ def teclado_admin_privado():
     )
     k.row(types.KeyboardButton("👤 Consultar usuario", request_users=types.KeyboardButtonRequestUsers(request_id=4103, user_is_bot=False, max_quantity=1, request_name=True, request_username=True)), types.KeyboardButton("❌ Cancelar"))
     return k
+
+
+def asegurar_teclado_admin_privado(chat_id):
+    """Publica una sola vez la botonera fija de administración."""
+    chat_key = str(int(chat_id))
+    with PANEL_LOCK:
+        registro = TECLADOS_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
+    if registro and registro.get("message_id"):
+        return registro["message_id"]
+    mensaje = _send_original(
+        chat_id,
+        "Atajos privados de administración.",
+        reply_markup=teclado_admin_privado(),
+        protect_content=True,
+    )
+    with PANEL_LOCK:
+        TECLADOS_PRIVADOS.upsert(
+            {
+                "chat_id": chat_key,
+                "message_id": mensaje.message_id,
+            },
+            PANEL_QUERY.chat_id == chat_key,
+        )
+    return mensaje.message_id
+
 
 def _grupos_configurados():
     cfg=cargar_config(); out=[]
@@ -8909,8 +9562,8 @@ def recibir_usuario_compartido(message):
 @bot.message_handler(commands=["admin"], func=lambda m: m.chat.type=="private" and str(m.from_user.id)==str(ADMIN_ID))
 def admin_command_private(message):
     if message.chat.type!="private" or str(message.from_user.id)!=str(ADMIN_ID): return
+    asegurar_teclado_admin_privado(message.chat.id)
     mostrar_panel_admin(message.chat.id)
-    bot.send_message(message.chat.id,"Atajos privados disponibles abajo.",reply_markup=teclado_admin_privado(),protect_content=True)
 
 @bot.message_handler(func=lambda m: m.chat.type=="private" and str(m.from_user.id)==str(ADMIN_ID) and m.text in ("⚙️ Grupos y canales","💳 Pagos"),content_types=["text"])
 def admin_shortcuts(message):
@@ -8949,19 +9602,15 @@ def _grupo_reporte_seleccionado(valor=None):
 
 
 def _limpiar_panel_inicio_privado(chat_id):
-    """Descarta el panel anterior para que /start siempre reconstruya el menú."""
+    """Reinicia el flujo sin borrar el único panel visible del chat."""
     try:
         chat_key = str(int(chat_id))
     except (TypeError, ValueError):
         return
-    with PANEL_LOCK:
-        registro = PANELES_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
-        PANELES_PRIVADOS.remove(PANEL_QUERY.chat_id == chat_key)
-    if registro and registro.get("message_id"):
+    with PAYMENT_CHAT_LOCK:
         try:
-            bot.delete_message(int(chat_id), int(registro["message_id"]))
-        except Exception:
-            # El usuario puede haber borrado el historial; el ID viejo ya no sirve.
+            PAYMENT_CHAT_SESSIONS.pop(int(chat_id), None)
+        except (TypeError, ValueError):
             pass
 
 
@@ -8998,11 +9647,107 @@ def _markup_selector_idioma_pago():
 
 def _markup_confirmar_metodos_pago(user_id, language):
     textos = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
-    return types.InlineKeyboardMarkup().add(
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
         types.InlineKeyboardButton(
             textos["confirm"],
-            callback_data=f"payment_methods|{int(user_id)}|{language}",
+            callback_data=f"payment_offer|{int(user_id)}|{language}",
+        ),
+        types.InlineKeyboardButton(
+            textos["free_club"],
+            url=LINK_CANAL_GRATUITO,
+        ),
+    )
+    return markup
+
+
+def _markup_oferta_goldpass(user_id, language):
+    textos = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton(
+            textos["offer_yes"],
+            callback_data=f"payment_offer_yes|{int(user_id)}|{language}",
+        ),
+        types.InlineKeyboardButton(
+            textos["offer_no"],
+            callback_data=f"payment_offer_no|{int(user_id)}|{language}",
+        ),
+    )
+    markup.add(types.InlineKeyboardButton(
+        textos["onlyfans"],
+        url=ONLYFANS_URL,
+    ))
+    return markup
+
+
+def _markup_respuesta_rechazo_goldpass(user_id, language):
+    textos = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        textos["free_club"],
+        url=LINK_CANAL_GRATUITO,
+    ))
+    return markup
+
+
+def _texto_oferta_goldpass(language):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    try:
+        introduccion = _generar_intro_oferta_goldpass(language)
+    except Exception as error:
+        app.logger.warning(
+            "La oferta Gold Pass usó la introducción localizada de respaldo (error=%s).",
+            type(error).__name__,
         )
+        introducciones = {
+            "es": "Te cuento con claridad qué incluye el Gold Pass antes de que decidas.",
+            "en": "Here’s a clear look at what Gold Pass includes before you decide.",
+            "pt": "Vou te explicar direitinho o que o Gold Pass inclui antes de você decidir.",
+            "it": "Ecco cosa include il Gold Pass, così puoi decidere con calma.",
+        }
+        introduccion = introducciones[language]
+    return f"{introduccion}\n\n{GOLDPASS_OFFER_FACTS[language]}"
+
+
+def _mostrar_oferta_goldpass(chat_id, user_id, language, message=None):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    PAYMENT_USER_LANGUAGE[int(user_id)] = language
+    return editar_o_enviar_panel(
+        chat_id,
+        _texto_oferta_goldpass(language),
+        _markup_oferta_goldpass(user_id, language),
+        message=message,
+        protect_content=True,
+        parse_mode=None,
+        forzar_texto=True,
+    )
+
+
+def _mostrar_respuesta_no_goldpass(chat_id, user_id, language, message=None):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    try:
+        texto = _generar_respuesta_no_goldpass(language)
+    except Exception as error:
+        app.logger.warning(
+            "La respuesta de rechazo Gold Pass usó el texto localizado de respaldo (error=%s).",
+            type(error).__name__,
+        )
+        respuestas = {
+            "es": "Tranqui, no hay apuro. Si te provoca, puedes darte una vuelta por Free Club y volver cuando quieras.",
+            "en": "No worries, there’s no rush. Feel free to check out Free Club and come back whenever you like.",
+            "pt": "Tudo bem, sem pressa. Se quiser, dá uma olhada no Free Club e volta quando tiver vontade.",
+            "it": "Tranquillo, non c’è fretta. Se ti va, dai un’occhiata a Free Club e torna quando vuoi.",
+        }
+        texto = respuestas[language]
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        _markup_respuesta_rechazo_goldpass(user_id, language),
+        message=message,
+        protect_content=True,
+        parse_mode=None,
+        forzar_texto=True,
     )
 
 
@@ -9065,31 +9810,27 @@ def _enviar_bienvenida_inicio_pago(chat_id, user_id, language, text):
         try:
             if isinstance(photo, str) and os.path.isfile(photo):
                 with open(photo, "rb") as archivo:
-                    return bot.send_photo(
+                    return enviar_foto_panel(
                         chat_id,
                         archivo,
-                        caption=text,
-                        parse_mode=None,
-                        reply_markup=markup,
-                        protect_content=True,
+                        text,
+                        markup,
                     )
-            return bot.send_photo(
+            return enviar_foto_panel(
                 chat_id,
                 photo,
-                caption=text,
-                parse_mode=None,
-                reply_markup=markup,
-                protect_content=True,
+                text,
+                markup,
             )
         except Exception:
             app.logger.exception(
                 "No se pudo enviar la foto de bienvenida; se enviará solo el texto."
             )
-    return bot.send_message(
+    return editar_o_enviar_panel(
         chat_id,
         text,
+        markup,
         parse_mode=None,
-        reply_markup=markup,
         protect_content=True,
     )
 
@@ -9175,23 +9916,21 @@ def _procesar_mensaje_conversacion_pago(message):
         respuesta = PAYMENT_MENU_COPY.get(
             language, PAYMENT_MENU_COPY["es"]
         )["reply_fallback"]
-        bot.send_message(
+        editar_o_enviar_panel(
             message.chat.id,
             respuesta,
+            _markup_confirmar_metodos_pago(user_id, language),
             parse_mode=None,
-            reply_markup=_markup_confirmar_metodos_pago(user_id, language),
             protect_content=True,
         )
         return True
 
     if listo_para_pago:
         with PAYMENT_CHAT_LOCK:
-            session = PAYMENT_CHAT_SESSIONS.pop(user_id, None)
             PAYMENT_USER_LANGUAGE[user_id] = language
-        _quitar_botones_conversacion_pago(message.chat.id, session)
-        mostrar_metodos_pago(
+        _mostrar_oferta_goldpass(
             message.chat.id,
-            aviso=respuesta,
+            user_id,
             language=language,
         )
         return True
@@ -9204,17 +9943,17 @@ def _procesar_mensaje_conversacion_pago(message):
         if session:
             session["history"] = nuevo_historial[-PAYMENT_CHAT_HISTORY_LIMIT:]
             session["last_activity"] = time.time()
-    sent = bot.send_message(
+    sent = editar_o_enviar_panel(
         message.chat.id,
         respuesta,
+        _markup_confirmar_metodos_pago(user_id, language),
         parse_mode=None,
-        reply_markup=_markup_confirmar_metodos_pago(user_id, language),
         protect_content=True,
     )
     with PAYMENT_CHAT_LOCK:
         session = PAYMENT_CHAT_SESSIONS.get(user_id)
         if session:
-            session.setdefault("message_ids", []).append(sent.message_id)
+            session["message_ids"] = [sent.message_id]
     return True
 
 
@@ -9236,17 +9975,13 @@ def elegir_idioma_pago(call):
         bot.answer_callback_query(call.id, "Ese idioma no está disponible.")
         return
     bot.answer_callback_query(call.id)
-    try:
-        bot.delete_message(chat.id, message.message_id)
-    except Exception:
-        pass
     _iniciar_conversacion_pago(chat.id, call.from_user.id, language)
 
 
 @bot.callback_query_handler(
-    func=lambda call: call.data.startswith("payment_methods|")
+    func=lambda call: call.data.startswith("payment_offer|")
 )
-def confirmar_mostrar_metodos_pago(call):
+def mostrar_oferta_goldpass_callback(call):
     message = getattr(call, "message", None)
     chat = getattr(message, "chat", None)
     try:
@@ -9254,6 +9989,30 @@ def confirmar_mostrar_metodos_pago(call):
         user_id = int(partes[1])
         callback_language = partes[2] if len(partes) > 2 else "es"
     except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(call.id, "No pude validar esta solicitud.")
+        return
+    if (
+        not chat
+        or getattr(chat, "type", None) != "private"
+        or int(chat.id) != int(call.from_user.id)
+        or int(call.from_user.id) != user_id
+    ):
+        bot.answer_callback_query(call.id, "Este botón no corresponde a tu chat.")
+        return
+    bot.answer_callback_query(call.id)
+    _mostrar_oferta_goldpass(chat.id, user_id, callback_language, message=message)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("payment_offer_yes|")
+)
+def confirmar_oferta_goldpass(call):
+    message = getattr(call, "message", None)
+    chat = getattr(message, "chat", None)
+    try:
+        _, raw_user_id, callback_language = call.data.split("|", 2)
+        user_id = int(raw_user_id)
+    except (ValueError, TypeError):
         bot.answer_callback_query(call.id, "No pude validar esta solicitud.")
         return
     if (
@@ -9274,9 +10033,69 @@ def confirmar_mostrar_metodos_pago(call):
             else PAYMENT_USER_LANGUAGE.get(user_id, "es")
         )
         PAYMENT_USER_LANGUAGE[user_id] = language
-    _quitar_botones_conversacion_pago(chat.id, session)
     bot.answer_callback_query(call.id)
     mostrar_metodos_pago(chat.id, language=language)
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("payment_offer_no|")
+)
+def rechazar_oferta_goldpass(call):
+    message = getattr(call, "message", None)
+    chat = getattr(message, "chat", None)
+    try:
+        _, raw_user_id, callback_language = call.data.split("|", 2)
+        user_id = int(raw_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "No pude validar esta solicitud.")
+        return
+    if (
+        not chat
+        or getattr(chat, "type", None) != "private"
+        or int(chat.id) != int(call.from_user.id)
+        or int(call.from_user.id) != user_id
+    ):
+        bot.answer_callback_query(call.id, "Este botón no corresponde a tu chat.")
+        return
+    language = (
+        PAYMENT_CHAT_SESSIONS.get(user_id, {}).get("language")
+        or callback_language
+    )
+    if language not in PAYMENT_LANGUAGES:
+        language = "es"
+    bot.answer_callback_query(call.id)
+    _mostrar_respuesta_no_goldpass(
+        chat.id,
+        user_id,
+        language,
+        message=message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("payment_methods|")
+)
+def confirmar_mostrar_metodos_pago(call):
+    """Legacy button from old welcome cards now leads through the new offer."""
+    message = getattr(call, "message", None)
+    chat = getattr(message, "chat", None)
+    try:
+        partes = call.data.split("|")
+        user_id = int(partes[1])
+        language = partes[2] if len(partes) > 2 else "es"
+    except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(call.id, "No pude validar esta solicitud.")
+        return
+    if (
+        not chat
+        or getattr(chat, "type", None) != "private"
+        or int(chat.id) != int(call.from_user.id)
+        or int(call.from_user.id) != user_id
+    ):
+        bot.answer_callback_query(call.id, "Este botón no corresponde a tu chat.")
+        return
+    bot.answer_callback_query(call.id)
+    _mostrar_oferta_goldpass(chat.id, user_id, language, message=message)
 
 
 @bot.message_handler(commands=["start"])
@@ -9317,12 +10136,7 @@ def start_payment(message):
     _iniciar_inicio_pago(chat_id, uid, start_payload)
     if str(uid) == str(ADMIN_ID):
         try:
-            bot.send_message(
-                chat_id,
-                "Atajos privados de administración.",
-                reply_markup=teclado_admin_privado(),
-                protect_content=True,
-            )
+            asegurar_teclado_admin_privado(chat_id)
         except Exception:
             app.logger.exception("No se pudieron restaurar los atajos del administrador tras /start.")
 
@@ -9373,7 +10187,10 @@ def flujo_admin_pago(message):
                 aviso="Edición cancelada; no se agregó ninguna palabra.",
             )
             return
-        if paso == "esperando_instrucciones_bienvenida_pago":
+        if paso in (
+            "esperando_instrucciones_bienvenida_pago",
+            "esperando_instrucciones_oferta_goldpass",
+        ):
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
             mostrar_admin_bienvenida_inicio_pago(
@@ -9438,6 +10255,38 @@ def flujo_admin_pago(message):
             message.chat.id,
             message_id=state.get("panel_message_id"),
             aviso="Gemini aplicará estas instrucciones al saludo inicial.",
+        )
+        return
+    if paso == "esperando_instrucciones_oferta_goldpass":
+        if not text or len(text) > 600:
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            _mostrar_prompt_instrucciones_oferta_goldpass(
+                message.chat.id,
+                message_id=state.get("panel_message_id"),
+            )
+            return
+        try:
+            actualizar_config(
+                lambda config: config.update(
+                    {"payment_goldpass_offer_instructions": text}
+                )
+            )
+        except Exception:
+            app.logger.exception(
+                "No se pudieron guardar las instrucciones de oferta Gold Pass."
+            )
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            _mostrar_prompt_instrucciones_oferta_goldpass(
+                message.chat.id,
+                message_id=state.get("panel_message_id"),
+            )
+            return
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_admin_bienvenida_inicio_pago(
+            message.chat.id,
+            message_id=state.get("panel_message_id"),
+            aviso="Gemini usará estas instrucciones al explicar el Gold Pass.",
         )
         return
     if paso == "esperando_foto_bienvenida_pago":
@@ -9642,6 +10491,16 @@ def recibir_foto_pago(message):
             if info
             else ""
         )
+        markup_admin = types.InlineKeyboardMarkup(row_width=1)
+        if info and info.get("metodo"):
+            markup_admin.add(types.InlineKeyboardButton(
+                "📋 Revisar datos y comprobante",
+                callback_data=f"ac_{uid}_{info['metodo']}",
+            ))
+        markup_admin.add(types.InlineKeyboardButton(
+            f"📥 Solicitudes pendientes ({len(_solicitudes_pago_pendientes())})",
+            callback_data="admin_payment_queue|0",
+        ))
         bot.send_photo(
             int(ADMIN_ID),
             file_id,
@@ -9651,6 +10510,7 @@ def recibir_foto_pago(message):
                 f"{contexto}"
             ),
             parse_mode="HTML",
+            reply_markup=markup_admin,
             protect_content=True,
         )
         eliminar_mensaje_disparador(message)
@@ -10319,12 +11179,7 @@ def motor_principal(message):
             _iniciar_inicio_pago(chat_id, uid, payload_start)
             if str(uid) == str(ADMIN_ID):
                 try:
-                    bot.send_message(
-                        chat_id,
-                        "Atajos privados de administración.",
-                        reply_markup=teclado_admin_privado(),
-                        protect_content=True,
-                    )
+                    asegurar_teclado_admin_privado(chat_id)
                 except Exception:
                     app.logger.exception("No se pudieron restaurar los atajos del administrador tras /start.")
         return

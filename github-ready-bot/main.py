@@ -189,6 +189,11 @@ SUPABASE_SECRET_KEY = os.environ.get(
 SUPABASE_SETTINGS_TABLE = "bot_persistent_settings"
 SUPABASE_SETTINGS_ROW_KEY = "visual_settings"
 SUPABASE_SETTINGS_CACHE_TTL_SECONDS = 15
+SUPABASE_SUBSCRIPTIONS_TABLE = "bot_subscription_records"
+SUPABASE_SUBSCRIPTIONS_SYNC_TTL_SECONDS = 60
+SUPABASE_SUBSCRIPTIONS_STATUS = "not_checked"
+SUPABASE_SUBSCRIPTIONS_SYNC_AT = 0.0
+SUPABASE_SUBSCRIPTIONS_LOCK = threading.RLock()
 SUPABASE_SETTINGS_LOCK = threading.RLock()
 SUPABASE_SETTINGS_CACHE = None
 SUPABASE_SETTINGS_CACHE_AT = 0.0
@@ -198,6 +203,9 @@ SUPABASE_START_CONFIG_KEYS = (
     "payment_start_photo_file_id",
     "payment_start_welcome_instructions",
     "payment_goldpass_offer_instructions",
+    "payment_start_cta_instructions",
+    "payment_start_freepass_instructions",
+    "payment_start_button_labels",
 )
 SUPABASE_PAYMENT_CONFIG_KEY = "payment_menu_photo_file_id"
 db = TinyDB(_state_path("usuarios.json"))
@@ -317,6 +325,12 @@ PAYMENT_MENU_COPY = {
         "reply_fallback": "La connessione si è bloccata un attimo, ma sono ancora qui. Raccontami qualcosa in più oppure premi il pulsante quando vuoi vedere le opzioni.",
     },
 }
+PAYMENT_USA_MENU_COPY = {
+    "es": "🇺🇸 Cuenta USA — Elige tu forma de pago:",
+    "en": "🇺🇸 US account — Choose your payment method:",
+    "pt": "🇺🇸 Conta dos EUA — Escolha a forma de pagamento:",
+    "it": "🇺🇸 Conto USA — Scegli il metodo di pagamento:",
+}
 
 GOLDPASS_OFFER_FACTS = {
     "es": (
@@ -342,6 +356,215 @@ GOLDPASS_OFFER_FACTS = {
         "per adulti, di circa 2–3 minuti, tratte da video più lunghi. "
         "Le versioni complete sono su OnlyFans."
     ),
+}
+FREEPASS_USER_COPY = {
+    "es": {
+        "pending": (
+            "🎟️🏆 Tu pase gratuito GoldPass está listo.\n\n"
+            "Dura {duration}. El tiempo empieza cuando el bot apruebe tu entrada "
+            "al canal; al terminar, el bot te retirará.\n\n¡Disfrútalo! 🔥"
+        ),
+        "active": (
+            "🎟️🏆 Tu pase gratuito GoldPass está activo.\n\n"
+            "Tu acceso termina el {expiry}; después el bot te retirará del canal. "
+            "¡Disfrútalo! 🔥"
+        ),
+        "available": (
+            "🎟️🏆 Free Gold Pass disponible.\n\n"
+            "Puedes solicitar un acceso gratuito por {duration}. El plazo comienza "
+            "cuando se emite tu enlace; al vencer, el bot te retirará del canal.\n\n"
+            "Pulsa el botón para recibir tu enlace personal. 🔥"
+        ),
+    },
+    "en": {
+        "pending": (
+            "🎟️🏆 Your free Gold Pass is ready.\n\n"
+            "It lasts {duration}. Your time starts when the bot approves your "
+            "channel entry; when it ends, the bot will remove you.\n\nEnjoy it! 🔥"
+        ),
+        "active": (
+            "🎟️🏆 Your free Gold Pass is active.\n\n"
+            "Your access ends on {expiry}; after that, the bot will remove you "
+            "from the channel. Enjoy it! 🔥"
+        ),
+        "available": (
+            "🎟️🏆 Free Gold Pass available.\n\n"
+            "You can request free access for {duration}. The period starts when "
+            "your link is issued; when it expires, the bot will remove you from "
+            "the channel.\n\nTap the button to receive your personal link. 🔥"
+        ),
+    },
+    "pt": {
+        "pending": (
+            "🎟️🏆 Seu Gold Pass gratuito está pronto.\n\n"
+            "Ele dura {duration}. O tempo começa quando o bot aprovar sua entrada "
+            "no canal; quando terminar, o bot vai remover você.\n\nAproveite! 🔥"
+        ),
+        "active": (
+            "🎟️🏆 Seu Gold Pass gratuito está ativo.\n\n"
+            "Seu acesso termina em {expiry}; depois disso, o bot vai remover você "
+            "do canal. Aproveite! 🔥"
+        ),
+        "available": (
+            "🎟️🏆 Free Gold Pass disponível.\n\n"
+            "Você pode solicitar acesso grátis por {duration}. O prazo começa "
+            "quando o link é emitido; ao vencer, o bot vai remover você do canal."
+            "\n\nToque no botão para receber seu link pessoal. 🔥"
+        ),
+    },
+    "it": {
+        "pending": (
+            "🎟️🏆 Il tuo Gold Pass gratuito è pronto.\n\n"
+            "Dura {duration}. Il tempo inizia quando il bot approva il tuo ingresso "
+            "nel canale; alla scadenza il bot ti rimuoverà.\n\nGoditelo! 🔥"
+        ),
+        "active": (
+            "🎟️🏆 Il tuo Gold Pass gratuito è attivo.\n\n"
+            "Il tuo accesso termina il {expiry}; dopo, il bot ti rimuoverà dal "
+            "canale. Goditelo! 🔥"
+        ),
+        "available": (
+            "🎟️🏆 Free Gold Pass disponibile.\n\n"
+            "Puoi richiedere l'accesso gratuito per {duration}. Il periodo inizia "
+            "quando viene emesso il link; alla scadenza il bot ti rimuoverà dal "
+            "canale.\n\nTocca il pulsante per ricevere il tuo link personale. 🔥"
+        ),
+    },
+}
+FREEPASS_DURATION_COPY = {
+    60: {"es": "1 minuto", "en": "1 minute", "pt": "1 minuto", "it": "1 minuto"},
+    300: {"es": "5 minutos", "en": "5 minutes", "pt": "5 minutos", "it": "5 minuti"},
+    600: {"es": "10 minutos", "en": "10 minutes", "pt": "10 minutos", "it": "10 minuti"},
+    86400: {"es": "24 horas", "en": "24 hours", "pt": "24 horas", "it": "24 ore"},
+    259200: {"es": "72 horas", "en": "72 hours", "pt": "72 horas", "it": "72 ore"},
+}
+
+# Etiquetas editables del recorrido /start. El texto fuente se introduce en
+# español y Gemini genera las otras tres traducciones; las acciones de los
+# callbacks no se editan nunca.
+START_BUTTON_LABEL_TITLES = {
+    "language_es": "Idioma: español",
+    "language_en": "Idioma: inglés",
+    "language_pt": "Idioma: portugués",
+    "language_it": "Idioma: italiano",
+    "confirm": "Ver métodos de pago",
+    "free_club": "Entrar al Free Club",
+    "offer_yes": "Sí, continuar",
+    "offer_no": "Quizás más tarde",
+    "onlyfans": "Ver OnlyFans",
+    "express": "Pase Exprés gratuito",
+    "freepass_start": "Iniciar Gold Pass",
+    "freepass_enter": "Entrar al canal GoldPass",
+    "method_binance": "Binance",
+    "method_pago_pm": "Pago Móvil",
+    "method_pago_trans": "Mercantil",
+    "method_pago_usa": "Cuenta USA",
+    "method_pago_mex": "Cuenta México",
+    "method_pago_airtm": "Airtm",
+    "method_pago_wally": "Wally",
+    "method_pago_visa_mc": "Visa / Mastercard",
+    "method_pago_iban": "IBAN / Euros",
+    "method_pago_paypal": "PayPal",
+    "method_usa_bank": "Transferencia bancaria USA",
+    "method_usa_link": "Pago por link USA",
+}
+START_BUTTON_LABEL_DEFAULTS = {
+    "language_es": {
+        "es": "🇪🇸 Español",
+        "en": "🇪🇸 Spanish",
+        "pt": "🇪🇸 Espanhol",
+        "it": "🇪🇸 Spagnolo",
+    },
+    "language_en": {
+        "es": "🇺🇸 English",
+        "en": "🇺🇸 English",
+        "pt": "🇺🇸 Inglês",
+        "it": "🇺🇸 Inglese",
+    },
+    "language_pt": {
+        "es": "🇧🇷 Português",
+        "en": "🇧🇷 Portuguese",
+        "pt": "🇧🇷 Português",
+        "it": "🇧🇷 Portoghese",
+    },
+    "language_it": {
+        "es": "🇮🇹 Italiano",
+        "en": "🇮🇹 Italian",
+        "pt": "🇮🇹 Italiano",
+        "it": "🇮🇹 Italiano",
+    },
+    "confirm": {lang: copy["confirm"] for lang, copy in PAYMENT_MENU_COPY.items()},
+    "free_club": {lang: copy["free_club"] for lang, copy in PAYMENT_MENU_COPY.items()},
+    "offer_yes": {lang: copy["offer_yes"] for lang, copy in PAYMENT_MENU_COPY.items()},
+    "offer_no": {lang: copy["offer_no"] for lang, copy in PAYMENT_MENU_COPY.items()},
+    "onlyfans": {lang: copy["onlyfans"] for lang, copy in PAYMENT_MENU_COPY.items()},
+    "express": {
+        "es": "🎟️✨ ¡PASE EXPRÉS GRATUITO — Accede ahora!",
+        "en": "🎟️✨ Free Express Pass",
+        "pt": "🎟️✨ Passe Expresso grátis",
+        "it": "🎟️✨ Pass Express gratuito",
+    },
+    "freepass_start": {
+        "es": "🎟️🏆 Iniciar Gold Pass",
+        "en": "🎟️🏆 Start Gold Pass",
+        "pt": "🎟️🏆 Iniciar Gold Pass",
+        "it": "🎟️🏆 Avvia Gold Pass",
+    },
+    "freepass_enter": {
+        "es": "🎟️🏆 Entrar al canal GoldPass",
+        "en": "🎟️🏆 Enter GoldPass channel",
+        "pt": "🎟️🏆 Entrar no canal GoldPass",
+        "it": "🎟️🏆 Entra nel canale GoldPass",
+    },
+    "method_binance": {lang: "🔸 Binance" for lang in PAYMENT_LANGUAGES},
+    "method_pago_pm": {
+        "es": "🇻🇪 Pago Móvil",
+        "en": "🇻🇪 Mobile payment",
+        "pt": "🇻🇪 Pagamento móvel",
+        "it": "🇻🇪 Pagamento mobile",
+    },
+    "method_pago_trans": {
+        "es": "🏦🇻🇪 Vznl",
+        "en": "🏦🇻🇪 Vznl (Venezuela)",
+        "pt": "🏦🇻🇪 Vznl (Venezuela)",
+        "it": "🏦🇻🇪 Vznl (Venezuela)",
+    },
+    "method_pago_usa": {
+        "es": "🏦🇺🇸 Cuenta USA",
+        "en": "🏦🇺🇸 US account",
+        "pt": "🏦🇺🇸 Conta dos EUA",
+        "it": "🏦🇺🇸 Conto USA",
+    },
+    "method_pago_mex": {
+        "es": "🏦🇲🇽 Cuenta MÉX",
+        "en": "🏦🇲🇽 Mexico account",
+        "pt": "🏦🇲🇽 Conta do México",
+        "it": "🏦🇲🇽 Conto del Messico",
+    },
+    "method_pago_airtm": {lang: "🌐 Airtm" for lang in PAYMENT_LANGUAGES},
+    "method_pago_wally": {lang: "💜 Wally" for lang in PAYMENT_LANGUAGES},
+    "method_pago_visa_mc": {
+        lang: "💳✨ Visa / Mastercard" for lang in PAYMENT_LANGUAGES
+    },
+    "method_pago_iban": {
+        "es": "💶🇪🇺 IBAN / Euros",
+        "en": "💶🇪🇺 IBAN / Euros",
+        "pt": "💶🇪🇺 IBAN / Euros",
+        "it": "💶🇪🇺 IBAN / Euro",
+    },
+    "method_pago_paypal": {lang: "🏦 PayPal" for lang in PAYMENT_LANGUAGES},
+    "method_usa_bank": {
+        "es": "🏦🇺🇸 Transferencia bancaria USA",
+        "en": "🏦🇺🇸 US bank transfer",
+        "pt": "🏦🇺🇸 Transferência bancária nos EUA",
+        "it": "🏦🇺🇸 Bonifico bancario USA",
+    },
+    "method_usa_link": {
+        "es": "🔗 Pago por Link",
+        "en": "🔗 Pay by link",
+        "pt": "🔗 Pagamento por link",
+        "it": "🔗 Pagamento con link",
+    },
 }
 PAYMENT_CHAT_SESSIONS = {}
 PAYMENT_USER_LANGUAGE = {}
@@ -430,19 +653,21 @@ def _supabase_configurado():
     return bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
 
 
-def _supabase_pedir(method, payload=None):
+def _supabase_pedir(method, payload=None, table=None, query_parameters=None):
     if not _supabase_configurado():
         raise RuntimeError("Faltan las variables de conexión de Supabase.")
-    query_parameters = (
-        {
-            "key": f"eq.{SUPABASE_SETTINGS_ROW_KEY}",
-            "select": "settings",
-        }
-        if method == "GET"
-        else {"on_conflict": "key"}
-    )
+    table = table or SUPABASE_SETTINGS_TABLE
+    if query_parameters is None:
+        query_parameters = (
+            {
+                "key": f"eq.{SUPABASE_SETTINGS_ROW_KEY}",
+                "select": "settings",
+            }
+            if method == "GET"
+            else {"on_conflict": "key"}
+        )
     query = urllib.parse.urlencode(query_parameters)
-    endpoint = f"{SUPABASE_URL}/rest/v1/{SUPABASE_SETTINGS_TABLE}?{query}"
+    endpoint = f"{SUPABASE_URL}/rest/v1/{table}?{query}"
     body = (
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if payload is not None
@@ -613,6 +838,282 @@ def _supabase_guardar_ajustes(changes):
         SUPABASE_SETTINGS_CACHE_AT = time.monotonic()
         SUPABASE_SETTINGS_STATUS = "connected"
     return True
+
+
+def _supabase_parsear_actualizacion(valor):
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(str(valor).replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _supabase_obtener_registros_suscripcion():
+    registros = []
+    offset = 0
+    while True:
+        pagina = _supabase_pedir(
+            "GET",
+            table=SUPABASE_SUBSCRIPTIONS_TABLE,
+            query_parameters={
+                "select": "record_type,user_id,username,status,expires_at,updated_at,data",
+                "order": "record_type.asc,user_id.asc",
+                "limit": "1000",
+                "offset": str(offset),
+            },
+        )
+        if not isinstance(pagina, list):
+            raise ValueError("Supabase devolvió una lista de suscripciones inválida.")
+        registros.extend(pagina)
+        if len(pagina) < 1000:
+            return registros
+        offset += len(pagina)
+
+
+def _supabase_guardar_registro_suscripcion(tipo, registro, actualizado=None):
+    global SUPABASE_SUBSCRIPTIONS_STATUS
+    if tipo not in ("paid", "free") or not isinstance(registro, dict):
+        return False
+    try:
+        user_id = int(registro.get("id"))
+    except (TypeError, ValueError):
+        return False
+    if user_id <= 0:
+        return False
+    if not _supabase_configurado():
+        SUPABASE_SUBSCRIPTIONS_STATUS = (
+            "incomplete" if SUPABASE_URL or SUPABASE_SECRET_KEY else "not_configured"
+        )
+        return False
+    data = {
+        str(key): value
+        for key, value in registro.items()
+        if not str(key).startswith("_")
+    }
+    updated_at = (
+        actualizado
+        or data.get("updated_at")
+        or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+    data["updated_at"] = str(updated_at)
+    payload = {
+        "record_type": tipo,
+        "user_id": user_id,
+        "username": str(data.get("username") or ""),
+        "status": str(
+            data.get("status") or data.get("estado") or "registered"
+        ),
+        "expires_at": str(data.get("vence") or ""),
+        "updated_at": str(updated_at),
+        "data": data,
+    }
+    try:
+        with SUPABASE_SUBSCRIPTIONS_LOCK:
+            _supabase_pedir(
+                "POST",
+                payload,
+                table=SUPABASE_SUBSCRIPTIONS_TABLE,
+                query_parameters={"on_conflict": "record_type,user_id"},
+            )
+        SUPABASE_SUBSCRIPTIONS_STATUS = "connected"
+        return True
+    except Exception as error:
+        SUPABASE_SUBSCRIPTIONS_STATUS = "error"
+        app.logger.warning(
+            "No se pudo guardar una suscripción en Supabase (tipo=%s, error=%s).",
+            tipo,
+            type(error).__name__,
+        )
+        return False
+
+
+def _supabase_aplicar_registro_local(tipo, fila):
+    if not isinstance(fila, dict) or not isinstance(fila.get("data"), dict):
+        return
+    try:
+        user_id = int(fila.get("user_id"))
+    except (TypeError, ValueError):
+        return
+    if user_id <= 0:
+        return
+    registro = dict(fila["data"])
+    registro["id"] = user_id
+    registro.setdefault("username", fila.get("username") or "")
+    registro.setdefault("updated_at", fila.get("updated_at") or "")
+    if fila.get("expires_at") and not registro.get("vence"):
+        registro["vence"] = fila["expires_at"]
+
+    if tipo == "paid":
+        SUSCRIPCIONES_ARCHIVO.upsert(registro, Query().id == user_id)
+        vencimiento = _parsear_fecha_suscripcion(registro.get("vence"))
+        estado = str(registro.get("estado") or fila.get("status") or "")
+        if vencimiento and estado not in ("expired", "cancelled", "revoked"):
+            db.upsert(registro, Query().id == user_id)
+        elif estado in ("expired", "cancelled", "revoked"):
+            db.remove(Query().id == user_id)
+    elif tipo == "free":
+        FreeGoldPasses.upsert(registro, FREE_GOLDPASS_QUERY.id == user_id)
+
+
+def _supabase_sincronizar_suscripciones(force=False):
+    """Importa el historial local una vez y mantiene Supabase como fuente compartida."""
+    global SUPABASE_SUBSCRIPTIONS_STATUS, SUPABASE_SUBSCRIPTIONS_SYNC_AT
+    with SUPABASE_SUBSCRIPTIONS_LOCK:
+        ahora_mono = time.monotonic()
+        if (
+            not force
+            and SUPABASE_SUBSCRIPTIONS_SYNC_AT
+            and ahora_mono - SUPABASE_SUBSCRIPTIONS_SYNC_AT
+            < SUPABASE_SUBSCRIPTIONS_SYNC_TTL_SECONDS
+        ):
+            return SUPABASE_SUBSCRIPTIONS_STATUS == "connected"
+        # Mantiene el respaldo local actualizado incluso si Supabase todavía no
+        # está configurado, y migra las filas antiguas antes del primer acceso.
+        try:
+            _sincronizar_suscripciones_pagadas()
+        except Exception as error:
+            app.logger.warning(
+                "No se pudieron preparar los JSON de suscripciones (error=%s).",
+                type(error).__name__,
+            )
+            if not _supabase_configurado():
+                SUPABASE_SUBSCRIPTIONS_STATUS = "error"
+                SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
+                return False
+        if not _supabase_configurado():
+            SUPABASE_SUBSCRIPTIONS_STATUS = (
+                "incomplete"
+                if SUPABASE_URL or SUPABASE_SECRET_KEY
+                else "not_configured"
+            )
+            SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
+            return False
+        try:
+            locales = []
+            for registro in SUSCRIPCIONES_ARCHIVO.all():
+                if registro.get("id"):
+                    locales.append(("paid", dict(registro)))
+            for registro in FreeGoldPasses.all():
+                if registro.get("id"):
+                    locales.append(("free", dict(registro)))
+
+            filas_remotas = _supabase_obtener_registros_suscripcion()
+            remotos = {}
+            for fila in filas_remotas:
+                try:
+                    clave = (str(fila.get("record_type")), int(fila.get("user_id")))
+                except (TypeError, ValueError):
+                    continue
+                if clave[0] in ("paid", "free") and clave[1] > 0:
+                    remotos[clave] = fila
+
+            carga_incompleta = False
+            for tipo, registro in locales:
+                user_id = int(registro["id"])
+                clave = (tipo, user_id)
+                fila_remota = remotos.get(clave)
+                local_updated = _supabase_parsear_actualizacion(
+                    registro.get("updated_at")
+                )
+                remote_updated = _supabase_parsear_actualizacion(
+                    fila_remota.get("updated_at") if fila_remota else None
+                )
+                if (
+                    not fila_remota
+                    or (
+                        local_updated
+                        and (not remote_updated or local_updated > remote_updated)
+                    )
+                ):
+                    if _supabase_guardar_registro_suscripcion(tipo, registro):
+                        updated = registro.get("updated_at") or datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        data = dict(registro, updated_at=str(updated))
+                        remotos[clave] = {
+                            "record_type": tipo,
+                            "user_id": user_id,
+                            "username": str(registro.get("username") or ""),
+                            "status": str(
+                                registro.get("status")
+                                or registro.get("estado")
+                                or "registered"
+                            ),
+                            "expires_at": str(registro.get("vence") or ""),
+                            "updated_at": str(updated),
+                            "data": data,
+                        }
+                    else:
+                        carga_incompleta = True
+
+            for (tipo, _user_id), fila in remotos.items():
+                _supabase_aplicar_registro_local(tipo, fila)
+            SUPABASE_SUBSCRIPTIONS_STATUS = (
+                "error" if carga_incompleta else "connected"
+            )
+            SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
+            return not carga_incompleta
+        except Exception as error:
+            SUPABASE_SUBSCRIPTIONS_STATUS = "error"
+            SUPABASE_SUBSCRIPTIONS_SYNC_AT = time.monotonic()
+            app.logger.warning(
+                "No se pudo sincronizar el registro de suscripciones de Supabase "
+                "(error=%s).",
+                type(error).__name__,
+            )
+            return False
+
+
+def _supabase_guardar_local(tipo, user_id):
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if tipo == "paid":
+        registro = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
+    elif tipo == "free":
+        registro = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
+    else:
+        return False
+    return _supabase_guardar_registro_suscripcion(
+        tipo, dict(registro) if registro else {}
+    ) if registro else False
+
+
+def _guardar_freepass(registro):
+    try:
+        user_id = int(registro.get("id"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    actual = dict(registro)
+    actual["id"] = user_id
+    actual["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with FREE_GOLDPASS_LOCK:
+        FreeGoldPasses.upsert(actual, FREE_GOLDPASS_QUERY.id == user_id)
+    _supabase_guardar_registro_suscripcion("free", actual)
+    return actual
+
+
+def _actualizar_freepass(user_id, cambios):
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    with FREE_GOLDPASS_LOCK:
+        actual = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
+        if not actual:
+            return None
+        actualizado = dict(actual)
+        actualizado.update(cambios or {})
+        actualizado["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        FreeGoldPasses.upsert(
+            actualizado, FREE_GOLDPASS_QUERY.id == user_id
+        )
+    _supabase_guardar_registro_suscripcion("free", actualizado)
+    return actualizado
 
 
 def cargar_config():
@@ -1362,6 +1863,122 @@ def _generar_intro_oferta_goldpass(language):
     )
 
 
+def _etiqueta_boton_inicio(key, language="es", config=None):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    settings = config if isinstance(config, dict) else cargar_config()
+    labels = settings.get("payment_start_button_labels", {})
+    configured = labels.get(key, {}) if isinstance(labels, dict) else {}
+    value = configured.get(language) if isinstance(configured, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:64]
+    return START_BUTTON_LABEL_DEFAULTS.get(key, {}).get(
+        language,
+        START_BUTTON_LABEL_DEFAULTS.get(key, {}).get("es", key),
+    )
+
+
+def _traducir_etiqueta_boton_inicio(texto_es):
+    texto_es = re.sub(r"\s+", " ", (texto_es or "").strip())
+    if not texto_es or len(texto_es.encode("utf-8")) > 60:
+        raise ValueError("La etiqueta debe tener entre 1 y 60 bytes.")
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("falta GEMINI_API_KEY")
+    body = {
+        "systemInstruction": {
+            "parts": [{
+                "text": (
+                    "Traduce una etiqueta breve para un botón de Telegram. "
+                    "Devuelve el mismo sentido en español (es), inglés (en), "
+                    "portugués brasileño (pt) e italiano (it). Conserva emojis, "
+                    "nombres de marcas, nombres propios y siglas. No agregues "
+                    "explicaciones, comillas, enlaces ni formato. Cada traducción "
+                    "debe caber en 60 bytes UTF-8."
+                )
+            }]
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": texto_es}],
+        }],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 220,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    language: {"type": "STRING"}
+                    for language in PAYMENT_LANGUAGES
+                },
+                "required": list(PAYMENT_LANGUAGES),
+            },
+        },
+    }
+    model = urllib.parse.quote(GEMINI_MODEL, safe="-_.")
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
+        method="POST",
+    )
+    result = None
+    for intento in range(2):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=GEMINI_TIMEOUT_SECONDS
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            if error.code == 503 and intento == 0:
+                time.sleep(1)
+                continue
+            raise RuntimeError(f"Gemini HTTP {error.code}") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            reason = getattr(error, "reason", None)
+            error_kind = (
+                type(reason).__name__ if reason is not None else type(error).__name__
+            )
+            raise RuntimeError(f"Gemini conexión ({error_kind})") from None
+    candidates = result.get("candidates") or []
+    parts = (
+        candidates[0].get("content", {}).get("parts", [])
+        if candidates and isinstance(candidates[0], dict)
+        else []
+    )
+    raw = " ".join(
+        part.get("text", "").strip()
+        for part in parts
+        if isinstance(part, dict) and part.get("text", "").strip()
+    ).strip()
+    try:
+        translations = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        translations = {}
+    if not isinstance(translations, dict):
+        raise RuntimeError("Gemini devolvió traducciones inválidas")
+    output = {"es": texto_es}
+    for language in ("en", "pt", "it"):
+        translated = re.sub(
+            r"\s+",
+            " ",
+            str(translations.get(language, "")).strip().strip("\"'"),
+        )
+        if (
+            not translated
+            or "\n" in translated
+            or len(translated.encode("utf-8")) > 60
+            or re.search(r"https?://|t\.me/|<[^>]+>", translated, re.I)
+        ):
+            raise RuntimeError("Gemini devolvió una etiqueta no válida")
+        output[language] = translated
+    return output
+
+
 def _generar_respuesta_no_goldpass(language):
     language = language if language in PAYMENT_LANGUAGES else "es"
     system_instruction = (
@@ -1371,6 +1988,15 @@ def _generar_respuesta_no_goldpass(language):
         "canal gratuito usando los botones. No intentes convencerla de pagar, no "
         "menciones precios ni inventes enlaces o condiciones. Escribe solo 1 o 2 frases."
     )
+    instrucciones = (
+        cargar_config().get("payment_start_freepass_instructions", "") or ""
+    ).strip()[:600]
+    if instrucciones:
+        system_instruction += (
+            "\nPreferencias de tono del administrador: "
+            f"{instrucciones}\n"
+            "Úsalas sin añadir presión, precios, enlaces ni condiciones."
+        )
     prompt = (
         "Responde con naturalidad a «No, quizás más tarde». Hazle saber que no hay "
         "prisa y que puede visitar Free Club si le apetece."
@@ -1423,6 +2049,16 @@ def _generar_cta_menu_pago(language, incluir_pase_expres=False):
         "Markdown, comillas ni explicaciones. Devuelve una sola frase de máximo "
         "150 caracteres."
     )
+    instrucciones = (
+        cargar_config().get("payment_start_cta_instructions", "") or ""
+    ).strip()[:600]
+    if instrucciones:
+        system_instruction += (
+            "\nOrientación del administrador para el tono de esta llamada: "
+            f"{instrucciones}\n"
+            "No permitas que cambie el idioma, el precio, los métodos, los enlaces "
+            "ni las condiciones."
+        )
     prompt = (
         f"{condicion_pase} Redacta una frase distinta a las habituales. "
         f"Variación: {random.randint(1000, 999999)}."
@@ -2636,6 +3272,69 @@ def _formato_duracion_freepass(segundos):
     return FREE_GOLDPASS_DURATIONS.get(int(segundos), ("duración no válida", ""))[0]
 
 
+_FREEPASS_COPY_CACHE = {}
+_FREEPASS_COPY_CACHE_TTL = 15 * 60
+
+
+def _formato_duracion_freepass_idioma(segundos, language):
+    try:
+        segundos = int(segundos)
+    except (TypeError, ValueError):
+        return _formato_duracion_freepass(segundos)
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    return FREEPASS_DURATION_COPY.get(segundos, {}).get(
+        language, _formato_duracion_freepass(segundos)
+    )
+
+
+def _texto_freepass_usuario(language, estado, duracion, expiracion=None):
+    language = language if language in PAYMENT_LANGUAGES else "es"
+    estado = estado if estado in ("pending", "active", "available") else "available"
+    plantilla = FREEPASS_USER_COPY[language][estado]
+    texto_base = plantilla.format(duration=duracion, expiry=expiracion or "—")
+    instrucciones = (
+        cargar_config().get("payment_start_freepass_instructions", "") or ""
+    ).strip()[:600]
+    cache_key = (language, estado, duracion, expiracion or "", instrucciones)
+    ahora = time.monotonic()
+    cached = _FREEPASS_COPY_CACHE.get(cache_key)
+    if cached and ahora - cached[0] < _FREEPASS_COPY_CACHE_TTL:
+        return cached[1]
+
+    system_instruction = (
+        f"Escribe en {PAYMENT_LANGUAGES[language]} un mensaje breve y natural para "
+        "Telegram basado en el texto que te daré. Conserva exactamente los hechos, "
+        "la duración y la fecha/hora; no añadas precios, enlaces, promesas ni pasos. "
+        "No cambies el estado del pase ni cuándo empieza el tiempo. Usa texto plano, "
+        "sin HTML ni Markdown, y conserva los emojis."
+    )
+    if instrucciones:
+        system_instruction += (
+            "\nEl administrador pide este estilo: "
+            f"{instrucciones}\n"
+            "Úsalo solo para el tono; no modifiques los hechos ni las fechas."
+        )
+    try:
+        texto = _gemini_texto_breve(
+            language,
+            system_instruction,
+            texto_base,
+            max_tokens=180,
+        )
+        numeros_esperados = set(re.findall(r"\d+", texto_base))
+        numeros_generados = set(re.findall(r"\d+", texto))
+        if not numeros_esperados.issubset(numeros_generados):
+            raise RuntimeError("Gemini cambió los números del aviso Free Gold Pass")
+    except Exception as error:
+        app.logger.warning(
+            "El aviso Free Gold Pass usó el texto localizado de respaldo (error=%s).",
+            type(error).__name__,
+        )
+        texto = texto_base
+    _FREEPASS_COPY_CACHE[cache_key] = (ahora, texto)
+    return texto
+
+
 def _fecha_freepass(registro):
     try:
         return datetime.strptime(str(registro.get("vence")), "%Y-%m-%d %H:%M:%S")
@@ -2695,16 +3394,15 @@ def _cancelar_enlaces_pendientes_freepass(campaign_id):
                     "No se pudo revocar un enlace pendiente de Free Gold Pass."
                 )
         try:
-            with FREE_GOLDPASS_LOCK:
-                FreeGoldPasses.update(
-                    {
-                        "status": "cancelled",
-                        "cancelled_at": datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                    },
-                    FREE_GOLDPASS_QUERY.id == int(registro.get("id")),
-                )
+            _actualizar_freepass(
+                int(registro.get("id")),
+                {
+                    "status": "cancelled",
+                    "cancelled_at": datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                },
+            )
         except (TypeError, ValueError):
             app.logger.exception(
                 "No se pudo marcar como cancelado un pase pendiente."
@@ -2735,42 +3433,26 @@ def _desactivar_free_goldpass(motivo, campaign_id=None):
 
 def mostrar_menu_free_goldpass_usuario(chat_id, user_id, registro=None):
     estado = free_goldpass_config()
-    duracion = _formato_duracion_freepass(
-        registro.get("duration_seconds")
-        if registro
-        else estado.get("duration_seconds", 0)
+    language = PAYMENT_USER_LANGUAGE.get(int(user_id), "es")
+    duracion = _formato_duracion_freepass_idioma(
+        registro.get("duration_seconds") if registro else estado.get("duration_seconds", 0),
+        language,
     )
     markup = types.InlineKeyboardMarkup()
     if registro and registro.get("status") == "pending":
         markup.add(types.InlineKeyboardButton(
-            "🎟️🏆 Entrar al canal GoldPass",
+            _etiqueta_boton_inicio("freepass_enter", language),
             url=registro.get("invite_link"),
         ))
-        texto = (
-            "🎟️🏆 <b>Tu pase gratuito GoldPass está listo.</b>\n\n"
-            f"Tu pase dura <b>{html.escape(duracion)}</b>. El tiempo empieza "
-            "cuando el bot apruebe tu entrada al canal; desde ahí se contará "
-            "tu acceso y, al terminar, el bot te retirará.\n\n"
-            "¡Disfrútalo! 🔥"
-        )
+        texto = _texto_freepass_usuario(language, "pending", duracion)
     elif registro and registro.get("status") == "active":
         vence = _fecha_freepass(registro)
-        fecha_txt = vence.strftime("%d/%m/%Y %H:%M") if vence else "la hora indicada"
-        texto = (
-            "🎟️🏆 <b>Tu pase gratuito GoldPass está activo.</b>\n\n"
-            f"Tu acceso termina el <b>{fecha_txt}</b>; después el bot te retirará "
-            "del canal. ¡Disfrútalo! 🔥"
-        )
+        fecha_txt = vence.strftime("%d/%m/%Y %H:%M") if vence else "—"
+        texto = _texto_freepass_usuario(language, "active", duracion, fecha_txt)
     else:
-        texto = (
-            "🎟️🏆 <b>Free Gold Pass disponible</b>\n\n"
-            f"Puedes solicitar un acceso gratuito por <b>{html.escape(duracion)}</b>. "
-            "El plazo comienza cuando se emite tu enlace; al vencer, el bot te "
-            "retirará del canal.\n\n"
-            "Pulsa el botón para recibir tu enlace personal. 🔥"
-        )
+        texto = _texto_freepass_usuario(language, "available", duracion)
         markup.add(types.InlineKeyboardButton(
-            "🎟️🏆 Iniciar Gold Pass",
+            _etiqueta_boton_inicio("freepass_start", language),
             callback_data="free_goldpass_claim",
         ))
     return editar_o_enviar_panel(
@@ -2836,23 +3518,31 @@ def mostrar_metodos_pago(chat_id, aviso=None, language=None):
     if pase_expres_disponible:
         markup.add(
             types.InlineKeyboardButton(
-                "🎟️✨ ¡PASE EXPRÉS GRATUITO — Accede ahora!",
+                _etiqueta_boton_inicio("express", language),
                 callback_data="pase_expres_click"
             )
         )
 
-    markup.add(
-        types.InlineKeyboardButton("🔸 Binance",             callback_data="pago_binance"),
-        types.InlineKeyboardButton("🇻🇪 Pago Móvil",         callback_data="pago_pm"),
-        types.InlineKeyboardButton("🏦🇻🇪 Vznl",             callback_data="pago_trans"),
-        types.InlineKeyboardButton("🏦🇺🇸 Cuenta USA",       callback_data="pago_usa"),
-        types.InlineKeyboardButton("🏦🇲🇽 Cuenta MÉX",       callback_data="pago_mex"),
-        types.InlineKeyboardButton("🌐 Airtm",                callback_data="pago_airtm"),
-        types.InlineKeyboardButton("💜 Wally",                callback_data="pago_wally"),
-        types.InlineKeyboardButton("💳✨ Visa / Mastercard",  callback_data="pago_visa_mc"),
-        types.InlineKeyboardButton("💶🇪🇺 IBAN / Euros",     callback_data="pago_iban"),
-        types.InlineKeyboardButton(" 🏦 PayPal",     callback_data="pago_PayPal"),
+    method_buttons = (
+        ("method_binance", "pago_binance"),
+        ("method_pago_pm", "pago_pm"),
+        ("method_pago_trans", "pago_trans"),
+        ("method_pago_usa", "pago_usa"),
+        ("method_pago_mex", "pago_mex"),
+        ("method_pago_airtm", "pago_airtm"),
+        ("method_pago_wally", "pago_wally"),
+        ("method_pago_visa_mc", "pago_visa_mc"),
+        ("method_pago_iban", "pago_iban"),
+        ("method_pago_paypal", "pago_PayPal"),
     )
+    ui_config = cargar_config()
+    markup.add(*[
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio(label_key, language, ui_config),
+            callback_data=callback_data,
+        )
+        for label_key, callback_data in method_buttons
+    ])
 
     textos_pago = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
     llamada_accion = _generar_cta_menu_pago(language, pase_expres_disponible)
@@ -2907,8 +3597,8 @@ def markup_admin_config_pagos():
             callback_data="admin_pagos_metodos",
         ),
         types.InlineKeyboardButton(
-            "🖼️ Cambiar foto del menú",
-            callback_data="admin_pagos_cambiar_foto",
+            "⚙️ Configuración general de /start",
+            callback_data="admin_start_welcome",
         ),
         types.InlineKeyboardButton(
             f"🎟️ Free Gold Pass · {estado_free}",
@@ -2917,10 +3607,6 @@ def markup_admin_config_pagos():
         types.InlineKeyboardButton(
             "👥 Administrar suscripciones",
             callback_data="admin_suscripciones|0",
-        ),
-        types.InlineKeyboardButton(
-            "👋 Bienvenida de /start",
-            callback_data="admin_start_welcome",
         ),
         types.InlineKeyboardButton(
             "📤 Compartir asistente",
@@ -3101,7 +3787,12 @@ def _parsear_fecha_suscripcion(valor):
 
 
 def _guardar_archivo_suscripcion(
-    registro, comprobante=None, metodo=None, estado_forzado=None
+    registro,
+    comprobante=None,
+    metodo=None,
+    estado_forzado=None,
+    persistir=True,
+    touch_updated=True,
 ):
     """Conserva historial y comprobantes sin depender del registro activo."""
     try:
@@ -3126,8 +3817,11 @@ def _guardar_archivo_suscripcion(
             "vence": str(registro.get("vence") or previo.get("vence") or ""),
             "tipo": "paid",
             "estado": estado,
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+        if touch_updated:
+            guardado["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        elif registro.get("updated_at"):
+            guardado["updated_at"] = str(registro["updated_at"])
         fecha_entrada = (
             registro.get("joined_at")
             or registro.get("fecha_entrada")
@@ -3146,8 +3840,28 @@ def _guardar_archivo_suscripcion(
             guardado["left_at"] = str(registro["left_at"])
         elif previo.get("left_at"):
             guardado["left_at"] = str(previo["left_at"])
+        for campo in (
+            "vip_access_sent",
+            "vip_access_sending",
+            "vip_access_sending_at",
+            "access_message_id",
+            "access_welcome_message_id",
+            "invite_link",
+            "invite_status",
+            "invite_created_at",
+            "invite_expires_at",
+            "invite_revoked_at",
+            "invite_revoke_error",
+            "access_cleanup_status",
+            "access_cleanup_updated_at",
+            "access_followup_message_id",
+        ):
+            if campo in registro:
+                guardado[campo] = registro[campo]
         if metodo:
             guardado["metodo_pago"] = str(metodo)
+        elif registro.get("metodo_pago"):
+            guardado["metodo_pago"] = str(registro["metodo_pago"])
         if comprobante:
             guardado.update({
                 "comprobante_file_id": comprobante.get("file_id"),
@@ -3165,7 +3879,21 @@ def _guardar_archivo_suscripcion(
                 if registro.get(campo):
                     guardado[campo] = registro[campo]
         SUSCRIPCIONES_ARCHIVO.upsert(guardado, Query().id == user_id)
-        return guardado
+        resultado = dict(guardado)
+    if persistir:
+        _supabase_guardar_registro_suscripcion("paid", resultado)
+    return resultado
+
+
+def _sincronizar_suscripcion_pagada_desde_db(user_id):
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    registro = db.get(Query().id == user_id)
+    if registro:
+        return _guardar_archivo_suscripcion(dict(registro))
+    return _supabase_guardar_local("paid", user_id)
 
 
 def _normalizar_suscripcion_legacy(registro):
@@ -3259,13 +3987,17 @@ def _sincronizar_suscripciones_pagadas():
     for registro in registros_legacy:
         normalizado = _normalizar_suscripcion_legacy(registro)
         if normalizado:
-            _guardar_archivo_suscripcion(normalizado)
+            _guardar_archivo_suscripcion(
+                normalizado, persistir=False, touch_updated=False
+            )
 
     # La tabla principal de usuarios.json es la fuente actual; copiar todos los
     # usuarios con ID evita ocultar registros que aún no tengan fecha normalizada.
     for registro in db.all():
         if isinstance(registro, dict) and registro.get("id"):
-            _guardar_archivo_suscripcion(registro)
+            _guardar_archivo_suscripcion(
+                registro, persistir=False, touch_updated=False
+            )
 
 
 def _estado_panel_suscripcion(registro, ahora):
@@ -3287,7 +4019,7 @@ def _estado_panel_suscripcion(registro, ahora):
 
 
 def _lista_suscripciones_admin():
-    _sincronizar_suscripciones_pagadas()
+    _supabase_sincronizar_suscripciones()
     registros = []
     for registro in SUSCRIPCIONES_ARCHIVO.all():
         actual = dict(registro)
@@ -3377,11 +4109,11 @@ def _lista_suscripciones_admin():
 def _obtener_suscripcion_admin(tipo, user_id):
     user_id = int(user_id)
     if tipo == "free":
+        _supabase_sincronizar_suscripciones()
         registro = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
         if not registro:
             return None
         actual = dict(registro)
-        _sincronizar_suscripciones_pagadas()
         pagada = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
         if pagada:
             for campo in (
@@ -3397,7 +4129,7 @@ def _obtener_suscripcion_admin(tipo, user_id):
         return actual
     if tipo != "paid":
         return None
-    _sincronizar_suscripciones_pagadas()
+    _supabase_sincronizar_suscripciones()
     registro = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
     return dict(registro) if registro else None
 
@@ -3448,6 +4180,7 @@ def _registrar_estado_miembro_goldpass(user_id, en_canal, username=None):
             cambios["username"] = str(username).lstrip("@")
         with SUSCRIPCIONES_LOCK:
             SUSCRIPCIONES_ARCHIVO.update(cambios, Query().id == user_id)
+        _supabase_guardar_local("paid", user_id)
 
     if pase:
         cambios = (
@@ -3464,8 +4197,7 @@ def _registrar_estado_miembro_goldpass(user_id, en_canal, username=None):
         )
         if username:
             cambios["username"] = str(username).lstrip("@")
-        with FREE_GOLDPASS_LOCK:
-            FreeGoldPasses.update(cambios, FREE_GOLDPASS_QUERY.id == user_id)
+        _actualizar_freepass(user_id, cambios)
 
 
 def _texto_tiempo_restante(vence):
@@ -3552,6 +4284,18 @@ def mostrar_lista_suscripciones(chat_id, pagina=0, message=None):
         texto = (
             "👥 <b>Administrar suscripciones</b>\n\n"
             "Aún no hay suscripciones registradas."
+        )
+    if SUPABASE_SUBSCRIPTIONS_STATUS == "connected":
+        texto += "\n\n☁️ Registro persistente: Supabase conectado."
+    elif SUPABASE_SUBSCRIPTIONS_STATUS in ("error", "incomplete"):
+        texto += (
+            "\n\n⚠️ Supabase no pudo sincronizarse; se muestra el respaldo local. "
+            "Revisa la tabla y las variables de conexión en Render."
+        )
+    else:
+        texto += (
+            "\n\n⚠️ Supabase no está configurado para suscripciones; "
+            "se muestra el respaldo local."
         )
     return editar_o_enviar_panel(
         chat_id,
@@ -3657,24 +4401,19 @@ def mostrar_detalle_suscripcion(
 def mostrar_admin_config_pagos(
     chat_id, message=None, message_id=None, aviso=None
 ):
-    config_pagos = cargar_config_pagos()
     estado_free = free_goldpass_config()
-    portada = (
-        "personalizada"
-        if config_pagos.get("portada_file_id")
-        else "foto original"
-    )
     texto = (
-        "💳 <b>Métodos de pago e imagen</b>\n\n"
-        "Administra por separado los métodos de pago y la imagen de este menú. "
-        "El texto de pago guardado no se muestra en los paneles.\n\n"
-        f"Foto del menú: <b>{portada}</b>.\n"
-        "La bienvenida de /start tiene ajustes de foto y estilo separados.\n"
+        "💳 <b>Métodos de pagos y configuración general</b>\n\n"
+        "Administra los métodos de pago sin mostrar aquí sus datos privados. "
+        "En «Configuración general de /start» puedes ajustar las dos fotos, "
+        "el estilo de los mensajes con Gemini y las etiquetas de los botones.\n"
+        "El saludo inicial que pide elegir idioma se mantiene fijo; los textos "
+        "posteriores respetan el idioma seleccionado.\n\n"
         "Free Gold Pass: <b>"
         + ("activado" if estado_free.get("active") else "desactivado")
         + "</b>.\n"
-        "Las imágenes y los mensajes de pago enviados por el bot usarán "
-        "la protección de contenido de Telegram."
+        "Los datos de pago, las acciones de los botones y las reglas de acceso "
+        "se mantienen protegidos."
     )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n" + texto
@@ -4321,8 +5060,8 @@ def _estado_persistencia_admin():
     if _supabase_configurado():
         if SUPABASE_SETTINGS_STATUS == "connected":
             return (
-                "✅ Supabase respondió correctamente; las referencias de fotos "
-                "y las instrucciones se guardan allí."
+                "✅ Supabase respondió correctamente; las fotos, instrucciones y "
+                "etiquetas de botones se guardan allí."
             )
         if SUPABASE_SETTINGS_STATUS == "error":
             return (
@@ -4366,7 +5105,7 @@ def mostrar_foto_pago_actual(chat_id, message=None, message_id=None, aviso=None)
         ),
         types.InlineKeyboardButton(
             "🔙 Volver",
-            callback_data="admin_pagos",
+            callback_data="admin_start_photos",
         ),
     )
     if config_pagos.get("portada_file_id"):
@@ -4409,6 +5148,272 @@ def _foto_bienvenida_inicio_pago():
     return None
 
 
+def _markup_admin_start_photos():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "👋 Foto de bienvenida",
+            callback_data="admin_start_welcome_photo",
+        ),
+        types.InlineKeyboardButton(
+            "💳 Foto del menú de pagos",
+            callback_data="admin_pagos_cambiar_foto",
+        ),
+    )
+    markup.add(
+        types.InlineKeyboardButton(
+            "👀 Vista previa de bienvenida",
+            callback_data="admin_start_welcome_preview",
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa del menú",
+            callback_data="admin_start_payment_preview",
+        ),
+    )
+    if cargar_config().get("payment_start_photo_file_id"):
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Restaurar foto original de bienvenida",
+            callback_data="admin_start_welcome_photo_original",
+        ))
+    if cargar_config_pagos().get("portada_file_id"):
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Restaurar foto original del menú de pago",
+            callback_data="admin_pagos_foto_original",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a configuración general",
+        callback_data="admin_start_welcome_back",
+    ))
+    return markup
+
+
+def mostrar_admin_start_photos(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    config = cargar_config()
+    config_pagos = cargar_config_pagos()
+    bienvenida = (
+        "personalizada"
+        if config.get("payment_start_photo_file_id")
+        else "foto original"
+    )
+    pagos = (
+        "personalizada"
+        if config_pagos.get("portada_file_id")
+        else "foto original"
+    )
+    texto = (
+        "🖼️ <b>Fotos del recorrido /start</b>\n\n"
+        f"Bienvenida después de elegir idioma: <b>{bienvenida}</b>.\n"
+        f"Menú de métodos de pago: <b>{pagos}</b>.\n\n"
+        "Son dos imágenes independientes. Cambiar una no modifica la otra."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        _markup_admin_start_photos(),
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def mostrar_admin_start_messages(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    config = cargar_config()
+    estados = (
+        (
+            "Saludo después de elegir idioma",
+            config.get("payment_start_welcome_instructions"),
+        ),
+        ("Presentación Gold Pass", config.get("payment_goldpass_offer_instructions")),
+        ("Llamada al menú de pago", config.get("payment_start_cta_instructions")),
+        ("Mensajes de Free Gold Pass", config.get("payment_start_freepass_instructions")),
+    )
+    resumen = "\n".join(
+        f"• {etiqueta}: <b>{'personalizado' if valor else 'estilo base'}</b>"
+        for etiqueta, valor in estados
+    )
+    texto = (
+        "✍️ <b>Mensajes con Gemini</b>\n\n"
+        "Elige qué mensaje quieres orientar. Escribe instrucciones sencillas de "
+        "tono o contenido; Gemini las redactará en el idioma que eligió cada usuario.\n\n"
+        f"{resumen}\n\n"
+        "El saludo fijo para elegir idioma no se edita. Precio, datos bancarios, "
+        "enlaces y permisos tampoco se cambian desde aquí."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "👋 Saludo de bienvenida",
+            callback_data="admin_start_welcome_instructions",
+        ),
+        types.InlineKeyboardButton(
+            "🎟️ Presentación Gold Pass",
+            callback_data="admin_start_offer_instructions",
+        ),
+        types.InlineKeyboardButton(
+            "💳 Llamada a los métodos de pago",
+            callback_data="admin_start_cta_instructions",
+        ),
+        types.InlineKeyboardButton(
+            "🎫 Mensajes de Free Gold Pass",
+            callback_data="admin_start_freepass_instructions",
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa de bienvenida",
+            callback_data="admin_start_welcome_preview",
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa de oferta",
+            callback_data="admin_start_offer_preview",
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa del menú de pago",
+            callback_data="admin_start_payment_preview",
+        ),
+    )
+    for key, callback_data, label in (
+        (
+            "payment_start_welcome_instructions",
+            "admin_start_welcome_reset",
+            "♻️ Restablecer saludo",
+        ),
+        (
+            "payment_goldpass_offer_instructions",
+            "admin_start_offer_reset",
+            "♻️ Restablecer estilo de oferta",
+        ),
+        (
+            "payment_start_cta_instructions",
+            "admin_start_cta_reset",
+            "♻️ Restablecer llamada al pago",
+        ),
+        (
+            "payment_start_freepass_instructions",
+            "admin_start_freepass_reset",
+            "♻️ Restablecer mensajes Free Pass",
+        ),
+    ):
+        if config.get(key):
+            markup.add(types.InlineKeyboardButton(
+                label,
+                callback_data=callback_data,
+            ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a configuración general",
+        callback_data="admin_start_welcome_back",
+    ))
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+START_BUTTON_LABEL_ORDER = tuple(START_BUTTON_LABEL_TITLES)
+START_BUTTON_LABEL_PAGE_SIZE = 7
+
+
+def mostrar_admin_start_button_labels(
+    chat_id, page=0, message=None, message_id=None, aviso=None
+):
+    config = cargar_config()
+    total_pages = max(
+        1,
+        (len(START_BUTTON_LABEL_ORDER) + START_BUTTON_LABEL_PAGE_SIZE - 1)
+        // START_BUTTON_LABEL_PAGE_SIZE,
+    )
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * START_BUTTON_LABEL_PAGE_SIZE
+    keys = START_BUTTON_LABEL_ORDER[start:start + START_BUTTON_LABEL_PAGE_SIZE]
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for key in keys:
+        markup.add(types.InlineKeyboardButton(
+            START_BUTTON_LABEL_TITLES[key],
+            callback_data=f"admin_start_button|{key}|{page}",
+        ))
+    navigation = []
+    if page > 0:
+        navigation.append(types.InlineKeyboardButton(
+            "⬅️ Anterior",
+            callback_data=f"admin_start_button_labels|{page - 1}",
+        ))
+    if page + 1 < total_pages:
+        navigation.append(types.InlineKeyboardButton(
+            "Siguiente ➡️",
+            callback_data=f"admin_start_button_labels|{page + 1}",
+        ))
+    if navigation:
+        markup.row(*navigation)
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a configuración general",
+        callback_data="admin_start_welcome_back",
+    ))
+    texto = (
+        f"🔘 <b>Botones del recorrido /start · página {page + 1}/{total_pages}</b>\n\n"
+        "Pulsa el botón que quieras renombrar. Envía el nuevo texto en español; "
+        "Gemini lo guardará también en inglés, portugués e italiano. "
+        "Solo cambia la etiqueta visible: la acción del botón no se modifica."
+    )
+    if aviso:
+        texto = f"✅ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def _mostrar_prompt_etiqueta_boton_inicio(
+    chat_id, key, page=0, message=None, message_id=None, aviso=None
+):
+    actual = _etiqueta_boton_inicio(key, "es")
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    labels = cargar_config().get("payment_start_button_labels", {})
+    if isinstance(labels, dict) and key in labels:
+        markup.add(types.InlineKeyboardButton(
+            "♻️ Restaurar etiqueta original",
+            callback_data=f"admin_start_button_reset|{key}|{page}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a la lista",
+        callback_data=f"admin_start_button_labels|{page}",
+    ))
+    texto = (
+        f"🔘 <b>Editar botón: {html.escape(START_BUTTON_LABEL_TITLES[key])}</b>\n\n"
+        f"Texto actual: <b>{html.escape(actual)}</b>\n\n"
+        "Envía el nuevo texto en español, máximo 60 bytes. Gemini guardará sus "
+        "traducciones al inglés, portugués e italiano. La acción del botón no cambia. "
+        "Escribe /cancelar para volver."
+    )
+    if aviso:
+        texto = f"⚠️ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
 def _markup_admin_bienvenida_inicio_pago(
     foto_personalizada,
     hay_instrucciones,
@@ -4417,22 +5422,26 @@ def _markup_admin_bienvenida_inicio_pago(
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         types.InlineKeyboardButton(
-            "🖼️ Cambiar foto",
-            callback_data="admin_start_welcome_photo",
+            "🖼️ Fotos",
+            callback_data="admin_start_photos",
         ),
         types.InlineKeyboardButton(
-            "✍️ Instrucciones de Gemini",
-            callback_data="admin_start_welcome_instructions",
+            "✍️ Mensajes de Gemini",
+            callback_data="admin_start_messages",
         ),
     )
     markup.add(
         types.InlineKeyboardButton(
-            "✍️ Estilo de oferta Gold Pass",
-            callback_data="admin_start_offer_instructions",
+            "🔘 Etiquetas de botones",
+            callback_data="admin_start_button_labels|0",
         ),
         types.InlineKeyboardButton(
             "👀 Vista previa de oferta",
             callback_data="admin_start_offer_preview",
+        ),
+        types.InlineKeyboardButton(
+            "👀 Vista previa del menú de pago",
+            callback_data="admin_start_payment_preview",
         ),
     )
     markup.add(
@@ -4441,31 +5450,10 @@ def _markup_admin_bienvenida_inicio_pago(
             callback_data="admin_start_welcome_preview",
         )
     )
-    if hay_instrucciones:
-        markup.add(
-            types.InlineKeyboardButton(
-                "♻️ Restablecer instrucciones",
-                callback_data="admin_start_welcome_reset",
-            )
-        )
-    if hay_instrucciones_oferta:
-        markup.add(
-            types.InlineKeyboardButton(
-                "♻️ Restablecer oferta Gold Pass",
-                callback_data="admin_start_offer_reset",
-            )
-        )
-    if foto_personalizada:
-        markup.add(
-            types.InlineKeyboardButton(
-                "↩️ Usar foto original",
-                callback_data="admin_start_welcome_photo_original",
-            )
-        )
     markup.add(
         types.InlineKeyboardButton(
-            "🔙 Volver a pagos",
-            callback_data="admin_start_welcome_back",
+            "🔙 Volver a métodos de pago",
+            callback_data="admin_pagos",
         )
     )
     return markup
@@ -4486,38 +5474,86 @@ def mostrar_admin_bienvenida_inicio_pago(
     instrucciones_oferta = (
         config.get("payment_goldpass_offer_instructions", "") or ""
     ).strip()
+    instrucciones_cta = (
+        config.get("payment_start_cta_instructions", "") or ""
+    ).strip()
+    instrucciones_freepass = (
+        config.get("payment_start_freepass_instructions", "") or ""
+    ).strip()
     foto_personalizada = config.get("payment_start_photo_file_id")
     foto = _foto_bienvenida_inicio_pago()
-    markup = _markup_admin_bienvenida_inicio_pago(
-        bool(foto_personalizada),
-        bool(instrucciones),
-        bool(instrucciones_oferta),
-    )
+    foto_menu_pago = cargar_config_pagos().get("portada_file_id")
     if preview_text is not None:
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        ui_config = config
+        es_oferta = "oferta" in str(preview_label).lower()
+        if es_oferta:
+            markup.add(
+                types.InlineKeyboardButton(
+                    _etiqueta_boton_inicio("offer_yes", "es", ui_config),
+                    callback_data="start_preview|yes",
+                ),
+                types.InlineKeyboardButton(
+                    _etiqueta_boton_inicio("offer_no", "es", ui_config),
+                    callback_data="start_preview|later",
+                ),
+                types.InlineKeyboardButton(
+                    _etiqueta_boton_inicio("onlyfans", "es", ui_config),
+                    callback_data="start_preview|onlyfans",
+                ),
+            )
+        else:
+            markup.add(
+                types.InlineKeyboardButton(
+                    _etiqueta_boton_inicio("confirm", "es", ui_config),
+                    callback_data="start_preview|methods",
+                ),
+                types.InlineKeyboardButton(
+                    _etiqueta_boton_inicio("free_club", "es", ui_config),
+                    callback_data="start_preview|freeclub",
+                ),
+            )
+        markup.add(types.InlineKeyboardButton(
+            "🔙 Volver a configuración general",
+            callback_data="admin_start_welcome_back",
+        ))
+        preview_plain = re.sub(r"</?b>", "", str(preview_text), flags=re.I)
         caption = (
             f"{html.escape(preview_label)}\n\n"
-            f"{html.escape(preview_text)}\n\n"
-            "<i>La vista previa conserva los botones y el flujo real de acceso. "
-            "Gemini no cambia precios, métodos ni permisos.</i>"
+            f"{html.escape(preview_plain)}\n\n"
+            "<i>Los botones son solo de muestra; no ejecutan pagos ni abren enlaces.</i>"
         )
     else:
+        markup = _markup_admin_bienvenida_inicio_pago(
+            bool(foto_personalizada),
+            bool(instrucciones),
+            bool(instrucciones_oferta),
+        )
         estado_foto = "personalizada" if foto_personalizada else "foto original"
+        estado_foto_pago = "personalizada" if foto_menu_pago else "foto original"
         estado_texto = "instrucciones personalizadas" if instrucciones else "estilo predeterminado"
         estado_oferta = (
             "instrucciones personalizadas"
             if instrucciones_oferta
             else "estilo predeterminado"
         )
+        estado_cta = "personalizado" if instrucciones_cta else "predeterminado"
+        estado_freepass = (
+            "personalizado" if instrucciones_freepass else "predeterminado"
+        )
         caption = (
-            "👋 <b>Bienvenida del /start</b>\n\n"
-            "Esta foto y el estilo de la bienvenida son independientes de la foto "
-            "del menú de pagos y del saludo de Telegram Business.\n\n"
-            f"Foto: <b>{estado_foto}</b>.\n"
-            f"Saludo de Gemini: <b>{estado_texto}</b>.\n"
-            f"Oferta Gold Pass de Gemini: <b>{estado_oferta}</b>.\n"
-            "La bienvenida incluye Free Club. Antes de mostrar los pagos, el bot "
-            "explica el contenido y espera una confirmación. Los datos fijos y el "
-            "flujo de pago no se pueden cambiar con Gemini.\n\n"
+            "⚙️ <b>Configuración general de /start</b>\n\n"
+            "Aquí organizas las fotos, los mensajes generados por Gemini y las "
+            "etiquetas de los botones del recorrido privado.\n\n"
+            f"Foto de bienvenida: <b>{estado_foto}</b>.\n"
+            f"Foto del menú de pago: <b>{estado_foto_pago}</b>.\n"
+            f"Estilo del saludo: <b>{estado_texto}</b>.\n"
+            f"Estilo de oferta Gold Pass: <b>{estado_oferta}</b>.\n"
+            f"Estilo de llamada al pago: <b>{estado_cta}</b>.\n"
+            f"Estilo de mensajes Free Pass: <b>{estado_freepass}</b>.\n"
+            "El mensaje inicial para elegir idioma queda fijo. Después, Gemini "
+            "responde en el idioma elegido. Precios, datos bancarios, enlaces y "
+            "acciones de pago/acceso siguen protegidos.\n\n"
             f"{html.escape(_estado_persistencia_admin())}"
         )
         if instrucciones:
@@ -4529,6 +5565,16 @@ def mostrar_admin_bienvenida_inicio_pago(
             caption += (
                 "\n\n<b>Estilo/condiciones de oferta guardadas:</b>\n"
                 f"{html.escape(instrucciones_oferta[:300])}"
+            )
+        if instrucciones_cta:
+            caption += (
+                "\n\n<b>Estilo de llamada al pago:</b>\n"
+                f"{html.escape(instrucciones_cta[:300])}"
+            )
+        if instrucciones_freepass:
+            caption += (
+                "\n\n<b>Estilo de mensajes Free Pass:</b>\n"
+                f"{html.escape(instrucciones_freepass[:300])}"
             )
     if aviso:
         caption = f"✅ {html.escape(aviso)}\n\n{caption}"
@@ -4571,8 +5617,8 @@ def _mostrar_prompt_instrucciones_bienvenida_pago(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver",
-            callback_data="admin_start_welcome_back",
+            "🔙 Volver a mensajes de Gemini",
+            callback_data="admin_start_messages",
         )
     )
     return editar_o_enviar_panel(
@@ -4597,8 +5643,8 @@ def _mostrar_prompt_instrucciones_oferta_goldpass(
 ):
     markup = types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
-            "🔙 Volver",
-            callback_data="admin_start_welcome_back",
+            "🔙 Volver a mensajes de Gemini",
+            callback_data="admin_start_messages",
         )
     )
     return editar_o_enviar_panel(
@@ -4616,6 +5662,62 @@ def _mostrar_prompt_instrucciones_oferta_goldpass(
     )
 
 
+def _mostrar_prompt_instrucciones_cta_pago(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Volver a mensajes de Gemini",
+            callback_data="admin_start_messages",
+        )
+    )
+    texto = (
+        "✍️ <b>Llamada al menú de pago</b>\n\n"
+        "Indica cómo quieres que Gemini invite a tocar los métodos de pago o el "
+        "Pase Exprés. El precio y los métodos disponibles no se pueden cambiar "
+        "desde este texto. Máximo 600 caracteres; /cancelar vuelve atrás."
+    )
+    if aviso:
+        texto = f"⚠️ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+def _mostrar_prompt_instrucciones_freepass(
+    chat_id, message=None, message_id=None, aviso=None
+):
+    markup = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            "🔙 Volver a mensajes de Gemini",
+            callback_data="admin_start_messages",
+        )
+    )
+    texto = (
+        "✍️ <b>Mensajes de Free Gold Pass</b>\n\n"
+        "Indica el tono para explicar el pase disponible, pendiente o activo. "
+        "Gemini lo redactará en el idioma elegido y conservará la duración, la "
+        "fecha y cuándo comienza el plazo. Máximo 600 caracteres; /cancelar vuelve."
+    )
+    if aviso:
+        texto = f"⚠️ {html.escape(aviso)}\n\n" + texto
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        message_id=message_id,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
 def es_admin_privado(call):
     chat = getattr(getattr(call, "message", None), "chat", None)
     return (
@@ -4623,6 +5725,20 @@ def es_admin_privado(call):
         and getattr(chat, "type", None) == "private"
         and str(getattr(chat, "id", "")) == str(ADMIN_ID)
     )
+
+
+def _limpiar_edicion_inicio_admin(user_id):
+    estado = admin_estado.get(user_id, {})
+    if estado.get("paso") in {
+        "esperando_instrucciones_bienvenida_pago",
+        "esperando_instrucciones_oferta_goldpass",
+        "esperando_instrucciones_cta_pago",
+        "esperando_instrucciones_freepass",
+        "esperando_etiqueta_boton_inicio",
+        "esperando_foto_bienvenida_pago",
+        "esperando_foto_metodos_pago",
+    }:
+        admin_estado.pop(user_id, None)
 
 
 def _mostrar_prompt_instrucciones_compartir(chat_id, message=None, message_id=None):
@@ -4675,6 +5791,134 @@ def admin_abrir_bienvenida_inicio_pago(call):
 
 
 @bot.callback_query_handler(
+    func=lambda call: call.data.startswith("start_preview|")
+)
+def admin_clic_boton_vista_previa_start(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo está disponible en el panel privado.")
+        return
+    bot.answer_callback_query(call.id, "Solo vista previa; no se ejecutó ninguna acción.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_start_photos")
+def admin_abrir_fotos_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    _limpiar_edicion_inicio_admin(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    mostrar_admin_start_photos(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_start_messages")
+def admin_abrir_mensajes_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    _limpiar_edicion_inicio_admin(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    mostrar_admin_start_messages(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_button_labels|")
+)
+def admin_abrir_etiquetas_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    _limpiar_edicion_inicio_admin(call.from_user.id)
+    try:
+        page = int(call.data.split("|", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        page = 0
+    bot.answer_callback_query(call.id)
+    mostrar_admin_start_button_labels(
+        call.message.chat.id,
+        page=page,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_button|")
+)
+def admin_editar_etiqueta_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    try:
+        _, key, raw_page = call.data.split("|", 2)
+        page = int(raw_page)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "No pude validar ese botón.")
+        return
+    if key not in START_BUTTON_LABEL_TITLES:
+        bot.answer_callback_query(call.id, "Ese botón no se puede editar.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_etiqueta_boton_inicio",
+        "button_key": key,
+        "button_page": page,
+        "panel_message_id": call.message.message_id,
+    }
+    _mostrar_prompt_etiqueta_boton_inicio(
+        call.message.chat.id,
+        key,
+        page=page,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_start_button_reset|")
+)
+def admin_restaurar_etiqueta_inicio(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, key, raw_page = call.data.split("|", 2)
+        page = int(raw_page)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "No pude validar ese botón.")
+        return
+    if key not in START_BUTTON_LABEL_TITLES:
+        bot.answer_callback_query(call.id, "Ese botón no se puede editar.")
+        return
+    try:
+        def quitar_etiqueta(config):
+            labels = config.get("payment_start_button_labels", {})
+            if not isinstance(labels, dict):
+                return
+            labels.pop(key, None)
+            if labels:
+                config["payment_start_button_labels"] = labels
+            else:
+                config.pop("payment_start_button_labels", None)
+        actualizar_config(quitar_etiqueta)
+    except Exception:
+        app.logger.exception("No se pudo restaurar una etiqueta del recorrido /start.")
+        bot.answer_callback_query(call.id, "No se pudo guardar.")
+        return
+    _limpiar_edicion_inicio_admin(call.from_user.id)
+    bot.answer_callback_query(call.id, "Etiqueta original restaurada.")
+    mostrar_admin_start_button_labels(
+        call.message.chat.id,
+        page=page,
+        message=call.message,
+        aviso="Se restauró la traducción original.",
+    )
+
+
+@bot.callback_query_handler(
     func=lambda call: call.data == "admin_start_welcome_instructions"
 )
 def admin_editar_instrucciones_bienvenida(call):
@@ -4711,6 +5955,126 @@ def admin_editar_instrucciones_oferta_goldpass(call):
 
 
 @bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_cta_instructions"
+)
+def admin_editar_instrucciones_cta_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_instrucciones_cta_pago",
+        "panel_message_id": call.message.message_id,
+    }
+    _mostrar_prompt_instrucciones_cta_pago(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_freepass_instructions"
+)
+def admin_editar_instrucciones_freepass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id)
+    admin_estado[call.from_user.id] = {
+        "paso": "esperando_instrucciones_freepass",
+        "panel_message_id": call.message.message_id,
+    }
+    _mostrar_prompt_instrucciones_freepass(
+        call.message.chat.id,
+        message=call.message,
+    )
+
+
+def _mostrar_vista_previa_menu_pago(call):
+    language = "es"
+    config = cargar_config()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    promo_activa = free_goldpass_activo()
+    precio_html = ""
+    if promo_activa:
+        texto = _texto_freepass_usuario(
+            language,
+            "available",
+            "24 horas",
+        )
+        markup.add(types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("freepass_start", language, config),
+            callback_data="start_preview|freepass",
+        ))
+    else:
+        pase_expres_disponible = pase_expres_activo()
+        menu_copy = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
+        precio_html = menu_copy["price"]
+        texto = _generar_cta_menu_pago(language, pase_expres_disponible)
+        if pase_expres_disponible:
+            markup.add(types.InlineKeyboardButton(
+                _etiqueta_boton_inicio("express", language, config),
+                callback_data="start_preview|express",
+            ))
+        methods = (
+            ("method_binance", "pago_binance"),
+            ("method_pago_pm", "pago_pm"),
+            ("method_pago_trans", "pago_trans"),
+            ("method_pago_usa", "pago_usa"),
+            ("method_pago_mex", "pago_mex"),
+            ("method_pago_airtm", "pago_airtm"),
+            ("method_pago_wally", "pago_wally"),
+            ("method_pago_visa_mc", "pago_visa_mc"),
+            ("method_pago_iban", "pago_iban"),
+            ("method_pago_paypal", "pago_PayPal"),
+        )
+        markup.add(*[
+            types.InlineKeyboardButton(
+                _etiqueta_boton_inicio(key, language, config),
+                callback_data=f"start_preview|{callback_data}",
+            )
+            for key, callback_data in methods
+        ])
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a configuración general",
+        callback_data="admin_start_welcome_back",
+    ))
+    precio_linea = f"{precio_html}\n\n" if precio_html else ""
+    caption = (
+        "👀 <b>Vista previa · Menú de pago</b>\n\n"
+        f"{precio_linea}"
+        f"{html.escape(texto)}\n\n"
+        "<i>Los botones son de muestra. El precio, las opciones de pago y sus "
+        "acciones reales se conservan sin cambios.</i>"
+    )
+    photo = cargar_config_pagos().get("portada_file_id")
+    if not photo:
+        photo = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "portada.jpg",
+        )
+    try:
+        if photo:
+            return enviar_foto_panel(
+                call.message.chat.id,
+                photo,
+                caption,
+                markup,
+                forzar_reemplazo=True,
+            )
+    except Exception:
+        app.logger.exception("No se pudo mostrar la foto de vista previa del menú de pago.")
+    return editar_o_enviar_panel(
+        call.message.chat.id,
+        caption,
+        markup,
+        message=call.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
     func=lambda call: call.data == "admin_start_offer_preview"
 )
 def admin_previsualizar_oferta_goldpass(call):
@@ -4725,6 +6089,17 @@ def admin_previsualizar_oferta_goldpass(call):
         preview_text=texto,
         preview_label="👀 Oferta Gold Pass · Español",
     )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_payment_preview"
+)
+def admin_previsualizar_menu_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    bot.answer_callback_query(call.id, "Preparando la vista previa…")
+    _mostrar_vista_previa_menu_pago(call)
 
 
 @bot.callback_query_handler(
@@ -4748,10 +6123,57 @@ def admin_restaurar_instrucciones_oferta_goldpass(call):
         return
     admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
-    mostrar_admin_bienvenida_inicio_pago(
+    mostrar_admin_start_messages(
         call.message.chat.id,
         message=call.message,
         aviso="Instrucciones de oferta restablecidas.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_cta_reset"
+)
+def admin_restaurar_instrucciones_cta_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        actualizar_config(
+            lambda config: config.update({"payment_start_cta_instructions": ""})
+        )
+    except Exception:
+        app.logger.exception("No se pudo restablecer el estilo de llamada al pago.")
+        bot.answer_callback_query(call.id, "No se pudo guardar.")
+        return
+    bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
+    mostrar_admin_start_messages(
+        call.message.chat.id,
+        message=call.message,
+        aviso="Llamada al menú de pagos restablecida.",
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "admin_start_freepass_reset"
+)
+def admin_restaurar_instrucciones_freepass(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        actualizar_config(
+            lambda config: config.update({"payment_start_freepass_instructions": ""})
+        )
+    except Exception:
+        app.logger.exception("No se pudo restablecer el estilo de Free Gold Pass.")
+        bot.answer_callback_query(call.id, "No se pudo guardar.")
+        return
+    _FREEPASS_COPY_CACHE.clear()
+    bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
+    mostrar_admin_start_messages(
+        call.message.chat.id,
+        message=call.message,
+        aviso="Mensajes de Free Gold Pass restablecidos.",
     )
 
 
@@ -4802,7 +6224,7 @@ def admin_restaurar_instrucciones_bienvenida(call):
         return
     admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "Estilo predeterminado restaurado.")
-    mostrar_admin_bienvenida_inicio_pago(
+    mostrar_admin_start_messages(
         call.message.chat.id,
         message=call.message,
         aviso="Instrucciones restablecidas.",
@@ -4868,7 +6290,7 @@ def admin_restaurar_foto_bienvenida_pago(call):
         bot.answer_callback_query(call.id, "No se pudo guardar.")
         return
     bot.answer_callback_query(call.id, "Se usará la foto original.")
-    mostrar_admin_bienvenida_inicio_pago(
+    mostrar_admin_start_photos(
         call.message.chat.id,
         message=call.message,
         aviso="Foto original restaurada.",
@@ -4886,7 +6308,7 @@ def admin_cancelar_foto_bienvenida_pago(call):
     if estado.get("paso") == "esperando_foto_bienvenida_pago":
         admin_estado.pop(call.from_user.id, None)
     bot.answer_callback_query(call.id, "No se guardaron cambios.")
-    mostrar_admin_bienvenida_inicio_pago(
+    mostrar_admin_start_photos(
         call.message.chat.id,
         message=call.message,
     )
@@ -4899,14 +6321,9 @@ def admin_volver_bienvenida_inicio_pago(call):
     if not es_admin_privado(call):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
-    estado = admin_estado.get(call.from_user.id, {})
-    if estado.get("paso") in (
-        "esperando_instrucciones_bienvenida_pago",
-        "esperando_instrucciones_oferta_goldpass",
-    ):
-        admin_estado.pop(call.from_user.id, None)
-    bot.answer_callback_query(call.id, "Edición cancelada.")
-    mostrar_admin_config_pagos(
+    _limpiar_edicion_inicio_admin(call.from_user.id)
+    bot.answer_callback_query(call.id, "Volviendo a configuración general.")
+    mostrar_admin_bienvenida_inicio_pago(
         call.message.chat.id,
         message=call.message,
     )
@@ -5513,7 +6930,13 @@ def admin_cancelar_edicion_pagos(call):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
     bot.answer_callback_query(call.id, "Edición cancelada.")
-    admin_estado.pop(call.from_user.id, None)
+    estado = admin_estado.pop(call.from_user.id, None) or {}
+    if estado.get("paso") == "esperando_foto_metodos_pago":
+        return mostrar_admin_start_photos(
+            call.message.chat.id,
+            message=call.message,
+            aviso="No se guardaron cambios.",
+        )
     mostrar_admin_config_pagos(
         call.message.chat.id,
         message=call.message,
@@ -6140,8 +7563,8 @@ def procesar_vencimiento_freepass(registro):
             except ValueError:
                 pass
         actual["status"] = "expiring"
-        FreeGoldPasses.upsert(actual, FREE_GOLDPASS_QUERY.id == user_id)
     registro = actual
+    _guardar_freepass(registro)
 
     error_desactivacion = None
     try:
@@ -6182,17 +7605,18 @@ def procesar_vencimiento_freepass(registro):
 
     with FREE_GOLDPASS_LOCK:
         actual = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id) or registro
-        actual["status"] = estado
-        actual["last_kick_attempt"] = datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        if estado == "expired":
-            actual["expired_at"] = actual["last_kick_attempt"]
-        if error_expulsion:
-            actual["last_kick_error"] = error_expulsion[:500]
-        if error_desactivacion:
-            actual["last_expiry_error"] = error_desactivacion[:500]
-        FreeGoldPasses.upsert(actual, FREE_GOLDPASS_QUERY.id == user_id)
+        actual = dict(actual)
+    actual["status"] = estado
+    actual["last_kick_attempt"] = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    if estado == "expired":
+        actual["expired_at"] = actual["last_kick_attempt"]
+    if error_expulsion:
+        actual["last_kick_error"] = error_expulsion[:500]
+    if error_desactivacion:
+        actual["last_expiry_error"] = error_desactivacion[:500]
+    _guardar_freepass(actual)
 
     if not registro.get("notified_at"):
         try:
@@ -6204,11 +7628,10 @@ def procesar_vencimiento_freepass(registro):
                     else "Tu pase venció; el bot está terminando la expiración y tu salida del canal."
                 ),
             )
-            with FREE_GOLDPASS_LOCK:
-                FreeGoldPasses.update(
-                    {"notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-                    FREE_GOLDPASS_QUERY.id == user_id,
-                )
+            _actualizar_freepass(
+                user_id,
+                {"notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+            )
         except Exception:
             app.logger.exception(
                 "No se pudo notificar el vencimiento de Free Gold Pass al usuario."
@@ -6224,11 +7647,7 @@ def procesar_vencimiento_freepass(registro):
                 parse_mode="HTML",
                 protect_content=True,
             )
-            with FREE_GOLDPASS_LOCK:
-                FreeGoldPasses.update(
-                    {"expiry_error_notified": True},
-                    FREE_GOLDPASS_QUERY.id == user_id,
-                )
+            _actualizar_freepass(user_id, {"expiry_error_notified": True})
         except Exception:
             app.logger.exception(
                 "No se pudo informar al administrador de un fallo de expulsión."
@@ -6240,6 +7659,7 @@ def revisar_vencimientos_free_goldpass():
     while True:
         ahora = datetime.now()
         try:
+            _supabase_sincronizar_suscripciones()
             with FREE_GOLDPASS_LOCK:
                 vencidos = [
                     dict(registro)
@@ -6267,12 +7687,22 @@ def revisar_vencimientos_free_goldpass():
 def revisar_vencimientos():
     while True:
         ahora = datetime.now()
-        vencidos = db.search(Query().vence <= ahora.strftime('%Y-%m-%d %H:%M:%S'))
-        for u in vencidos:
-            try:
-                expulsar_usuario_vencido(u['id'])
-            except:
-                pass
+        try:
+            _supabase_sincronizar_suscripciones()
+            vencidos = db.search(
+                Query().vence <= ahora.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            for usuario in vencidos:
+                try:
+                    expulsar_usuario_vencido(usuario["id"])
+                except Exception:
+                    app.logger.exception(
+                        "No se pudo procesar un vencimiento VIP."
+                    )
+        except Exception:
+            app.logger.exception(
+                "No se pudieron revisar los vencimientos VIP."
+            )
         time.sleep(3600)
 
 def guardar_foto_compartir_asistente(message, foto_id):
@@ -6337,7 +7767,7 @@ def guardar_foto_bienvenida_pago(message, foto_id):
         return True
     admin_estado.pop(uid, None)
     eliminar_mensaje_disparador(message)
-    mostrar_admin_bienvenida_inicio_pago(
+    mostrar_admin_start_photos(
         message.chat.id,
         message_id=panel_message_id,
         aviso="Foto de bienvenida actualizada; la foto del menú de pagos no cambió.",
@@ -6568,6 +7998,9 @@ def reclamar_free_goldpass(call):
         )
         return
 
+    if enlace_nuevo and registro:
+        _guardar_freepass(registro)
+
     bot.answer_callback_query(
         call.id,
         "Tu enlace personal está listo."
@@ -6672,11 +8105,13 @@ def _guardar_estado_invitacion_vip(user_id, cambios):
         if not registro:
             with SUSCRIPCIONES_LOCK:
                 SUSCRIPCIONES_ARCHIVO.update(cambios, Query().id == user_id)
+            _supabase_guardar_local("paid", user_id)
             return None
         registro = dict(registro)
         _guardar_archivo_suscripcion(registro)
         with SUSCRIPCIONES_LOCK:
             SUSCRIPCIONES_ARCHIVO.update(cambios, Query().id == user_id)
+        _supabase_guardar_local("paid", user_id)
         return registro
 
 
@@ -6954,6 +8389,7 @@ def confirmar_acceso_goldpass(call):
             consulta.id == user_id,
         )
 
+    _sincronizar_suscripcion_pagada_desde_db(user_id)
     enlace_vip = None
     bienvenida = None
     try:
@@ -7046,6 +8482,7 @@ def confirmar_acceso_goldpass(call):
             },
             consulta.id == user_id,
         )
+        _sincronizar_suscripcion_pagada_desde_db(user_id)
         app.logger.exception(
             "No se pudo crear o entregar el enlace GoldPass individual."
         )
@@ -7135,6 +8572,7 @@ def admin_aprobar_pase_expres(call):
             {"access_message_id": mensaje_acceso.message_id},
             Query().id == user_id,
         )
+        _sincronizar_suscripcion_pagada_desde_db(user_id)
     except Exception as e:
         bot.send_message(int(ADMIN_ID),
             f"⚠️ No pude notificar al usuario <code>{user_id}</code> ({e}).\n"
@@ -7203,14 +8641,23 @@ def admin_rechazar_pase_expres(call):
 @bot.callback_query_handler(func=lambda call: call.data == "pago_usa")
 def pago_usa_submenu(call):
     bot.answer_callback_query(call.id)
+    language = PAYMENT_USER_LANGUAGE.get(int(call.from_user.id), "es")
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("🏦 Transferencia Bancaria USA", callback_data="pago_usa_bank"),
-        types.InlineKeyboardButton("🔗 Pago por Link",              callback_data="pago_usa_link"),
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("method_usa_bank", language),
+            callback_data="pago_usa_bank",
+        ),
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("method_usa_link", language),
+            callback_data="pago_usa_link",
+        ),
     )
     editar_o_enviar_panel(
         call.message.chat.id,
-        "🇺🇸 <b>Cuenta USA — Elige tu forma de pago:</b>",
+        PAYMENT_USA_MENU_COPY.get(
+            language, PAYMENT_USA_MENU_COPY["es"]
+        ),
         markup,
         message=call.message,
         protect_content=True,
@@ -7657,7 +9104,8 @@ def _mostrar_datos_pago_admin(user_id, metodo, indice=0, message=None):
         return editar_o_enviar_panel(
             int(ADMIN_ID),
             f"⚠️ No hay información configurada para {html.escape(nombre_metodo)}. "
-            "Ve a /admin → Métodos de pago e imagen para actualizarla.",
+            "Ve a /admin → Métodos de pagos y configuración general → "
+            "Configuración general de /start para actualizarla.",
             _markup_cola_solicitudes_pago(),
             message=message,
             protect_content=True,
@@ -7890,6 +9338,7 @@ def admin_aprobar(call):
             {"access_message_id": mensaje_acceso.message_id},
             Query().id == user_id,
         )
+        _sincronizar_suscripcion_pagada_desde_db(user_id)
     except Exception as e:
         bot.send_message(
             int(ADMIN_ID),
@@ -8015,6 +9464,7 @@ def aprobar(message):
             {"access_message_id": mensaje_acceso.message_id},
             Query().id == user_id,
         )
+        _sincronizar_suscripcion_pagada_desde_db(user_id)
         bot.send_message(int(ADMIN_ID),
             f"✅ Botón de confirmación de acceso enviado a <code>{user_id}</code>.",
             parse_mode="HTML")
@@ -8133,7 +9583,10 @@ def listar_vip(message):
 def mostrar_panel_admin(chat_id, message=None):
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
-        types.InlineKeyboardButton("💳 Métodos de pago e imagen", callback_data="admin_pagos"),
+        types.InlineKeyboardButton(
+            "💳 Métodos de pagos y configuración general",
+            callback_data="admin_pagos",
+        ),
         types.InlineKeyboardButton("⚙️ Grupos y canales", callback_data="grupos_admin"),
     )
     return editar_o_enviar_panel(chat_id, "🛠 Panel privado de administración", markup, message=message, protect_content=True)
@@ -10138,25 +11591,38 @@ def _mostrar_inicio_privado(chat_id):
 
 def _markup_selector_idioma_pago():
     markup = types.InlineKeyboardMarkup(row_width=2)
+    ui_config = cargar_config()
     markup.add(
-        types.InlineKeyboardButton("🇪🇸 Español", callback_data="payment_language|es"),
-        types.InlineKeyboardButton("🇺🇸 English", callback_data="payment_language|en"),
-        types.InlineKeyboardButton("🇧🇷 Português", callback_data="payment_language|pt"),
-        types.InlineKeyboardButton("🇮🇹 Italiano", callback_data="payment_language|it"),
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("language_es", "es", ui_config),
+            callback_data="payment_language|es",
+        ),
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("language_en", "es", ui_config),
+            callback_data="payment_language|en",
+        ),
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("language_pt", "es", ui_config),
+            callback_data="payment_language|pt",
+        ),
+        types.InlineKeyboardButton(
+            _etiqueta_boton_inicio("language_it", "es", ui_config),
+            callback_data="payment_language|it",
+        ),
     )
     return markup
 
 
 def _markup_confirmar_metodos_pago(user_id, language):
-    textos = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
+    ui_config = cargar_config()
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(
-            textos["confirm"],
+            _etiqueta_boton_inicio("confirm", language, ui_config),
             callback_data=f"payment_offer|{int(user_id)}|{language}",
         ),
         types.InlineKeyboardButton(
-            textos["free_club"],
+            _etiqueta_boton_inicio("free_club", language, ui_config),
             url=LINK_CANAL_GRATUITO,
         ),
     )
@@ -10164,30 +11630,30 @@ def _markup_confirmar_metodos_pago(user_id, language):
 
 
 def _markup_oferta_goldpass(user_id, language):
-    textos = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
+    ui_config = cargar_config()
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
         types.InlineKeyboardButton(
-            textos["offer_yes"],
+            _etiqueta_boton_inicio("offer_yes", language, ui_config),
             callback_data=f"payment_offer_yes|{int(user_id)}|{language}",
         ),
         types.InlineKeyboardButton(
-            textos["offer_no"],
+            _etiqueta_boton_inicio("offer_no", language, ui_config),
             callback_data=f"payment_offer_no|{int(user_id)}|{language}",
         ),
     )
     markup.add(types.InlineKeyboardButton(
-        textos["onlyfans"],
+        _etiqueta_boton_inicio("onlyfans", language, ui_config),
         url=ONLYFANS_URL,
     ))
     return markup
 
 
 def _markup_respuesta_rechazo_goldpass(user_id, language):
-    textos = PAYMENT_MENU_COPY.get(language, PAYMENT_MENU_COPY["es"])
+    ui_config = cargar_config()
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton(
-        textos["free_club"],
+        _etiqueta_boton_inicio("free_club", language, ui_config),
         url=LINK_CANAL_GRATUITO,
     ))
     return markup
@@ -10780,10 +12246,12 @@ def flujo_admin_pago(message):
         if paso in (
             "esperando_instrucciones_bienvenida_pago",
             "esperando_instrucciones_oferta_goldpass",
+            "esperando_instrucciones_cta_pago",
+            "esperando_instrucciones_freepass",
         ):
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
-            mostrar_admin_bienvenida_inicio_pago(
+            mostrar_admin_start_messages(
                 message.chat.id,
                 message_id=state.get("panel_message_id"),
                 aviso="No se guardaron cambios.",
@@ -10792,8 +12260,27 @@ def flujo_admin_pago(message):
         if paso == "esperando_foto_bienvenida_pago":
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_seguro(message.chat.id, message.message_id)
-            mostrar_admin_bienvenida_inicio_pago(
+            mostrar_admin_start_photos(
                 message.chat.id,
+                message_id=state.get("panel_message_id"),
+                aviso="No se guardaron cambios.",
+            )
+            return
+        if paso == "esperando_foto_metodos_pago":
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_admin_start_photos(
+                message.chat.id,
+                message_id=state.get("panel_message_id"),
+                aviso="No se guardaron cambios.",
+            )
+            return
+        if paso == "esperando_etiqueta_boton_inicio":
+            admin_estado.pop(message.from_user.id, None)
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            mostrar_admin_start_button_labels(
+                message.chat.id,
+                page=state.get("button_page", 0),
                 message_id=state.get("panel_message_id"),
                 aviso="No se guardaron cambios.",
             )
@@ -10851,7 +12338,7 @@ def flujo_admin_pago(message):
             return
         admin_estado.pop(message.from_user.id, None)
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
-        mostrar_admin_bienvenida_inicio_pago(
+        mostrar_admin_start_messages(
             message.chat.id,
             message_id=state.get("panel_message_id"),
             aviso="Gemini aplicará estas instrucciones al saludo inicial.",
@@ -10883,10 +12370,132 @@ def flujo_admin_pago(message):
             return
         admin_estado.pop(message.from_user.id, None)
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
-        mostrar_admin_bienvenida_inicio_pago(
+        mostrar_admin_start_messages(
             message.chat.id,
             message_id=state.get("panel_message_id"),
             aviso="Gemini usará estas instrucciones al explicar el Gold Pass.",
+        )
+        return
+    if paso in (
+        "esperando_instrucciones_cta_pago",
+        "esperando_instrucciones_freepass",
+    ):
+        if not text or len(text) > 600:
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            prompt = (
+                _mostrar_prompt_instrucciones_cta_pago
+                if paso == "esperando_instrucciones_cta_pago"
+                else _mostrar_prompt_instrucciones_freepass
+            )
+            prompt(
+                message.chat.id,
+                message_id=state.get("panel_message_id"),
+                aviso="Escribe un texto de hasta 600 caracteres.",
+            )
+            return
+        key = (
+            "payment_start_cta_instructions"
+            if paso == "esperando_instrucciones_cta_pago"
+            else "payment_start_freepass_instructions"
+        )
+        try:
+            actualizar_config(lambda config: config.update({key: text}))
+        except Exception:
+            app.logger.exception("No se pudieron guardar instrucciones del flujo /start.")
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            prompt = (
+                _mostrar_prompt_instrucciones_cta_pago
+                if paso == "esperando_instrucciones_cta_pago"
+                else _mostrar_prompt_instrucciones_freepass
+            )
+            prompt(
+                message.chat.id,
+                message_id=state.get("panel_message_id"),
+                aviso="No se pudo guardar. No se confirmó ningún cambio; inténtalo otra vez.",
+            )
+            return
+        if key == "payment_start_freepass_instructions":
+            _FREEPASS_COPY_CACHE.clear()
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_admin_start_messages(
+            message.chat.id,
+            message_id=state.get("panel_message_id"),
+            aviso="Gemini usará estas instrucciones en el idioma elegido.",
+        )
+        return
+    if paso == "esperando_etiqueta_boton_inicio":
+        key = state.get("button_key")
+        page = state.get("button_page", 0)
+        valid_text = (
+            bool(text)
+            and "\n" not in text
+            and "\r" not in text
+            and len(text.encode("utf-8")) <= 60
+            and not re.search(r"https?://|t\.me/|<[^>]+>", text, re.I)
+        )
+        if key not in START_BUTTON_LABEL_TITLES or not valid_text:
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            if key in START_BUTTON_LABEL_TITLES:
+                _mostrar_prompt_etiqueta_boton_inicio(
+                    message.chat.id,
+                    key,
+                    page=page,
+                    message_id=state.get("panel_message_id"),
+                    aviso="Texto inválido: máximo 60 bytes, una sola línea y sin enlaces.",
+                )
+            else:
+                admin_estado.pop(message.from_user.id, None)
+                mostrar_admin_start_button_labels(
+                    message.chat.id,
+                    page=page,
+                    message_id=state.get("panel_message_id"),
+                    aviso="No se pudo validar el botón.",
+                )
+            return
+        try:
+            traducciones = _traducir_etiqueta_boton_inicio(text)
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo traducir una etiqueta /start (error=%s).",
+                type(error).__name__,
+            )
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            _mostrar_prompt_etiqueta_boton_inicio(
+                message.chat.id,
+                key,
+                page=page,
+                message_id=state.get("panel_message_id"),
+                aviso="Gemini no pudo traducir la etiqueta. No se guardó; verifica la conexión e inténtalo otra vez.",
+            )
+            return
+
+        def guardar_etiqueta(config):
+            labels = config.get("payment_start_button_labels", {})
+            if not isinstance(labels, dict):
+                labels = {}
+            labels[key] = traducciones
+            config["payment_start_button_labels"] = labels
+        try:
+            actualizar_config(guardar_etiqueta)
+        except Exception:
+            app.logger.exception("No se pudo guardar una etiqueta del recorrido /start.")
+            eliminar_mensaje_seguro(message.chat.id, message.message_id)
+            _mostrar_prompt_etiqueta_boton_inicio(
+                message.chat.id,
+                key,
+                page=page,
+                message_id=state.get("panel_message_id"),
+                aviso="No se pudo guardar en el almacenamiento configurado. No se aplicó ningún cambio.",
+            )
+            return
+        admin_estado.pop(message.from_user.id, None)
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+        mostrar_admin_start_button_labels(
+            message.chat.id,
+            page=page,
+            message_id=state.get("panel_message_id"),
+            aviso="Botón actualizado y traducido a los cuatro idiomas.",
         )
         return
     if paso == "esperando_foto_bienvenida_pago":
@@ -11292,15 +12901,14 @@ def procesar_comprobante_admin(message, file_id, file_type):
                 },
             )
         else:
-            with SUSCRIPCIONES_LOCK:
-                FreeGoldPasses.update(
-                    {
-                        "comprobante_file_id": file_id,
-                        "comprobante_tipo": file_type,
-                        "comprobante_fecha": momento,
-                    },
-                    FREE_GOLDPASS_QUERY.id == user_id,
-                )
+            _actualizar_freepass(
+                user_id,
+                {
+                    "comprobante_file_id": file_id,
+                    "comprobante_tipo": file_type,
+                    "comprobante_fecha": momento,
+                },
+            )
         pagina = int(estado.get("suscripcion_pagina", 0))
         panel_message_id = estado.get("panel_message_id")
         admin_estado.pop(message.from_user.id, None)
@@ -11531,18 +13139,15 @@ def aprobar_solicitud_goldpass(req):
                 bot.approve_chat_join_request(req.chat.id, user_id)
                 entrada = datetime.now().replace(microsecond=0)
                 vence = entrada + timedelta(seconds=duracion)
-                with FREE_GOLDPASS_LOCK:
-                    FreeGoldPasses.update(
-                        {
-                            "status": "active",
-                            "joined_at": entrada.strftime(
-                                "%Y-%m-%d %H:%M:%S"
-                            ),
-                            "vence": vence.strftime("%Y-%m-%d %H:%M:%S"),
-                            "in_channel": True,
-                        },
-                        FREE_GOLDPASS_QUERY.id == user_id,
-                    )
+                _actualizar_freepass(
+                    user_id,
+                    {
+                        "status": "active",
+                        "joined_at": entrada.strftime("%Y-%m-%d %H:%M:%S"),
+                        "vence": vence.strftime("%Y-%m-%d %H:%M:%S"),
+                        "in_channel": True,
+                    },
+                )
                 try:
                     bot.revoke_chat_invite_link(req.chat.id, invite_url)
                 except Exception:
@@ -12323,8 +13928,15 @@ if __name__ == "__main__":
     if _supabase_configurado():
         app.logger.info(
             "Supabase está configurado para conservar los ajustes de fotos "
-            "y la bienvenida de /start."
+            "y la bienvenida de /start y las suscripciones."
         )
+        if _supabase_sincronizar_suscripciones(force=True):
+            app.logger.info("El registro de suscripciones se sincronizó con Supabase.")
+        else:
+            app.logger.warning(
+                "No se pudo sincronizar suscripciones con Supabase; "
+                "el bot conservará el respaldo local."
+            )
     elif SUPABASE_URL or SUPABASE_SECRET_KEY:
         app.logger.warning(
             "La configuración de Supabase está incompleta; faltan variables de entorno."

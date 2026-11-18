@@ -15571,22 +15571,54 @@ def _mostrar_selector_idioma_pago(chat_id):
     )
 
 
-def _usuario_usa_inicio_directo(user_id, payload=""):
-    if (
-        str(user_id) == str(ADMIN_ID)
-        or free_goldpass_activo()
-    ):
-        return True
+def _mostrar_acceso_existente_despues_idioma(chat_id, user_id, language):
+    """Tras elegir idioma, conserva fuera del flujo de pago a miembros activos."""
+    user_id = int(user_id)
+    PAYMENT_USER_LANGUAGE[user_id] = language
+
+    # El administrador debe poder probar el saludo conversacional de /start.
+    if str(user_id) == str(ADMIN_ID):
+        return False
+
     pase = _registro_freepass(user_id)
     if pase and pase.get("status") in ("pending", "active"):
+        vence = _fecha_freepass(pase)
+        if pase.get("status") == "active" and vence and vence <= datetime.now():
+            procesar_vencimiento_freepass(pase)
+            mostrar_metodos_pago(chat_id, language=language)
+            return True
+        mostrar_menu_free_goldpass_usuario(chat_id, user_id, registro=pase)
         return True
-    return bool(_suscripcion_vip_activa(user_id))
+
+    if free_goldpass_activo():
+        mostrar_menu_free_goldpass_usuario(chat_id, user_id)
+        return True
+
+    suscripcion = _suscripcion_vip_activa(user_id)
+    if not suscripcion:
+        return False
+
+    vence = _fecha_freepass(suscripcion)
+    fecha = vence.strftime("%d/%m/%Y %H:%M") if vence else "—"
+    textos = {
+        "es": f"✅ Tu acceso a 🏆🎟GoldPass está activo hasta <b>{fecha}</b>.",
+        "en": f"✅ Your 🏆🎟GoldPass access is active until <b>{fecha}</b>.",
+        "pt": f"✅ Seu acesso ao 🏆🎟GoldPass está ativo até <b>{fecha}</b>.",
+        "it": f"✅ Il tuo accesso a 🏆🎟GoldPass è attivo fino al <b>{fecha}</b>.",
+    }
+    editar_o_enviar_panel(
+        chat_id,
+        textos.get(language, textos["es"]),
+        types.InlineKeyboardMarkup(),
+        protect_content=True,
+        parse_mode="HTML",
+        forzar_texto=True,
+    )
+    return True
 
 
 def _iniciar_inicio_pago(chat_id, user_id, payload=""):
-    if _usuario_usa_inicio_directo(user_id, payload):
-        PAYMENT_USER_LANGUAGE.setdefault(int(user_id), "es")
-        return _mostrar_inicio_privado(chat_id)
+    # Cada /start empieza por la selección de idioma, también para el admin.
     return _mostrar_selector_idioma_pago(chat_id)
 
 
@@ -15859,6 +15891,12 @@ def elegir_idioma_pago(call):
         bot.answer_callback_query(call.id, "Ese idioma no está disponible.")
         return
     bot.answer_callback_query(call.id)
+    if _mostrar_acceso_existente_despues_idioma(
+        chat.id,
+        call.from_user.id,
+        language,
+    ):
+        return
     _iniciar_conversacion_pago(chat.id, call.from_user.id, language)
 
 
@@ -17126,6 +17164,9 @@ def _procesar_solicitud_invitacion_vip(req, invite_url):
             user_id,
             dict(actual, invite_status="approved_waiting_join"),
         )
+        # Do not depend only on Telegram delivering chat_member later: once
+        # Telegram accepts the request, remove the invite button immediately.
+        _procesar_ingreso_vip_individual(req, user_id)
     return True
 
 

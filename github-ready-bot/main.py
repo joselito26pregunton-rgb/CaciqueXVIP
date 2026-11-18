@@ -1858,11 +1858,11 @@ def _business_saludo_reclamar(profile_id, recipient_id):
                 }
             except Exception as error:
                 app.logger.warning(
-                    "No se pudo reservar el saludo en Supabase; no se enviará "
-                    "para evitar duplicados (error=%s).",
+                    "No se pudo reservar el saludo en Supabase; se usará el "
+                    "registro local para no dejar al usuario sin respuesta "
+                    "(error=%s).",
                     type(error).__name__,
                 )
-                return {"claimed": False, "record": None, "error": True}
 
         if isinstance(legacy, dict):
             return {"claimed": False, "record": legacy}

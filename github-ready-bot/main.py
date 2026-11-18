@@ -10772,13 +10772,19 @@ def confirmar_acceso_goldpass(call):
         )
         if not estado_guardado:
             raise RuntimeError("No se pudo guardar la invitación individual.")
-        fase_entrega = "enviar el mensaje privado de acceso"
-        bienvenida = bot.send_message(
+        fase_entrega = "mostrar el botón de acceso"
+        bienvenida = editar_o_enviar_panel(
             user_id,
-            "⌛ Preparando tu acceso personal a GoldPass…",
-            parse_mode="HTML",
+            _normalizar_marca_goldpass(
+                "🎉 <b>¡Gracias por tu compra! Bienvenido/a a GoldPass.</b>\n\n"
+                "Pulsa el botón para solicitar tu entrada. El bot verificará "
+                "que la solicitud venga de tu cuenta y la aprobará automáticamente.\n\n"
+                "⏳ <i>Tu acceso es válido por 30 días.</i>"
+            ),
+            reply_markup=markup_enlace_canal_goldpass(enlace_vip),
             protect_content=True,
-            _force_new_message=True,
+            parse_mode="HTML",
+            forzar_texto=True,
         )
         estado_mensaje_guardado = _guardar_estado_invitacion_vip(
             user_id,
@@ -10790,18 +10796,6 @@ def confirmar_acceso_goldpass(call):
         )
         if not estado_mensaje_guardado:
             raise RuntimeError("La suscripción dejó de estar activa durante la entrega.")
-        fase_entrega = "mostrar el botón de acceso"
-        bot.edit_message_text(
-            "🎉 <b>¡Gracias por tu compra! Bienvenido/a a GoldPass.</b>\n\n"
-            "Pulsa el botón para solicitar tu entrada. El bot verificará que "
-            "la solicitud venga de tu cuenta y la aprobará automáticamente.\n\n"
-            "⏳ <i>Tu acceso es válido por 30 días.</i>",
-            chat_id=user_id,
-            message_id=bienvenida.message_id,
-            parse_mode="HTML",
-            reply_markup=markup_enlace_canal_goldpass(enlace_vip),
-            disable_web_page_preview=True,
-        )
         fase_entrega = "confirmar el registro del acceso"
         estado_entregado = _guardar_estado_invitacion_vip(
             user_id,

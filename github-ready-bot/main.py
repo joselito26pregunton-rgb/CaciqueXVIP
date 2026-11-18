@@ -4896,9 +4896,14 @@ def _guardar_archivo_suscripcion(
     with SUSCRIPCIONES_LOCK:
         previo = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id) or {}
         guardado = dict(previo)
-        estado = (
-            estado_forzado
-            or (
+        estado_entrada = str(
+            registro.get("estado") or registro.get("status") or ""
+        ).strip().lower()
+        revocado_at = registro.get("revoked_at")
+        estado = estado_forzado or (
+            "revoked"
+            if revocado_at or estado_entrada in ("revoked", "revocado", "revocada")
+            else (
                 "active"
                 if (_parsear_fecha_suscripcion(registro.get("vence")) or datetime.min)
                 > datetime.now()
@@ -4911,7 +4916,21 @@ def _guardar_archivo_suscripcion(
             "vence": str(registro.get("vence") or previo.get("vence") or ""),
             "tipo": "paid",
             "estado": estado,
+            "status": estado,
         })
+        if revocado_at:
+            guardado["revoked_at"] = str(revocado_at)
+        else:
+            guardado.pop("revoked_at", None)
+        if "revocation_error" in registro:
+            if registro.get("revocation_error"):
+                guardado["revocation_error"] = str(
+                    registro["revocation_error"]
+                )[:500]
+            else:
+                guardado.pop("revocation_error", None)
+        elif estado != "revoked":
+            guardado.pop("revocation_error", None)
         if touch_updated:
             guardado["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         elif registro.get("updated_at"):
@@ -4964,6 +4983,8 @@ def _guardar_archivo_suscripcion(
             "access_cleanup_status",
             "access_cleanup_updated_at",
             "access_followup_message_id",
+            "revoked_at",
+            "revocation_error",
         ):
             if campo in registro:
                 guardado[campo] = registro[campo]
@@ -5187,6 +5208,18 @@ def _sincronizar_suscripciones_pagadas():
     return conteos
 
 
+def _suscripcion_revocada(registro):
+    if not isinstance(registro, dict):
+        return False
+    estado = str(registro.get("estado") or "").strip().lower()
+    status = str(registro.get("status") or "").strip().lower()
+    return bool(
+        registro.get("revoked_at")
+        or estado in ("revoked", "revocado", "revocada")
+        or status in ("revoked", "revocado", "revocada")
+    )
+
+
 def _estado_panel_suscripcion(registro, ahora):
     vence = _parsear_fecha_suscripcion(registro.get("vence"))
     estado_original = registro.get("estado") or registro.get("status")
@@ -5211,10 +5244,14 @@ def _lista_suscripciones_admin():
     _supabase_sincronizar_suscripciones()
     registros = []
     for registro in SUSCRIPCIONES_ARCHIVO.all():
+        if _suscripcion_revocada(registro):
+            continue
         actual = dict(registro)
         actual["tipo"] = "paid"
         registros.append(actual)
     for registro in FreeGoldPasses.all():
+        if _suscripcion_revocada(registro):
+            continue
         if registro.get("status") not in (
             "active", "expired", "expiring", "kick_pending", "expiry_pending",
             "pending",
@@ -5300,7 +5337,7 @@ def _obtener_suscripcion_admin(tipo, user_id):
     if tipo == "free":
         _supabase_sincronizar_suscripciones()
         registro = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
-        if not registro:
+        if not registro or _suscripcion_revocada(registro):
             return None
         actual = dict(registro)
         pagada = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
@@ -5320,7 +5357,213 @@ def _obtener_suscripcion_admin(tipo, user_id):
         return None
     _supabase_sincronizar_suscripciones()
     registro = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
-    return dict(registro) if registro else None
+    return (
+        dict(registro)
+        if registro and not _suscripcion_revocada(registro)
+        else None
+    )
+
+
+def _retirar_miembro_canal_para_revocacion(user_id):
+    """Quita el acceso al canal si el usuario aún forma parte de él."""
+    try:
+        miembro = bot.get_chat_member(CANAL_ID, int(user_id))
+    except Exception as error:
+        return None, f"No pude comprobar su presencia en el canal: {error}"
+
+    estado = str(getattr(miembro, "status", "") or "")
+    es_miembro = estado in ("member", "administrator", "creator") or (
+        estado == "restricted" and bool(getattr(miembro, "is_member", False))
+    )
+    if estado in ("administrator", "creator"):
+        return True, "La cuenta tiene rol de administrador/creador y no se retiró."
+    if estado == "kicked":
+        try:
+            bot.unban_chat_member(CANAL_ID, int(user_id))
+            return False, None
+        except Exception as error:
+            return False, f"No pude reabrir su posibilidad de solicitar acceso: {error}"
+    if not es_miembro:
+        return False, None
+    try:
+        bot.ban_chat_member(CANAL_ID, int(user_id))
+    except Exception as error:
+        return True, f"No pude retirarlo del canal: {error}"
+    try:
+        bot.unban_chat_member(CANAL_ID, int(user_id))
+        return False, None
+    except Exception as error:
+        return False, (
+            "Fue retirado del canal, pero no pude quitar la restricción para "
+            f"una futura solicitud: {error}"
+        )
+
+
+def _revocar_accesos_goldpass_admin(user_id):
+    """Revoca todos los accesos paid/free, conserva recibos e historial."""
+    user_id = int(user_id)
+    _supabase_sincronizar_suscripciones()
+    pago_actual = db.get(Query().id == user_id)
+    pago_archivado = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
+    pase_gratis = FreeGoldPasses.get(FREE_GOLDPASS_QUERY.id == user_id)
+    if not any((pago_actual, pago_archivado, pase_gratis)):
+        return False, "No encontré suscripciones vigentes para esa cuenta."
+
+    pago = dict(pago_archivado or {})
+    if pago_actual:
+        for campo, valor in dict(pago_actual).items():
+            if valor is not None and valor != "":
+                pago[campo] = valor
+    pase = dict(pase_gratis or {})
+    mensajes_acceso = []
+    for registro in (pago_actual, pago_archivado, pase_gratis):
+        if not registro:
+            continue
+        for campo in ("access_welcome_message_id", "access_message_id"):
+            try:
+                message_id = int(registro.get(campo) or 0)
+            except (TypeError, ValueError):
+                message_id = 0
+            if message_id:
+                mensajes_acceso.append(message_id)
+
+    errores = []
+    # Retira primero al miembro; un fallo de Telegram queda visible al admin,
+    # pero la suscripción igualmente se revoca y ya no puede reusar el enlace.
+    en_canal, error_canal = _retirar_miembro_canal_para_revocacion(user_id)
+    if error_canal:
+        errores.append(error_canal[:350])
+    presencia_final = (
+        bool(en_canal)
+        if en_canal is not None
+        else None
+    )
+
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for registro in (pago, pase):
+        enlace = registro.get("invite_link")
+        if enlace:
+            try:
+                bot.revoke_chat_invite_link(CANAL_ID, enlace)
+            except Exception as error:
+                errores.append(
+                    f"No pude revocar una invitación pendiente: {str(error)[:250]}"
+                )
+
+    if pago:
+        pago.update({
+            "id": user_id,
+            "vence": ahora,
+            "estado": "revoked",
+            "status": "revoked",
+            "revoked_at": ahora,
+            "revocation_error": "; ".join(errores)[:500] or None,
+            "in_channel": (
+                presencia_final
+                if presencia_final is not None
+                else pago.get("in_channel")
+            ),
+            "vip_access_sent": False,
+            "vip_access_sending": False,
+            "vip_access_sending_at": None,
+            "expiry_kick_status": "revoked",
+            "invite_link": None,
+            "invite_status": "revoked",
+            "invite_revoked_at": ahora,
+            "invite_revoke_error": None,
+            "access_cleanup_status": "revoked",
+        })
+        if pago_actual:
+            db.update(
+                {
+                    campo: pago[campo]
+                    for campo in (
+                        "vence", "estado", "status", "revoked_at",
+                        "revocation_error", "in_channel", "vip_access_sent",
+                        "vip_access_sending", "vip_access_sending_at",
+                        "expiry_kick_status", "invite_link", "invite_status",
+                        "invite_revoked_at", "invite_revoke_error",
+                        "access_cleanup_status",
+                    )
+                },
+                Query().id == user_id,
+            )
+        _guardar_archivo_suscripcion(
+            pago,
+            estado_forzado="revoked",
+        )
+
+    if pase:
+        pase.update({
+            "id": user_id,
+            "status": "revoked",
+            "vence": ahora,
+            "revoked_at": ahora,
+            "revocation_error": "; ".join(errores)[:500] or None,
+            "in_channel": (
+                presencia_final
+                if presencia_final is not None
+                else pase.get("in_channel")
+            ),
+            "invite_link": None,
+            "invite_revoked_at": ahora,
+            "invite_revoke_error": None,
+        })
+        _guardar_freepass(pase)
+
+    if mensajes_acceso:
+        markup_vacio = types.InlineKeyboardMarkup()
+        texto_revocado = (
+            "🚫 <b>El acceso a GoldPass fue revocado.</b>\n\n"
+            "Si quieres volver a solicitarlo, inicia de nuevo con /start."
+        )
+        for message_id in set(mensajes_acceso):
+            try:
+                bot.edit_message_text(
+                    texto_revocado,
+                    chat_id=user_id,
+                    message_id=message_id,
+                    parse_mode="HTML",
+                    reply_markup=markup_vacio,
+                )
+            except Exception:
+                try:
+                    bot.edit_message_caption(
+                        caption=texto_revocado,
+                        chat_id=user_id,
+                        message_id=message_id,
+                        parse_mode="HTML",
+                        reply_markup=markup_vacio,
+                    )
+                except Exception:
+                    try:
+                        bot.edit_message_reply_markup(
+                            chat_id=user_id,
+                            message_id=message_id,
+                            reply_markup=markup_vacio,
+                        )
+                    except Exception:
+                        pass
+
+    try:
+        editar_o_enviar_panel(
+            user_id,
+            "🚫 <b>El acceso a GoldPass fue revocado.</b>\n\n"
+            "Si quieres volver a solicitarlo, inicia de nuevo con /start.",
+            types.InlineKeyboardMarkup(),
+            protect_content=True,
+            parse_mode="HTML",
+            forzar_texto=True,
+        )
+    except Exception:
+        errores.append("No pude avisar al usuario por el chat privado.")
+
+    if _supabase_configurado() and SUPABASE_SUBSCRIPTIONS_STATUS == "error":
+        errores.append("Supabase no confirmó el guardado del cambio.")
+    aviso = "Suscripción revocada; el historial y los comprobantes se conservaron."
+    if errores:
+        aviso += " Atención: " + "; ".join(errores)[:600]
+    return True, aviso
 
 
 def _registrar_estado_miembro_goldpass(user_id, en_canal, username=None):
@@ -5544,6 +5787,10 @@ def markup_detalle_suscripcion(tipo, user_id, pagina, tiene_comprobante):
     markup.add(types.InlineKeyboardButton(
         "📎 Adjuntar o reemplazar captura",
         callback_data=f"admin_suscripcion_adjuntar|{tipo}|{user_id}|{pagina}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "🚫 Revocar suscripción",
+        callback_data=f"admin_suscripcion_revocar|{tipo}|{user_id}|{pagina}",
     ))
     markup.add(types.InlineKeyboardButton(
         "🔙 Volver a la lista",
@@ -8787,6 +9034,110 @@ def admin_ver_suscripcion(call):
 
 
 @bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripcion_revocar|")
+)
+def admin_confirmar_revocacion_suscripcion(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, tipo, raw_user_id, raw_pagina = call.data.split("|", 3)
+        user_id, pagina = int(raw_user_id), int(raw_pagina)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Ficha no válida.")
+        return
+    if not _obtener_suscripcion_admin(tipo, user_id):
+        bot.answer_callback_query(
+            call.id,
+            "No encontré esa suscripción.",
+            show_alert=True,
+        )
+        mostrar_lista_suscripciones(
+            call.message.chat.id,
+            pagina,
+            message=call.message,
+        )
+        return
+
+    bot.answer_callback_query(call.id)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(
+            "✅ Sí, revocar accesos",
+            callback_data=f"admin_suscripcion_revocar_ok|{tipo}|{user_id}|{pagina}",
+        ),
+        types.InlineKeyboardButton(
+            "↩️ Cancelar",
+            callback_data=f"admin_suscripcion_ver|{tipo}|{user_id}|{pagina}",
+        ),
+    )
+    editar_o_enviar_panel(
+        call.message.chat.id,
+        "⚠️ <b>¿Revocar el acceso a GoldPass?</b>\n\n"
+        "Se desactivarán los accesos pagados y gratuitos de esta cuenta, "
+        "se intentará retirarla del canal y desaparecerá de la lista. "
+        "Se conservarán su historial y comprobantes. Después podrá iniciar "
+        "con /start y volver a solicitar acceso.",
+        markup,
+        message=call.message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("admin_suscripcion_revocar_ok|")
+)
+def admin_ejecutar_revocacion_suscripcion(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Sin permiso.")
+        return
+    try:
+        _, tipo, raw_user_id, raw_pagina = call.data.split("|", 3)
+        user_id, pagina = int(raw_user_id), int(raw_pagina)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "Ficha no válida.")
+        return
+    if tipo not in ("paid", "free"):
+        bot.answer_callback_query(call.id, "Tipo de suscripción no válido.")
+        return
+    if not _obtener_suscripcion_admin(tipo, user_id):
+        bot.answer_callback_query(
+            call.id,
+            "La ficha ya no está disponible.",
+            show_alert=True,
+        )
+        mostrar_lista_suscripciones(
+            call.message.chat.id,
+            pagina,
+            message=call.message,
+        )
+        return
+
+    exito, aviso = _revocar_accesos_goldpass_admin(user_id)
+    bot.answer_callback_query(
+        call.id,
+        aviso[:190] if aviso else "Revocación completada.",
+        show_alert=bool(not exito or "Atención:" in aviso),
+    )
+    if exito:
+        mostrar_lista_suscripciones(
+            call.message.chat.id,
+            pagina,
+            message=call.message,
+        )
+    else:
+        mostrar_detalle_suscripcion(
+            call.message.chat.id,
+            tipo,
+            user_id,
+            pagina,
+            message=call.message,
+            aviso=aviso,
+        )
+
+
+@bot.callback_query_handler(
     func=lambda call: call.data.startswith("admin_suscripcion_ver_comprobante|")
 )
 def admin_ver_comprobante_suscripcion(call):
@@ -9295,6 +9646,8 @@ def _expulsar_usuario_vencido_bajo_lock(user_id, forzar=False):
     if not registro:
         return False
     registro = dict(registro)
+    if _suscripcion_revocada(registro):
+        return False
     vencimiento_actual = _parsear_fecha_suscripcion(registro.get("vence"))
     if not forzar and (
         not vencimiento_actual or vencimiento_actual > datetime.now()
@@ -9618,14 +9971,24 @@ def revisar_vencimientos():
         ahora = datetime.now()
         try:
             _supabase_sincronizar_suscripciones()
-            vencidos = db.search(
-                Query().vence <= ahora.strftime("%Y-%m-%d %H:%M:%S")
-            )
+            vencidos = [
+                dict(registro)
+                for registro in db.all()
+                if isinstance(registro, dict)
+                and not _suscripcion_revocada(registro)
+                and (
+                    _parsear_fecha_suscripcion(registro.get("vence"))
+                    or datetime.max
+                )
+                <= ahora
+            ]
             conocidos = {int(item.get("id", 0) or 0) for item in vencidos}
             with SUSCRIPCIONES_LOCK:
                 reintentos = []
                 reintentos_aviso_pago = []
                 for item in SUSCRIPCIONES_ARCHIVO.all():
+                    if _suscripcion_revocada(item):
+                        continue
                     user_id = int(item.get("id", 0) or 0)
                     vencimiento = _parsear_fecha_suscripcion(item.get("vence"))
                     if not user_id or not vencimiento:
@@ -10343,6 +10706,11 @@ def procesar_pago_stars_exitoso(message):
                 "access_followup_message_id": None,
             }
         )
+        # A fresh Stars charge reactivates a previously revoked account.
+        registro.pop("revoked_at", None)
+        registro.pop("revocation_error", None)
+        registro.pop("estado", None)
+        registro.pop("status", None)
         registro = _guardar_archivo_suscripcion(
             registro,
             metodo="Telegram Stars",

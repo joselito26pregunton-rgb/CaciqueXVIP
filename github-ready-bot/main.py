@@ -3026,6 +3026,85 @@ def probar_conexion_gemini(message):
     )
 
 
+@bot.message_handler(commands=["goldpass_check"])
+def diagnosticar_acceso_goldpass(message):
+    """Diagnóstico de solo lectura para el administrador del canal VIP."""
+    if (
+        getattr(getattr(message, "chat", None), "type", None) != "private"
+        or str(getattr(getattr(message, "from_user", None), "id", ""))
+        != str(ADMIN_ID)
+    ):
+        return
+
+    lineas = [
+        "🔎 <b>Diagnóstico privado de acceso GoldPass</b>",
+        f"Canal configurado: <code>{html.escape(str(CANAL_ID))}</code>",
+    ]
+    bot_info = None
+    try:
+        bot_info = bot.get_me()
+        bot_username = getattr(bot_info, "username", None)
+        bot_id = getattr(bot_info, "id", None)
+        lineas.append(
+            "Bot de este servicio: "
+            f"<b>@{html.escape(str(bot_username))}</b> "
+            f"(ID <code>{html.escape(str(bot_id))}</code>)"
+            if bot_username
+            else f"Bot de este servicio: ID <code>{html.escape(str(bot_id))}</code>"
+        )
+    except Exception as error:
+        codigo = getattr(error, "error_code", None)
+        lineas.append(
+            "No pude consultar la identidad del bot: "
+            f"<code>{html.escape(str(codigo or type(error).__name__))}</code>"
+        )
+
+    try:
+        canal = bot.get_chat(CANAL_ID)
+        lineas.append(
+            "Canal reconocido por Telegram: "
+            f"<b>{html.escape(str(getattr(canal, 'title', '') or 'sin título'))}</b> "
+            f"(ID <code>{html.escape(str(getattr(canal, 'id', CANAL_ID)))}</code>)"
+        )
+    except Exception as error:
+        codigo = getattr(error, "error_code", None)
+        detalle = getattr(error, "description", None) or type(error).__name__
+        lineas.append(
+            "Telegram no dejó consultar el canal: "
+            f"<code>{html.escape(str(codigo or 'error'))}</code> "
+            f"{html.escape(str(detalle)[:220])}"
+        )
+
+    if bot_info:
+        try:
+            miembro = bot.get_chat_member(CANAL_ID, bot_info.id)
+            estado = getattr(miembro, "status", "desconocido")
+            invitar = bool(getattr(miembro, "can_invite_users", False))
+            expulsar = bool(getattr(miembro, "can_restrict_members", False))
+            lineas.extend(
+                [
+                    f"Estado del bot en ese canal: <b>{html.escape(str(estado))}</b>",
+                    f"Puede invitar: <b>{'sí' if invitar else 'no'}</b>",
+                    f"Puede restringir/expulsar: <b>{'sí' if expulsar else 'no'}</b>",
+                ]
+            )
+        except Exception as error:
+            codigo = getattr(error, "error_code", None)
+            detalle = getattr(error, "description", None) or type(error).__name__
+            lineas.append(
+                "Telegram no reconoce al bot como miembro del canal: "
+                f"<code>{html.escape(str(codigo or 'error'))}</code> "
+                f"{html.escape(str(detalle)[:220])}"
+            )
+
+    bot.send_message(
+        message.chat.id,
+        "\n".join(lineas),
+        parse_mode="HTML",
+        protect_content=True,
+    )
+
+
 def _procesar_saludo_business(message, connection_id, profile_id, recipient_id):
     markup = _markup_bienvenida_business()
     claim = _business_saludo_reclamar(profile_id, recipient_id)
@@ -10734,7 +10813,7 @@ def confirmar_acceso_goldpass(call):
         if not estado_entregado:
             raise RuntimeError("No se pudo confirmar la entrega del acceso individual.")
     except Exception as error:
-        enlace_revocado = not bool(enlace_vip)
+        enlace_revocado = False
         if enlace_vip:
             try:
                 enlace_revocado = _revocar_enlace_vip_individual(
@@ -10782,14 +10861,18 @@ def confirmar_acceso_goldpass(call):
             fase_entrega,
         )
         diagnostico = _resumen_error_entrega_goldpass(error)
-        estado_enlace = (
-            "El enlace emitido se revocó por seguridad."
-            if enlace_revocado
-            else (
+        if enlace_vip and enlace_revocado:
+            estado_enlace = "El enlace emitido se revocó por seguridad."
+        elif enlace_vip:
+            estado_enlace = (
                 "No pude confirmar la revocación del enlace; no lo compartas y "
                 "revísalo en el canal."
             )
-        )
+        else:
+            estado_enlace = (
+                "Telegram rechazó la solicitud antes de emitir el enlace; "
+                "no se creó ni se envió ninguna invitación."
+            )
         try:
             bot.send_message(
                 int(ADMIN_ID),

@@ -63,3 +63,5 @@ La tabla `bot_persistent_settings` guarda las referencias de las fotos y los aju
 Al vencer una suscripción, el bot intenta retirar al usuario del canal privado y le ofrece **300 Stars** o los otros métodos de pago. Stars usa una factura real de Telegram (`XTR`), no un enlace de invitación; el pago confirmado extiende el acceso 30 días y registra el identificador del cargo para evitar duplicarlo. El usuario recibe un botón de acceso personal que solo funciona para su cuenta.
 
 Si Telegram rechaza una expulsión, el bot conserva el vencimiento pendiente en el historial y vuelve a intentarlo cada minuto. Para completar la expulsión, el bot debe ser administrador de `-1003914257220` con permiso para restringir miembros. Para emitir enlaces personales, también necesita permiso para invitar usuarios.
+
+Si falla el acceso, el administrador puede enviar `/goldpass_check` en el chat privado del bot. El diagnóstico muestra qué bot está usando Render, qué canal reconoce Telegram y si tiene permisos para invitar o expulsar; nunca muestra el token.

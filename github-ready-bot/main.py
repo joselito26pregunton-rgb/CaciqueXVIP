@@ -936,7 +936,9 @@ def _supabase_configurado():
     return bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
 
 
-def _supabase_pedir(method, payload=None, table=None, query_parameters=None):
+def _supabase_pedir(
+    method, payload=None, table=None, query_parameters=None, prefer=None
+):
     if not _supabase_configurado():
         raise RuntimeError("Faltan las variables de conexión de Supabase.")
     table = table or SUPABASE_SETTINGS_TABLE
@@ -964,7 +966,9 @@ def _supabase_pedir(method, payload=None, table=None, query_parameters=None):
         headers["Authorization"] = f"Bearer {SUPABASE_SECRET_KEY}"
     if body is not None:
         headers["Content-Type"] = "application/json"
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        headers["Prefer"] = prefer or "resolution=merge-duplicates,return=minimal"
+    elif prefer:
+        headers["Prefer"] = prefer
     request = urllib.request.Request(
         endpoint,
         data=body,
@@ -1673,39 +1677,243 @@ def _business_saludo_key(profile_id, recipient_id):
     return f"{profile_key}:{recipient_key}"
 
 
-def _marcar_estado_business_saludo(profile_id, recipient_id, photo_sent):
+def _business_saludo_hashes(profile_id, recipient_id):
+    profile_key, recipient_key = _business_saludo_key(
+        profile_id, recipient_id
+    ).split(":", 1)
+    return profile_key, recipient_key
+
+
+def _business_saludo_leer_archivo():
+    try:
+        with open(BUSINESS_WELCOME_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("sent", {}), dict):
+        return {}
+    return data["sent"]
+
+
+def _business_saludo_escribir_archivo(sent):
+    temporary = BUSINESS_WELCOME_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as file:
+        json.dump({"sent": sent}, file, ensure_ascii=False, indent=2)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temporary, BUSINESS_WELCOME_FILE)
+
+
+BUSINESS_WELCOME_TABLE = "bot_business_welcome_records"
+
+
+def _business_saludo_insertar_supabase(profile_hash, recipient_hash, record):
+    return _supabase_pedir(
+        "POST",
+        {
+            "profile_hash": profile_hash,
+            "recipient_hash": recipient_hash,
+            "status": record.get("status", "sent"),
+            "photo_sent": bool(record.get("photo_sent")),
+            "claim_id": str(record.get("claim_id") or ""),
+            "claimed_at": record.get("claimed_at") or datetime.now(timezone.utc).isoformat(),
+            "sent_at": record.get("sent_at"),
+        },
+        table=BUSINESS_WELCOME_TABLE,
+        query_parameters={"on_conflict": "profile_hash,recipient_hash"},
+        prefer="resolution=ignore-duplicates,return=representation",
+    )
+
+
+def _business_saludo_leer_supabase(profile_hash, recipient_hash):
+    rows = _supabase_pedir(
+        "GET",
+        table=BUSINESS_WELCOME_TABLE,
+        query_parameters={
+            "profile_hash": f"eq.{profile_hash}",
+            "recipient_hash": f"eq.{recipient_hash}",
+            "select": "status,photo_sent,claim_id,claimed_at,sent_at",
+            "limit": "1",
+        },
+    )
+    if not isinstance(rows, list):
+        raise ValueError("Supabase devolvió un registro de saludo inválido.")
+    return rows[0] if rows and isinstance(rows[0], dict) else None
+
+
+def _marcar_estado_business_saludo(
+    profile_id, recipient_id, photo_sent, claim_id=None
+):
     with BUSINESS_WELCOME_LOCK:
-        try:
-            with open(BUSINESS_WELCOME_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
-        sent = data.setdefault("sent", {})
-        if not isinstance(sent, dict):
-            sent = {}
-            data["sent"] = sent
-        sent[_business_saludo_key(profile_id, recipient_id)] = {
-            "sent_at": datetime.now(timezone.utc).isoformat(),
+        ahora = datetime.now(timezone.utc).isoformat()
+        key = _business_saludo_key(profile_id, recipient_id)
+        profile_hash, recipient_hash = _business_saludo_hashes(
+            profile_id, recipient_id
+        )
+        if _supabase_configurado():
+            try:
+                _supabase_pedir(
+                    "PATCH",
+                    {
+                        "status": "sent",
+                        "photo_sent": bool(photo_sent),
+                        "sent_at": ahora,
+                    },
+                    table=BUSINESS_WELCOME_TABLE,
+                    query_parameters={
+                        "profile_hash": f"eq.{profile_hash}",
+                        "recipient_hash": f"eq.{recipient_hash}",
+                        **(
+                            {"claim_id": f"eq.{claim_id}"}
+                            if claim_id
+                            else {}
+                        ),
+                    },
+                    prefer="return=minimal",
+                )
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo guardar el estado del saludo en Supabase "
+                    "(error=%s).",
+                    type(error).__name__,
+                )
+
+        sent = _business_saludo_leer_archivo()
+        record = sent.get(key, {})
+        sent[key] = {
+            **(record if isinstance(record, dict) else {}),
+            "sent_at": ahora,
             "photo_sent": bool(photo_sent),
+            "status": "sent",
+            **({"claim_id": str(claim_id)} if claim_id else {}),
         }
-        temporary = BUSINESS_WELCOME_FILE + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
-        os.replace(temporary, BUSINESS_WELCOME_FILE)
+        _business_saludo_escribir_archivo(sent)
 
 
 def _business_saludo_estado(profile_id, recipient_id):
     with BUSINESS_WELCOME_LOCK:
-        try:
-            with open(BUSINESS_WELCOME_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None
-        sent = data.get("sent", {}) if isinstance(data, dict) else {}
+        profile_hash, recipient_hash = _business_saludo_hashes(
+            profile_id, recipient_id
+        )
+        if _supabase_configurado():
+            try:
+                return _business_saludo_leer_supabase(
+                    profile_hash, recipient_hash
+                )
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo consultar el registro de saludo en Supabase "
+                    "(error=%s); se usará el respaldo local.",
+                    type(error).__name__,
+                )
+        sent = _business_saludo_leer_archivo()
         record = sent.get(_business_saludo_key(profile_id, recipient_id))
         return record if isinstance(record, dict) else None
+
+
+def _business_saludo_reclamar(profile_id, recipient_id):
+    """Reserva el saludo de forma atómica para que no se repita entre instancias."""
+    with BUSINESS_WELCOME_LOCK:
+        key = _business_saludo_key(profile_id, recipient_id)
+        profile_hash, recipient_hash = _business_saludo_hashes(
+            profile_id, recipient_id
+        )
+        sent = _business_saludo_leer_archivo()
+        legacy = sent.get(key)
+
+        if _supabase_configurado():
+            try:
+                # Migra el registro histórico si estaba en el archivo local.
+                if isinstance(legacy, dict):
+                    migrado = {
+                        **legacy,
+                        "status": legacy.get("status") or "sent",
+                        "claimed_at": legacy.get("claimed_at")
+                        or legacy.get("sent_at")
+                        or datetime.now(timezone.utc).isoformat(),
+                    }
+                    _business_saludo_insertar_supabase(
+                        profile_hash, recipient_hash, migrado
+                    )
+
+                claim_id = uuid.uuid4().hex
+                ahora = datetime.now(timezone.utc).isoformat()
+                filas = _business_saludo_insertar_supabase(
+                    profile_hash,
+                    recipient_hash,
+                    {
+                        "status": "sending",
+                        "photo_sent": False,
+                        "claim_id": claim_id,
+                        "claimed_at": ahora,
+                    },
+                )
+                if isinstance(filas, list) and filas:
+                    return {"claimed": True, "claim_id": claim_id}
+                return {
+                    "claimed": False,
+                    "record": _business_saludo_leer_supabase(
+                        profile_hash, recipient_hash
+                    ),
+                }
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo reservar el saludo en Supabase; no se enviará "
+                    "para evitar duplicados (error=%s).",
+                    type(error).__name__,
+                )
+                return {"claimed": False, "record": None, "error": True}
+
+        if isinstance(legacy, dict):
+            return {"claimed": False, "record": legacy}
+
+        claim_id = uuid.uuid4().hex
+        ahora = datetime.now(timezone.utc).isoformat()
+        sent[key] = {
+            "status": "sending",
+            "photo_sent": False,
+            "claim_id": claim_id,
+            "claimed_at": ahora,
+        }
+        _business_saludo_escribir_archivo(sent)
+        return {"claimed": True, "claim_id": claim_id}
+
+
+def _business_saludo_liberar_reclamo(profile_id, recipient_id, claim_id):
+    if not claim_id:
+        return
+    with BUSINESS_WELCOME_LOCK:
+        profile_hash, recipient_hash = _business_saludo_hashes(
+            profile_id, recipient_id
+        )
+        if _supabase_configurado():
+            try:
+                _supabase_pedir(
+                    "DELETE",
+                    table=BUSINESS_WELCOME_TABLE,
+                    query_parameters={
+                        "profile_hash": f"eq.{profile_hash}",
+                        "recipient_hash": f"eq.{recipient_hash}",
+                        "claim_id": f"eq.{claim_id}",
+                        "status": "eq.sending",
+                    },
+                )
+            except Exception as error:
+                app.logger.warning(
+                    "No se pudo liberar una reserva de saludo en Supabase "
+                    "(error=%s).",
+                    type(error).__name__,
+                )
+        sent = _business_saludo_leer_archivo()
+        key = _business_saludo_key(profile_id, recipient_id)
+        record = sent.get(key)
+        if (
+            isinstance(record, dict)
+            and record.get("claim_id") == str(claim_id)
+            and record.get("status") == "sending"
+        ):
+            sent.pop(key, None)
+            _business_saludo_escribir_archivo(sent)
 
 
 BUSINESS_LANGUAGE_NAMES = {
@@ -2708,12 +2916,19 @@ def responder_primer_contacto_business(message):
     if not recipient_id or recipient_id != chat_id:
         return
 
-    # Serializar primera respuesta para evitar dobles saludos si llegan mensajes
-    # simultáneos mientras Telegram reintenta la entrega del webhook.
+    # Reservar de forma atómica antes de enviar evita duplicados entre procesos
+    # y entre reintentos de Telegram.
     with BUSINESS_WELCOME_LOCK:
         markup = _markup_bienvenida_business()
-        previous = _business_saludo_estado(profile_id, recipient_id)
-        if previous:
+        claim = _business_saludo_reclamar(profile_id, recipient_id)
+        if claim.get("error"):
+            return
+        if not claim.get("claimed"):
+            previous = claim.get("record")
+            if not isinstance(previous, dict):
+                return
+            if previous.get("status") == "sending":
+                return
             # Algunos registros antiguos no guardaban si se entregó la foto.
             # Se intenta una sola vez como envío de foto y botones, sin repetir
             # el texto del saludo que el usuario ya recibió.
@@ -2734,7 +2949,10 @@ def responder_primer_contacto_business(message):
                         business_connection_id=connection_id,
                     )
                 _marcar_estado_business_saludo(
-                    profile_id, recipient_id, photo_sent=True
+                    profile_id,
+                    recipient_id,
+                    photo_sent=True,
+                    claim_id=previous.get("claim_id"),
                 )
             except Exception as error:
                 app.logger.warning(
@@ -2745,6 +2963,7 @@ def responder_primer_contacto_business(message):
                 )
             return
 
+        claim_id = claim.get("claim_id")
         enviado = False
         photo_sent = False
         welcome_text = _mensaje_bienvenida_business(message)
@@ -2794,10 +3013,17 @@ def responder_primer_contacto_business(message):
         if enviado:
             try:
                 _marcar_estado_business_saludo(
-                    profile_id, recipient_id, photo_sent=photo_sent
+                    profile_id,
+                    recipient_id,
+                    photo_sent=photo_sent,
+                    claim_id=claim_id,
                 )
             except Exception:
                 app.logger.exception("No se pudo guardar el registro del saludo Business.")
+        else:
+            _business_saludo_liberar_reclamo(
+                profile_id, recipient_id, claim_id
+            )
 
 def registrar_actividad_stats(user_id, username):
     res = Estadisticas.search(User.id == user_id)

@@ -5015,6 +5015,40 @@ def _guardar_archivo_suscripcion(
     return resultado
 
 
+def _nuevo_registro_suscripcion_pagada(user_id, vence, username=""):
+    """Crea una concesión nueva y elimina marcadores de una revocación anterior."""
+    return {
+        "id": int(user_id),
+        "vence": str(vence),
+        "username": str(username or ""),
+        "estado": "active",
+        "status": "active",
+        "revoked_at": None,
+        "revocation_error": None,
+        "vip_access_sent": False,
+        "vip_access_sending": False,
+        "vip_access_sending_at": None,
+        "expiry_kick_status": "renewed",
+        "expiry_kick_attempt_at": None,
+        "expiry_kick_error": None,
+        "expiry_error_notified": False,
+        "renewal_notice_status": None,
+        "renewal_notice_attempt_at": None,
+        "renewal_notice_error": None,
+        "invite_link": None,
+        "invite_status": None,
+        "invite_created_at": None,
+        "invite_expires_at": None,
+        "invite_revoked_at": None,
+        "invite_revoke_error": None,
+        "access_message_id": None,
+        "access_welcome_message_id": None,
+        "access_cleanup_status": None,
+        "access_cleanup_updated_at": None,
+        "access_followup_message_id": None,
+    }
+
+
 def _sincronizar_suscripcion_pagada_desde_db(user_id):
     try:
         user_id = int(user_id)
@@ -11289,21 +11323,14 @@ def admin_aprobar_pase_expres(call):
 
     # Registrar en DB (30 días)
     vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    db.upsert(
-        {
-            'id': user_id,
-            'vence': vencimiento,
-            'username': username,
-            'vip_access_sent': False,
-        },
-        Query().id == user_id,
+    registro_nuevo = _nuevo_registro_suscripcion_pagada(
+        user_id,
+        vencimiento,
+        username,
     )
+    db.upsert(registro_nuevo, Query().id == user_id)
     _guardar_archivo_suscripcion(
-        {
-            "id": user_id,
-            "vence": vencimiento,
-            "username": username,
-        },
+        registro_nuevo,
         metodo="pase_expres",
     )
 
@@ -12118,21 +12145,14 @@ def admin_aprobar(call):
     username = info.get('username', '')
     if username == 'sin_usuario':
         username = ''
-    db.upsert(
-        {
-            'id': user_id,
-            'vence': vencimiento,
-            'username': username,
-            'vip_access_sent': False,
-        },
-        Query().id == user_id,
+    registro_nuevo = _nuevo_registro_suscripcion_pagada(
+        user_id,
+        vencimiento,
+        username,
     )
+    db.upsert(registro_nuevo, Query().id == user_id)
     _guardar_archivo_suscripcion(
-        {
-            "id": user_id,
-            "vence": vencimiento,
-            "username": username,
-        },
+        registro_nuevo,
         comprobante={
             "file_id": info.get("comprobante_file_id"),
             "file_type": info.get("comprobante_tipo", "photo"),
@@ -12253,21 +12273,14 @@ def aprobar(message):
         return
 
     vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    db.upsert(
-        {
-            'id': user_id,
-            'vence': vencimiento,
-            'username': '',
-            'vip_access_sent': False,
-        },
-        Query().id == user_id,
+    registro_nuevo = _nuevo_registro_suscripcion_pagada(
+        user_id,
+        vencimiento,
+        "",
     )
+    db.upsert(registro_nuevo, Query().id == user_id)
     _guardar_archivo_suscripcion(
-        {
-            "id": user_id,
-            "vence": vencimiento,
-            "username": "",
-        },
+        registro_nuevo,
         metodo="registro_manual",
     )
 
@@ -12373,9 +12386,14 @@ def registrar_manual(message):
         return
     username = partes[2].lstrip('@') if len(partes) >= 3 else ""
     vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    db.upsert({'id': user_id, 'vence': vencimiento, 'username': username}, Query().id == user_id)
+    registro_nuevo = _nuevo_registro_suscripcion_pagada(
+        user_id,
+        vencimiento,
+        username,
+    )
+    db.upsert(registro_nuevo, Query().id == user_id)
     _guardar_archivo_suscripcion(
-        {"id": user_id, "vence": vencimiento, "username": username},
+        registro_nuevo,
         metodo="registro_manual",
     )
     uname_txt = f"@{username}" if username else "—"

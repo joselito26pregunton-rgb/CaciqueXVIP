@@ -1593,6 +1593,13 @@ ATAJOS_TEXTO_GRUPO = {
     "🚀 /compartir": "/compartir",
     "👤 /admin": "/admin",
     "🔥 /vchat": "/vchat",
+    "🏠 start": "/start",
+    "🏹 menú": "/menu",
+    "🏹 menu": "/menu",
+    "📜 reglas": "/reglas",
+    "🚀 compartir": "/compartir",
+    "👤 admin": "/admin",
+    "🔥 videochat": "/vchat",
 }
 
 
@@ -3365,48 +3372,32 @@ def guardar_evidencia(message):
     return RegistroActividad.get(doc_id=evidence_doc_id)
 
 def obtener_teclado_cuadritos():
-    username = _obtener_username_bot_comandos()
-    direccion = f"@{username}" if username else ""
+    # Reply-keyboard buttons send their visible text as the message.
+    # Keep these short labels; the group router maps them to the existing
+    # commands without exposing the bot username in every button.
     markup = types.ReplyKeyboardMarkup(
         resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True,
         selective=False,
-        input_field_placeholder="Selecciona una acción... 🏹",
+        input_field_placeholder="Elige una acción... 🏹",
     )
     markup.row(
-        types.KeyboardButton(f"/start{direccion} 🏠"),
-        types.KeyboardButton(f"/menu{direccion} 🏹"),
+        types.KeyboardButton("🏠 Start"),
+        types.KeyboardButton("🏹 Menú"),
     )
     markup.row(
-        types.KeyboardButton(f"/reglas{direccion} 📜"),
-        types.KeyboardButton(f"/compartir{direccion} 🚀"),
+        types.KeyboardButton("📜 Reglas"),
+        types.KeyboardButton("🚀 Compartir"),
     )
     markup.row(
-        types.KeyboardButton(f"/admin{direccion} 👤"),
-        types.KeyboardButton(f"/vchat{direccion} 🔥"),
+        types.KeyboardButton("👤 Admin"),
+        types.KeyboardButton("🔥 Videochat"),
     )
     return markup
 
 
 GROUP_KEYBOARD_LOCK = threading.RLock()
-GROUP_COMMAND_USERNAME = None
-
-
-def _obtener_username_bot_comandos():
-    global GROUP_COMMAND_USERNAME
-    if GROUP_COMMAND_USERNAME:
-        return GROUP_COMMAND_USERNAME
-    try:
-        me = bot.get_me()
-        GROUP_COMMAND_USERNAME = str(getattr(me, "username", "") or "").lstrip("@")
-    except Exception as error:
-        app.logger.warning(
-            "No se pudo obtener el usuario del bot para dirigir los atajos "
-            "(error=%s).",
-            type(error).__name__,
-        )
-    return GROUP_COMMAND_USERNAME
 
 
 def publicar_teclado_grupo(chat_id):

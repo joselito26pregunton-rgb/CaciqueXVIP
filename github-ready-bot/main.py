@@ -1586,6 +1586,23 @@ COMANDOS_VALIDOS_PRIVADO = [
     "/start", "/menu", "/reglas", "/compartir", "/vchat", "/admin", "/reportar",
     "🏠 /start", "🏹 /menu", "📜 /reglas", "🚀 /compartir", "👤 /admin", "🔥 /vchat"
 ]
+ATAJOS_TEXTO_GRUPO = {
+    "🏠 /start": "/start",
+    "🏹 /menu": "/menu",
+    "📜 /reglas": "/reglas",
+    "🚀 /compartir": "/compartir",
+    "👤 /admin": "/admin",
+    "🔥 /vchat": "/vchat",
+}
+
+
+def normalizar_atajo_texto_grupo(texto):
+    texto = (texto or "").strip().lower().replace("\ufe0e", "").replace("\ufe0f", "")
+    atajos = {
+        etiqueta.replace("\ufe0e", "").replace("\ufe0f", ""): comando
+        for etiqueta, comando in ATAJOS_TEXTO_GRUPO.items()
+    }
+    return atajos.get(texto, texto)
 
 # --- LIBRERÍA ESTÉTICA EXPANDIDA (FUEGO PURO) ---
 MSG_INVITACION_LARGO = (
@@ -11197,12 +11214,13 @@ def teclado_admin_privado():
     return k
 
 
-def asegurar_teclado_admin_privado(chat_id):
-    """Publica una sola vez la botonera fija de administración."""
+def asegurar_teclado_admin_privado(chat_id, forzar=False):
+    """Publica o reactiva la botonera fija de administración."""
     chat_key = str(int(chat_id))
     with PANEL_LOCK:
         registro = TECLADOS_PRIVADOS.get(PANEL_QUERY.chat_id == chat_key)
-    if registro and registro.get("message_id"):
+    previous_message_id = registro.get("message_id") if registro else None
+    if previous_message_id and not forzar:
         return registro["message_id"]
     mensaje = _send_original(
         chat_id,
@@ -11218,6 +11236,15 @@ def asegurar_teclado_admin_privado(chat_id):
             },
             PANEL_QUERY.chat_id == chat_key,
         )
+    if forzar and previous_message_id and previous_message_id != mensaje.message_id:
+        try:
+            bot.delete_message(chat_id, previous_message_id)
+        except Exception:
+            # Si el mensaje anterior ya no se puede borrar, el teclado nuevo
+            # ya quedó activo; no ocultamos el flujo por un fallo de limpieza.
+            app.logger.info(
+                "No se pudo retirar el ancla anterior del teclado privado."
+            )
     return mensaje.message_id
 
 
@@ -13192,7 +13219,7 @@ def cb_destpub_private(c):
         "panel_message_id": c.message.message_id,
     }
     try:
-        asegurar_teclado_admin_privado(c.message.chat.id)
+        asegurar_teclado_admin_privado(c.message.chat.id, forzar=True)
     except Exception:
         app.logger.exception("No se pudo asegurar el atajo de selección de usuarios.")
     markup = types.InlineKeyboardMarkup().add(
@@ -16737,7 +16764,7 @@ def motor_principal(message):
         if not es_comando and message.content_type == 'text':
             return
 
-    texto_anonimo = (message.text or "").strip().lower()
+    texto_anonimo = normalizar_atajo_texto_grupo(message.text)
     atajos_grupo_anonimos = (
         "/start",
         "🏠 /start",
@@ -16772,7 +16799,7 @@ def motor_principal(message):
             return
     if not message.text:
         return
-    texto = message.text.lower()
+    texto = normalizar_atajo_texto_grupo(message.text)
 
     if texto.startswith("/reportar"):
         group_id = (
@@ -17293,20 +17320,16 @@ def proceso_obtener_usuario_reporte(message):
 
 if __name__ == "__main__":
     try:
-        bot.set_my_commands(
-            commands=[
-                types.BotCommand("start", "Abrir acceso y métodos de pago"),
-                types.BotCommand("menu", "Acciones de la comunidad"),
-                types.BotCommand("reglas", "Ver el reglamento"),
-                types.BotCommand("compartir", "Invitar a la comunidad"),
-                types.BotCommand("admin", "Contactar al administrador"),
-                types.BotCommand("vchat", "Abrir la guía del videochat"),
-            ],
-            scope=types.BotCommandScopeAllGroupChats(),
+        bot.delete_my_commands(
+            scope=types.BotCommandScopeAllGroupChats()
+        )
+        app.logger.info(
+            "Se retiró el menú diagonal de comandos de los grupos; "
+            "los atajos de la botonera inferior siguen habilitados."
         )
     except Exception as error:
         app.logger.warning(
-            "No se pudieron registrar los comandos de grupo "
+            "No se pudo retirar el menú diagonal de comandos de grupo "
             "(clase=%s, código=%s).",
             type(error).__name__,
             getattr(error, "error_code", "n/a"),

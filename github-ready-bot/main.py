@@ -1602,7 +1602,16 @@ def normalizar_atajo_texto_grupo(texto):
         etiqueta.replace("\ufe0e", "").replace("\ufe0f", ""): comando
         for etiqueta, comando in ATAJOS_TEXTO_GRUPO.items()
     }
-    return atajos.get(texto, texto)
+    comando = atajos.get(texto)
+    if comando:
+        return comando
+    for etiqueta, comando in ATAJOS_TEXTO_GRUPO.items():
+        emoji = etiqueta.split(maxsplit=1)[0]
+        emoji = emoji.replace("\ufe0e", "").replace("\ufe0f", "")
+        patron = rf"{re.escape(comando)}(?:@[a-z0-9_]+)?\s+{re.escape(emoji)}"
+        if re.fullmatch(patron, texto):
+            return comando
+    return texto
 
 # --- LIBRERÍA ESTÉTICA EXPANDIDA (FUEGO PURO) ---
 MSG_INVITACION_LARGO = (
@@ -3356,6 +3365,8 @@ def guardar_evidencia(message):
     return RegistroActividad.get(doc_id=evidence_doc_id)
 
 def obtener_teclado_cuadritos():
+    username = _obtener_username_bot_comandos()
+    direccion = f"@{username}" if username else ""
     markup = types.ReplyKeyboardMarkup(
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -3363,13 +3374,39 @@ def obtener_teclado_cuadritos():
         selective=False,
         input_field_placeholder="Selecciona una acción... 🏹",
     )
-    markup.row(types.KeyboardButton("🏠 /start"), types.KeyboardButton("🏹 /menu"))
-    markup.row(types.KeyboardButton("📜 /reglas"), types.KeyboardButton("🚀 /compartir"))
-    markup.row(types.KeyboardButton("👤 /admin"), types.KeyboardButton("🔥 /vchat"))
+    markup.row(
+        types.KeyboardButton(f"/start{direccion} 🏠"),
+        types.KeyboardButton(f"/menu{direccion} 🏹"),
+    )
+    markup.row(
+        types.KeyboardButton(f"/reglas{direccion} 📜"),
+        types.KeyboardButton(f"/compartir{direccion} 🚀"),
+    )
+    markup.row(
+        types.KeyboardButton(f"/admin{direccion} 👤"),
+        types.KeyboardButton(f"/vchat{direccion} 🔥"),
+    )
     return markup
 
 
 GROUP_KEYBOARD_LOCK = threading.RLock()
+GROUP_COMMAND_USERNAME = None
+
+
+def _obtener_username_bot_comandos():
+    global GROUP_COMMAND_USERNAME
+    if GROUP_COMMAND_USERNAME:
+        return GROUP_COMMAND_USERNAME
+    try:
+        me = bot.get_me()
+        GROUP_COMMAND_USERNAME = str(getattr(me, "username", "") or "").lstrip("@")
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo obtener el usuario del bot para dirigir los atajos "
+            "(error=%s).",
+            type(error).__name__,
+        )
+    return GROUP_COMMAND_USERNAME
 
 
 def publicar_teclado_grupo(chat_id):
@@ -3399,6 +3436,33 @@ def publicar_teclado_grupo(chat_id):
             except Exception:
                 pass
         return mensaje
+
+
+def _refrescar_teclados_grupos_configurados():
+    """Replace old reply-keyboard anchors in configured groups at startup."""
+    cfg = cargar_config()
+    for chat_id, info in cfg.get("group_settings", {}).items():
+        if isinstance(info, dict) and str(
+            info.get("type") or info.get("tipo") or ""
+        ).casefold() in ("canal", "channel"):
+            continue
+        try:
+            chat = bot.get_chat(int(chat_id))
+            if getattr(chat, "type", None) not in ("group", "supergroup"):
+                continue
+            publicar_teclado_grupo(chat.id)
+            app.logger.info(
+                "Se actualizó la botonera inferior del grupo %s.",
+                chat_id,
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo actualizar la botonera inicial del grupo %s "
+                "(clase=%s, código=%s).",
+                chat_id,
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
 
 
 def obtener_emoji_link(url):
@@ -17319,10 +17383,28 @@ def proceso_obtener_usuario_reporte(message):
 
 
 if __name__ == "__main__":
+    comandos_privados_preservados = False
     try:
-        bot.delete_my_commands(
-            scope=types.BotCommandScopeAllGroupChats()
+        alcance_privado = types.BotCommandScopeAllPrivateChats()
+        comandos_privados = bot.get_my_commands(scope=alcance_privado)
+        if not comandos_privados:
+            comandos_privados = bot.get_my_commands()
+        if comandos_privados:
+            bot.set_my_commands(
+                commands=comandos_privados,
+                scope=alcance_privado,
+            )
+        comandos_privados_preservados = True
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo conservar la lista de comandos privados "
+            "(clase=%s, código=%s).",
+            type(error).__name__,
+            getattr(error, "error_code", "n/a"),
         )
+
+    try:
+        bot.delete_my_commands(scope=types.BotCommandScopeAllGroupChats())
         app.logger.info(
             "Se retiró el menú diagonal de comandos de los grupos; "
             "los atajos de la botonera inferior siguen habilitados."
@@ -17334,6 +17416,18 @@ if __name__ == "__main__":
             type(error).__name__,
             getattr(error, "error_code", "n/a"),
         )
+    if comandos_privados_preservados:
+        try:
+            # Sin comandos por defecto, el ámbito de grupos no hereda una
+            # lista configurada globalmente por BotFather.
+            bot.delete_my_commands()
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo retirar la lista global de comandos "
+                "(clase=%s, código=%s).",
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
     if _supabase_configurado():
         app.logger.info(
             "Supabase está configurado para conservar los ajustes de fotos "
@@ -17383,6 +17477,11 @@ if __name__ == "__main__":
         "📬 Saludo Business listo para "
         f"{len(_perfiles_business_autorizados())} perfil(es) autorizado(s)."
     )
+    threading.Thread(
+        target=_refrescar_teclados_grupos_configurados,
+        name="group-keyboard-refresh",
+        daemon=True,
+    ).start()
     threading.Thread(target=revisar_vencimientos, name="vip-expiry", daemon=True).start()
     threading.Thread(
         target=bucle_supervision_gemini,

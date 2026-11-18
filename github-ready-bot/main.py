@@ -1,5 +1,6 @@
 import os, shutil, threading, time, json, hashlib, hmac, html, random, re, uuid, queue, urllib.parse, urllib.request, urllib.error, unicodedata, copy
 from types import SimpleNamespace
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import telebot
 from telebot import types
@@ -48,8 +49,9 @@ ADMIN_ID = "7827130679"
 CANAL_ID = "-1003914257220"
 CanaL_ID = "-1003561176552"
 FREE_GOLDPASS_PROMO_CHAT_ID = "-1003561176552"
+GOLDPASS_STARS_AMOUNT = 300
+GOLDPASS_RENEWAL_DAYS = 30
 GROUP_ADMIN_CONTACT_URL = "https://t.me/Ja2610X"
-CANAL_INVITE_LINK = "https://t.me/+U7Kk_sC9pToxZjIx"
 LINK_GRUPO = "https://t.me/+DT-eLLYZ0g8wNmMx"
 LINK_CANAL_GRATUITO = "https://t.me/+c6gutVsBfRw4YWUx"
 ONLYFANS_URL = "https://onlyfans.com/joseale1"
@@ -67,6 +69,7 @@ WEBHOOK_ALLOWED_UPDATES = [
     "business_message",
     "callback_query",
     "inline_query",
+    "pre_checkout_query",
     "chat_join_request",
     "chat_member",
     "my_chat_member",
@@ -412,6 +415,29 @@ PANELES_GRUPO_MIEMBRO = {}
 reporte_msgs = {}
 BUSINESS_WELCOME_FILE = _state_path("business_welcome_users.json")
 BUSINESS_WELCOME_LOCK = threading.RLock()
+BUSINESS_WELCOME_USER_LOCKS = {}
+BUSINESS_WELCOME_STALE_CLAIM_SECONDS = 5 * 60
+
+
+@contextmanager
+def _business_saludo_lock_usuario(profile_id, recipient_id):
+    """Serialize one recipient's greeting without blocking other users."""
+    key = _business_saludo_key(profile_id, recipient_id)
+    with BUSINESS_WELCOME_LOCK:
+        entry = BUSINESS_WELCOME_USER_LOCKS.get(key)
+        if entry is None:
+            entry = {"lock": threading.Lock(), "users": 0}
+            BUSINESS_WELCOME_USER_LOCKS[key] = entry
+        entry["users"] += 1
+    entry["lock"].acquire()
+    try:
+        yield
+    finally:
+        entry["lock"].release()
+        with BUSINESS_WELCOME_LOCK:
+            entry["users"] -= 1
+            if entry["users"] <= 0 and BUSINESS_WELCOME_USER_LOCKS.get(key) is entry:
+                BUSINESS_WELCOME_USER_LOCKS.pop(key, None)
 
 # Saludo automático para perfiles conectados mediante Telegram Chat Automation
 # (Secretary Mode). Los perfiles adicionales se autorizan con
@@ -1717,6 +1743,23 @@ def _business_saludo_hashes(profile_id, recipient_id):
     return profile_key, recipient_key
 
 
+def _business_saludo_reclamo_vencido(record):
+    if not isinstance(record, dict) or record.get("status") != "sending":
+        return False
+    claimed_at = record.get("claimed_at")
+    try:
+        timestamp = datetime.fromisoformat(
+            str(claimed_at).replace("Z", "+00:00")
+        )
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return (
+            datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)
+        ).total_seconds() >= BUSINESS_WELCOME_STALE_CLAIM_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
 def _business_saludo_leer_archivo():
     try:
         with open(BUSINESS_WELCOME_FILE, "r", encoding="utf-8") as file:
@@ -1738,6 +1781,33 @@ def _business_saludo_escribir_archivo(sent):
 
 
 BUSINESS_WELCOME_TABLE = "bot_business_welcome_records"
+
+
+def _business_saludo_supabase_diagnostico(error):
+    if isinstance(error, urllib.error.HTTPError):
+        status = int(getattr(error, "code", 0) or 0)
+        if status in (401, 403):
+            return (
+                f"Supabase rechazó la clave o los permisos (HTTP {status}); "
+                "revisa que Render use la clave secreta del proyecto correcto."
+            )
+        if status == 404:
+            return (
+                "Supabase no encuentra bot_business_welcome_records; "
+                "confirma que ejecutaste supabase/schema.sql en ese proyecto."
+            )
+        if status == 400:
+            return (
+                "Supabase rechazó la estructura del saludo (HTTP 400); "
+                "revisa que la tabla tenga las columnas del esquema actual."
+            )
+        if status == 409:
+            return (
+                "Supabase detectó un conflicto de clave; revisa la clave primaria "
+                "profile_hash, recipient_hash."
+            )
+        return f"Supabase respondió con HTTP {status} al guardar el saludo."
+    return _supabase_error_resumido(error)
 
 
 def _business_saludo_insertar_supabase(profile_hash, recipient_hash, record):
@@ -1777,40 +1847,41 @@ def _business_saludo_leer_supabase(profile_hash, recipient_hash):
 def _marcar_estado_business_saludo(
     profile_id, recipient_id, photo_sent, claim_id=None
 ):
-    with BUSINESS_WELCOME_LOCK:
-        ahora = datetime.now(timezone.utc).isoformat()
-        key = _business_saludo_key(profile_id, recipient_id)
-        profile_hash, recipient_hash = _business_saludo_hashes(
-            profile_id, recipient_id
-        )
-        if _supabase_configurado():
-            try:
-                _supabase_pedir(
-                    "PATCH",
-                    {
-                        "status": "sent",
-                        "photo_sent": bool(photo_sent),
-                        "sent_at": ahora,
-                    },
-                    table=BUSINESS_WELCOME_TABLE,
-                    query_parameters={
-                        "profile_hash": f"eq.{profile_hash}",
-                        "recipient_hash": f"eq.{recipient_hash}",
-                        **(
-                            {"claim_id": f"eq.{claim_id}"}
-                            if claim_id
-                            else {}
-                        ),
-                    },
-                    prefer="return=minimal",
-                )
-            except Exception as error:
-                app.logger.warning(
-                    "No se pudo guardar el estado del saludo en Supabase "
-                    "(error=%s).",
-                    type(error).__name__,
-                )
+    ahora = datetime.now(timezone.utc).isoformat()
+    key = _business_saludo_key(profile_id, recipient_id)
+    profile_hash, recipient_hash = _business_saludo_hashes(
+        profile_id, recipient_id
+    )
+    if _supabase_configurado():
+        try:
+            _supabase_pedir(
+                "PATCH",
+                {
+                    "status": "sent",
+                    "photo_sent": bool(photo_sent),
+                    "sent_at": ahora,
+                },
+                table=BUSINESS_WELCOME_TABLE,
+                query_parameters={
+                    "profile_hash": f"eq.{profile_hash}",
+                    "recipient_hash": f"eq.{recipient_hash}",
+                    **(
+                        {"claim_id": f"eq.{claim_id}"}
+                        if claim_id
+                        else {}
+                    ),
+                },
+                prefer="return=minimal",
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo guardar el estado del saludo en Supabase "
+                "(diagnóstico=%s; clase=%s).",
+                _business_saludo_supabase_diagnostico(error),
+                type(error).__name__,
+            )
 
+    with BUSINESS_WELCOME_LOCK:
         sent = _business_saludo_leer_archivo()
         record = sent.get(key, {})
         sent[key] = {
@@ -1824,21 +1895,22 @@ def _marcar_estado_business_saludo(
 
 
 def _business_saludo_estado(profile_id, recipient_id):
+    profile_hash, recipient_hash = _business_saludo_hashes(
+        profile_id, recipient_id
+    )
+    if _supabase_configurado():
+        try:
+            return _business_saludo_leer_supabase(
+                profile_hash, recipient_hash
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo consultar el registro de saludo en Supabase "
+                "(diagnóstico=%s; clase=%s); se usará el respaldo local.",
+                _business_saludo_supabase_diagnostico(error),
+                type(error).__name__,
+            )
     with BUSINESS_WELCOME_LOCK:
-        profile_hash, recipient_hash = _business_saludo_hashes(
-            profile_id, recipient_id
-        )
-        if _supabase_configurado():
-            try:
-                return _business_saludo_leer_supabase(
-                    profile_hash, recipient_hash
-                )
-            except Exception as error:
-                app.logger.warning(
-                    "No se pudo consultar el registro de saludo en Supabase "
-                    "(error=%s); se usará el respaldo local.",
-                    type(error).__name__,
-                )
         sent = _business_saludo_leer_archivo()
         record = sent.get(_business_saludo_key(profile_id, recipient_id))
         return record if isinstance(record, dict) else None
@@ -1846,58 +1918,96 @@ def _business_saludo_estado(profile_id, recipient_id):
 
 def _business_saludo_reclamar(profile_id, recipient_id):
     """Reserva el saludo de forma atómica para que no se repita entre instancias."""
+    key = _business_saludo_key(profile_id, recipient_id)
+    profile_hash, recipient_hash = _business_saludo_hashes(
+        profile_id, recipient_id
+    )
     with BUSINESS_WELCOME_LOCK:
-        key = _business_saludo_key(profile_id, recipient_id)
-        profile_hash, recipient_hash = _business_saludo_hashes(
-            profile_id, recipient_id
-        )
         sent = _business_saludo_leer_archivo()
         legacy = sent.get(key)
 
-        if _supabase_configurado():
-            try:
-                # Migra el registro histórico si estaba en el archivo local.
-                if isinstance(legacy, dict):
-                    migrado = {
-                        **legacy,
-                        "status": legacy.get("status") or "sent",
-                        "claimed_at": legacy.get("claimed_at")
-                        or legacy.get("sent_at")
-                        or datetime.now(timezone.utc).isoformat(),
-                    }
-                    _business_saludo_insertar_supabase(
-                        profile_hash, recipient_hash, migrado
-                    )
+    if _supabase_configurado():
+        try:
+            # Migra el registro histórico si estaba en el archivo local.
+            if isinstance(legacy, dict):
+                migrado = {
+                    **legacy,
+                    "status": legacy.get("status") or "sent",
+                    "claimed_at": legacy.get("claimed_at")
+                    or legacy.get("sent_at")
+                    or datetime.now(timezone.utc).isoformat(),
+                }
+                _business_saludo_insertar_supabase(
+                    profile_hash, recipient_hash, migrado
+                )
 
+            claim_id = uuid.uuid4().hex
+            ahora = datetime.now(timezone.utc).isoformat()
+            filas = _business_saludo_insertar_supabase(
+                profile_hash,
+                recipient_hash,
+                {
+                    "status": "sending",
+                    "photo_sent": False,
+                    "claim_id": claim_id,
+                    "claimed_at": ahora,
+                },
+            )
+            if isinstance(filas, list) and filas:
+                return {"claimed": True, "claim_id": claim_id}
+            previous = _business_saludo_leer_supabase(
+                profile_hash, recipient_hash
+            )
+            if _business_saludo_reclamo_vencido(previous):
+                new_claim_id = uuid.uuid4().hex
+                updated = _supabase_pedir(
+                    "PATCH",
+                    {
+                        "claim_id": new_claim_id,
+                        "claimed_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    table=BUSINESS_WELCOME_TABLE,
+                    query_parameters={
+                        "profile_hash": f"eq.{profile_hash}",
+                        "recipient_hash": f"eq.{recipient_hash}",
+                        "status": "eq.sending",
+                        "claim_id": f"eq.{previous.get('claim_id', '')}",
+                    },
+                    prefer="return=representation",
+                )
+                if isinstance(updated, list) and updated:
+                    return {"claimed": True, "claim_id": new_claim_id}
+            return {
+                "claimed": False,
+                "record": _business_saludo_leer_supabase(
+                    profile_hash, recipient_hash
+                ),
+            }
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo reservar el saludo en Supabase; se usará el "
+                "registro local para no dejar al usuario sin respuesta "
+                "(diagnóstico=%s; clase=%s).",
+                _business_saludo_supabase_diagnostico(error),
+                type(error).__name__,
+            )
+
+    with BUSINESS_WELCOME_LOCK:
+        sent = _business_saludo_leer_archivo()
+        legacy = sent.get(key)
+        if isinstance(legacy, dict):
+            if _business_saludo_reclamo_vencido(legacy):
                 claim_id = uuid.uuid4().hex
                 ahora = datetime.now(timezone.utc).isoformat()
-                filas = _business_saludo_insertar_supabase(
-                    profile_hash,
-                    recipient_hash,
-                    {
-                        "status": "sending",
-                        "photo_sent": False,
-                        "claim_id": claim_id,
-                        "claimed_at": ahora,
-                    },
-                )
-                if isinstance(filas, list) and filas:
-                    return {"claimed": True, "claim_id": claim_id}
-                return {
-                    "claimed": False,
-                    "record": _business_saludo_leer_supabase(
-                        profile_hash, recipient_hash
-                    ),
+                sent[key] = {
+                    **legacy,
+                    "status": "sending",
+                    "photo_sent": False,
+                    "claim_id": claim_id,
+                    "claimed_at": ahora,
                 }
-            except Exception as error:
-                app.logger.warning(
-                    "No se pudo reservar el saludo en Supabase; se usará el "
-                    "registro local para no dejar al usuario sin respuesta "
-                    "(error=%s).",
-                    type(error).__name__,
-                )
-
-        if isinstance(legacy, dict):
+                _business_saludo_escribir_archivo(sent)
+                return {"claimed": True, "claim_id": claim_id}
             return {"claimed": False, "record": legacy}
 
         claim_id = uuid.uuid4().hex
@@ -1915,28 +2025,29 @@ def _business_saludo_reclamar(profile_id, recipient_id):
 def _business_saludo_liberar_reclamo(profile_id, recipient_id, claim_id):
     if not claim_id:
         return
+    profile_hash, recipient_hash = _business_saludo_hashes(
+        profile_id, recipient_id
+    )
+    if _supabase_configurado():
+        try:
+            _supabase_pedir(
+                "DELETE",
+                table=BUSINESS_WELCOME_TABLE,
+                query_parameters={
+                    "profile_hash": f"eq.{profile_hash}",
+                    "recipient_hash": f"eq.{recipient_hash}",
+                    "claim_id": f"eq.{claim_id}",
+                    "status": "eq.sending",
+                },
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo liberar una reserva de saludo en Supabase "
+                "(diagnóstico=%s; clase=%s).",
+                _business_saludo_supabase_diagnostico(error),
+                type(error).__name__,
+            )
     with BUSINESS_WELCOME_LOCK:
-        profile_hash, recipient_hash = _business_saludo_hashes(
-            profile_id, recipient_id
-        )
-        if _supabase_configurado():
-            try:
-                _supabase_pedir(
-                    "DELETE",
-                    table=BUSINESS_WELCOME_TABLE,
-                    query_parameters={
-                        "profile_hash": f"eq.{profile_hash}",
-                        "recipient_hash": f"eq.{recipient_hash}",
-                        "claim_id": f"eq.{claim_id}",
-                        "status": "eq.sending",
-                    },
-                )
-            except Exception as error:
-                app.logger.warning(
-                    "No se pudo liberar una reserva de saludo en Supabase "
-                    "(error=%s).",
-                    type(error).__name__,
-                )
         sent = _business_saludo_leer_archivo()
         key = _business_saludo_key(profile_id, recipient_id)
         record = sent.get(key)
@@ -1977,22 +2088,24 @@ BUSINESS_LANGUAGE_WORDS = {
     "es": set(
         "hola epa chamo pana que tal estas como gracias amigo amiga buenos buenas "
         "dias noches haces quieres eres bien quiero tienes encantado encantada "
-        "genial guapo guapa gusto saludos oye dime estas haciendo"
+        "genial guapo guapa gusto saludos oye dime estas haciendo yo me mi te tu "
+        "para porque"
     .split()),
     "en": set(
         "hello hi hey how are you doing what thanks thank good morning evening "
         "friend buddy dude please where great nice whats sup howdy tell today "
-        "hows going"
+        "hows going i im ive we our they he she it the this that your youre "
+        "love miss see want can will would when why who with from about"
     .split()),
     "pt": set(
         "oi ola tudo voce voces obrigado obrigada valeu beleza legal prazer bora "
         "saudade nao bom boa dia noite fala querido querida tranquilo tranqui "
-        "como vai"
+        "como vai eu meu minha voce sua seu estou esta muito quero"
     .split()),
     "it": set(
         "ciao buongiorno buonasera buonanotte grazie stai tutto bene amico amica "
         "piacere cosa fai sei vuoi bella bello giornata oggi parlare caro cara "
-        "fantastico salve"
+        "fantastico salve io tu ti te che come sono voglio"
     .split()),
     "fr": set(
         "bonjour salut coucou merci comment vas allez quoi bonsoir ami amie "
@@ -2109,7 +2222,7 @@ def _detectar_idioma_business(mensaje, language_hint=None):
         primeras_posiciones.setdefault(idioma_cirilico, letras_cirilicas[0].start())
 
     if not puntuaciones:
-        return None
+        return idioma_preferido
     puntuacion_maxima = max(puntuaciones.values())
     candidatos = [
         idioma
@@ -2844,6 +2957,16 @@ def _mensaje_bienvenida_business(message):
     remitente = getattr(message, "from_user", None)
     language_hint = getattr(remitente, "language_code", None)
     idioma_objetivo = _detectar_idioma_business(texto_entrante, language_hint)
+    if not texto_entrante.strip():
+        app.logger.info(
+            "El primer mensaje Business no tenía texto; se usó el idioma "
+            "configurado en Telegram (%s).",
+            idioma_objetivo or "es",
+        )
+        return BUSINESS_WELCOME_FALLBACKS.get(
+            idioma_objetivo,
+            WELCOME_MESSAGE,
+        )
     try:
         respuesta = _generar_respuesta_inicial_business(
             texto_entrante,
@@ -2903,6 +3026,84 @@ def probar_conexion_gemini(message):
     )
 
 
+def _procesar_saludo_business(message, connection_id, profile_id, recipient_id):
+    markup = _markup_bienvenida_business()
+    claim = _business_saludo_reclamar(profile_id, recipient_id)
+    if claim.get("error"):
+        return
+    if not claim.get("claimed"):
+        previous = claim.get("record")
+        if isinstance(previous, dict) and previous.get("status") == "sending":
+            return
+        # The first-contact greeting is one-time. Do not send a photo-only
+        # follow-up on later messages; it looked like a second, incomplete
+        # greeting and could duplicate a photo after a network timeout.
+        return
+
+    claim_id = claim.get("claim_id")
+    enviado = False
+    photo_sent = False
+    welcome_text = _mensaje_bienvenida_business(message)
+    if os.path.isfile(WELCOME_PHOTO_PATH):
+        try:
+            with open(WELCOME_PHOTO_PATH, "rb") as photo:
+                bot.send_photo(
+                    str(getattr(message.chat, "id", recipient_id)),
+                    photo,
+                    caption=welcome_text,
+                    parse_mode=None,
+                    reply_markup=markup,
+                    business_connection_id=connection_id,
+                    timeout=60,
+                )
+            enviado = True
+            photo_sent = True
+        except Exception as error:
+            app.logger.warning(
+                "Falló el envío de la foto del saludo Business; se enviará "
+                "el texto de respaldo (error=%s, telegram_code=%s).",
+                type(error).__name__,
+                getattr(error, "error_code", None),
+            )
+    else:
+        app.logger.warning(
+            "No se encontró la foto del saludo Business; se enviará el texto."
+        )
+
+    if not enviado:
+        try:
+            bot.send_message(
+                str(getattr(message.chat, "id", recipient_id)),
+                welcome_text,
+                parse_mode=None,
+                reply_markup=markup,
+                business_connection_id=connection_id,
+            )
+            enviado = True
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo enviar el texto del saludo automático Business "
+                "(error=%s, telegram_code=%s).",
+                type(error).__name__,
+                getattr(error, "error_code", None),
+            )
+
+    if enviado:
+        try:
+            _marcar_estado_business_saludo(
+                profile_id,
+                recipient_id,
+                photo_sent=photo_sent,
+                claim_id=claim_id,
+            )
+        except Exception:
+            app.logger.exception("No se pudo guardar el registro del saludo Business.")
+    else:
+        _business_saludo_liberar_reclamo(
+            profile_id, recipient_id, claim_id
+        )
+
+
 @bot.business_message_handler(
     content_types=[
         "text", "photo", "video", "document", "audio", "animation", "voice",
@@ -2949,114 +3150,15 @@ def responder_primer_contacto_business(message):
     if not recipient_id or recipient_id != chat_id:
         return
 
-    # Reservar de forma atómica antes de enviar evita duplicados entre procesos
-    # y entre reintentos de Telegram.
-    with BUSINESS_WELCOME_LOCK:
-        markup = _markup_bienvenida_business()
-        claim = _business_saludo_reclamar(profile_id, recipient_id)
-        if claim.get("error"):
-            return
-        if not claim.get("claimed"):
-            previous = claim.get("record")
-            if not isinstance(previous, dict):
-                return
-            if previous.get("status") == "sending":
-                return
-            # Algunos registros antiguos no guardaban si se entregó la foto.
-            # Se intenta una sola vez como envío de foto y botones, sin repetir
-            # el texto del saludo que el usuario ya recibió.
-            if previous.get("photo_sent") is True:
-                return
-            if not os.path.isfile(WELCOME_PHOTO_PATH):
-                app.logger.warning(
-                    "No se encontró la foto pendiente del saludo Business."
-                )
-                return
-            try:
-                with open(WELCOME_PHOTO_PATH, "rb") as photo:
-                    bot.send_photo(
-                        chat_id,
-                        photo,
-                        parse_mode=None,
-                        reply_markup=markup,
-                        business_connection_id=connection_id,
-                    )
-                _marcar_estado_business_saludo(
-                    profile_id,
-                    recipient_id,
-                    photo_sent=True,
-                    claim_id=previous.get("claim_id"),
-                )
-            except Exception as error:
-                app.logger.warning(
-                    "No se pudo completar la foto pendiente del saludo Business "
-                    "(error=%s, telegram_code=%s).",
-                    type(error).__name__,
-                    getattr(error, "error_code", None),
-                )
-            return
-
-        claim_id = claim.get("claim_id")
-        enviado = False
-        photo_sent = False
-        welcome_text = _mensaje_bienvenida_business(message)
-        if os.path.isfile(WELCOME_PHOTO_PATH):
-            try:
-                with open(WELCOME_PHOTO_PATH, "rb") as photo:
-                    bot.send_photo(
-                        chat_id,
-                        photo,
-                        caption=welcome_text,
-                        parse_mode=None,
-                        reply_markup=markup,
-                        business_connection_id=connection_id,
-                    )
-                enviado = True
-                photo_sent = True
-            except Exception as error:
-                app.logger.warning(
-                    "Falló la foto del saludo Business; se intentará enviar el texto "
-                    "(error=%s, telegram_code=%s).",
-                    type(error).__name__,
-                    getattr(error, "error_code", None),
-                )
-        else:
-            app.logger.warning(
-                "No se encontró la foto del saludo Business; se intentará enviar el texto."
-            )
-
-        if not enviado:
-            try:
-                bot.send_message(
-                    chat_id,
-                    welcome_text,
-                    parse_mode=None,
-                    reply_markup=markup,
-                    business_connection_id=connection_id,
-                )
-                enviado = True
-            except Exception as error:
-                app.logger.warning(
-                    "No se pudo enviar el saludo automático Business "
-                    "(error=%s, telegram_code=%s).",
-                    type(error).__name__,
-                    getattr(error, "error_code", None),
-                )
-
-        if enviado:
-            try:
-                _marcar_estado_business_saludo(
-                    profile_id,
-                    recipient_id,
-                    photo_sent=photo_sent,
-                    claim_id=claim_id,
-                )
-            except Exception:
-                app.logger.exception("No se pudo guardar el registro del saludo Business.")
-        else:
-            _business_saludo_liberar_reclamo(
-                profile_id, recipient_id, claim_id
-            )
+    # A keyed lock prevents duplicate first-contact sends for this user without
+    # making unrelated users wait for Gemini or Telegram photo uploads.
+    with _business_saludo_lock_usuario(profile_id, recipient_id):
+        _procesar_saludo_business(
+            message,
+            connection_id,
+            profile_id,
+            recipient_id,
+        )
 
 def registrar_actividad_stats(user_id, username):
     res = Estadisticas.search(User.id == user_id)
@@ -4757,6 +4859,21 @@ def _guardar_archivo_suscripcion(
             "vip_access_sent",
             "vip_access_sending",
             "vip_access_sending_at",
+            "expiry_kick_status",
+            "expiry_kick_attempt_at",
+            "expiry_kick_error",
+            "expiry_error_notified",
+            "renewal_notice_status",
+            "renewal_notice_attempt_at",
+            "renewal_notice_error",
+            "stars_payment_charge_ids",
+            "stars_last_charge_id",
+            "stars_last_paid_at",
+            "stars_last_paid_amount",
+            "stars_delivery_status",
+            "stars_delivery_attempt_at",
+            "stars_delivery_error",
+            "stars_delivery_error_notified",
             "access_message_id",
             "access_welcome_message_id",
             "invite_link",
@@ -9084,55 +9201,190 @@ def enviar_con_media(chat_id, texto, markup, boton):
         parse_mode="HTML",
     )
 
-def expulsar_usuario_vencido(user_id):
+def _expulsar_usuario_vencido_bajo_lock(user_id, forzar=False):
     """Expulsa a un usuario del canal VIP, le notifica opciones de renovación
-    y lo elimina de la base de datos. Usado tanto por la revisión automática
-    de vencimientos como por el comando manual /expulsar (pruebas).
-    El historial se conserva aunque el acceso activo se retire."""
-    registro = db.get(Query().id == int(user_id))
-    if registro and registro.get("vence"):
-        _revocar_enlace_vip_individual(
-            user_id,
-            registro,
-            estado="expired",
-        )
-        registro = db.get(Query().id == int(user_id)) or registro
-        registro_archivo = dict(registro)
-        _guardar_archivo_suscripcion(
-            registro_archivo,
-            estado_forzado="expired",
-        )
-    # 1. Expulsar del canal (si ya salió, el ban puede fallar — no importa)
+    y lo elimina de la lista activa. Los fallos de expulsión permanecen en el
+    historial y se reintentan desde el proceso de revisión."""
     try:
-        bot.ban_chat_member(CANAL_ID, user_id)
-        bot.unban_chat_member(CANAL_ID, user_id)
-    except Exception as e_ban:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+    registro = db.get(Query().id == user_id)
+    if not registro:
+        registro = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id)
+    if not registro:
+        return False
+    registro = dict(registro)
+    vencimiento_actual = _parsear_fecha_suscripcion(registro.get("vence"))
+    if not forzar and (
+        not vencimiento_actual or vencimiento_actual > datetime.now()
+    ):
+        return False
+    estado_expulsion = registro.get("expiry_kick_status")
+    if (
+        estado_expulsion == "removed"
+        and registro.get("renewal_notice_status") == "sent"
+    ):
+        db.remove(Query().id == user_id)
+        return True
+
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    registro.update(
+        {
+            "expiry_kick_status": estado_expulsion or "kick_pending",
+            "expiry_kick_attempt_at": ahora,
+        }
+    )
+    registro = _guardar_archivo_suscripcion(
+        registro,
+        estado_forzado="expired",
+    ) or registro
+
+    if estado_expulsion != "removed":
+        if registro.get("invite_link"):
+            try:
+                _revocar_enlace_vip_individual(
+                    user_id,
+                    registro,
+                    estado="expired",
+                )
+            except Exception:
+                app.logger.exception(
+                    "No se pudo revocar el enlace GoldPass vencido del usuario %s.",
+                    user_id,
+                )
+
+        error_expulsion = None
         try:
-            bot.send_message(int(ADMIN_ID),
-                f"ℹ️ No pude expulsar a <code>{user_id}</code> del canal "
-                f"(probablemente ya salió): {e_ban}",
-                parse_mode="HTML")
-        except:
-            pass
+            bot.ban_chat_member(CANAL_ID, user_id)
+            bot.unban_chat_member(CANAL_ID, user_id)
+        except Exception as error:
+            error_expulsion = error
+            try:
+                estado_miembro = bot.get_chat_member(CANAL_ID, user_id)
+                estado_actual = getattr(estado_miembro, "status", "")
+                if estado_actual == "left":
+                    error_expulsion = None
+                elif estado_actual == "kicked":
+                    bot.unban_chat_member(CANAL_ID, user_id)
+                    error_expulsion = None
+            except Exception:
+                pass
 
-    # 2. Notificar al usuario con opciones de renovación
-    try:
-        markup_renovar = types.InlineKeyboardMarkup(row_width=1)
-        markup_renovar.add(
-            types.InlineKeyboardButton("⭐ Ingresar con Telegram Stars", url=CANAL_INVITE_LINK),
-            types.InlineKeyboardButton("💳 Usar otro método de pago", callback_data="otro_metodo"),
-        )
-        bot.send_message(
-            user_id,
-            "⚠️ <b>Tu suscripción VIP ha vencido.</b>\n\n"
-            "Elige cómo quieres renovar tu acceso al canal 👇",
-            parse_mode="HTML", protect_content=True, reply_markup=markup_renovar
-        )
-    except:
-        pass  # El usuario nunca inició el bot — no se puede notificar
+        if error_expulsion:
+            registro.update(
+                {
+                    "expiry_kick_status": "kick_pending",
+                    "expiry_kick_attempt_at": ahora,
+                    "expiry_kick_error": str(error_expulsion)[:500],
+                }
+            )
+            registro = _guardar_archivo_suscripcion(
+                registro,
+                estado_forzado="expired",
+            ) or registro
+            db.remove(Query().id == user_id)
+            if not registro.get("expiry_error_notified"):
+                try:
+                    bot.send_message(
+                        int(ADMIN_ID),
+                        "⚠️ No pude expulsar del canal GoldPass al usuario "
+                        f"<code>{user_id}</code>; el vencimiento quedó pendiente "
+                        "y se volverá a intentar. "
+                        f"Detalle: {html.escape(str(error_expulsion)[:300])}",
+                        parse_mode="HTML",
+                        protect_content=True,
+                    )
+                    registro["expiry_error_notified"] = True
+                    _guardar_archivo_suscripcion(
+                        registro,
+                        estado_forzado="expired",
+                    )
+                except Exception:
+                    app.logger.exception(
+                        "No se pudo avisar al administrador del reintento de expulsión."
+                    )
+            app.logger.warning(
+                "La expulsión GoldPass quedó pendiente y se reintentará "
+                "(user_id=%s, error=%s).",
+                user_id,
+                type(error_expulsion).__name__,
+            )
+            return False
 
-    # 3. Eliminar del registro SIEMPRE, sin importar lo anterior
+        registro.update(
+            {
+                "expiry_kick_status": "removed",
+                "expiry_kick_attempt_at": ahora,
+                "expiry_kick_error": None,
+            }
+        )
+        registro = _guardar_archivo_suscripcion(
+            registro,
+            estado_forzado="expired",
+        ) or registro
+
+    if registro.get("renewal_notice_status") != "sent":
+        try:
+            markup_renovar = types.InlineKeyboardMarkup(row_width=1)
+            markup_renovar.add(
+                types.InlineKeyboardButton(
+                    f"⭐ Renovar · {GOLDPASS_STARS_AMOUNT} Stars",
+                    callback_data=f"renew_stars:{user_id}",
+                ),
+                types.InlineKeyboardButton(
+                    "💳 Usar otro método de pago",
+                    callback_data="otro_metodo",
+                ),
+            )
+            registro["renewal_notice_status"] = "sending"
+            registro["renewal_notice_attempt_at"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            _guardar_archivo_suscripcion(
+                registro,
+                estado_forzado="expired",
+            )
+            bot.send_message(
+                user_id,
+                "⚠️ <b>Tu suscripción VIP ha vencido.</b>\n\n"
+                "Elige cómo quieres renovar tu acceso al canal 👇",
+                parse_mode="HTML",
+                protect_content=True,
+                reply_markup=markup_renovar,
+            )
+            registro["renewal_notice_status"] = "sent"
+            registro["renewal_notice_error"] = None
+            registro = _guardar_archivo_suscripcion(
+                registro,
+                estado_forzado="expired",
+            ) or registro
+        except Exception as error:
+            registro["renewal_notice_status"] = "failed"
+            registro["renewal_notice_error"] = str(error)[:400]
+            registro = _guardar_archivo_suscripcion(
+                registro,
+                estado_forzado="expired",
+            ) or registro
+            app.logger.warning(
+                "No se pudo enviar el menú de renovación VIP "
+                "(user_id=%s, error=%s).",
+                user_id,
+                type(error).__name__,
+            )
+
     db.remove(Query().id == user_id)
+    return True
+
+
+def expulsar_usuario_vencido(user_id, forzar=False):
+    """Serializa el vencimiento con los pagos y renovaciones."""
+    with PAID_ACCESS_LOCK:
+        return _expulsar_usuario_vencido_bajo_lock(
+            user_id,
+            forzar=forzar,
+        )
 
 
 def procesar_vencimiento_freepass(registro):
@@ -9290,6 +9542,56 @@ def revisar_vencimientos():
             vencidos = db.search(
                 Query().vence <= ahora.strftime("%Y-%m-%d %H:%M:%S")
             )
+            conocidos = {int(item.get("id", 0) or 0) for item in vencidos}
+            with SUSCRIPCIONES_LOCK:
+                reintentos = []
+                reintentos_aviso_pago = []
+                for item in SUSCRIPCIONES_ARCHIVO.all():
+                    user_id = int(item.get("id", 0) or 0)
+                    vencimiento = _parsear_fecha_suscripcion(item.get("vence"))
+                    if not user_id or not vencimiento:
+                        continue
+                    estado_expulsion = item.get("expiry_kick_status")
+                    if (
+                        user_id not in conocidos
+                        and vencimiento <= ahora
+                        and estado_expulsion == "kick_pending"
+                    ):
+                        reintentos.append(dict(item))
+                        conocidos.add(user_id)
+                    estado_aviso = item.get("stars_delivery_status")
+                    if (
+                        vencimiento > ahora
+                        and estado_aviso in ("pending", "failed", "sending")
+                    ):
+                        ultimo_intento = _parsear_fecha_suscripcion(
+                            item.get("stars_delivery_attempt_at")
+                        )
+                        if (
+                            ultimo_intento
+                            and ahora - ultimo_intento < timedelta(minutes=5)
+                        ):
+                            pass
+                        else:
+                            reintentos_aviso_pago.append(dict(item))
+                    if user_id in conocidos or vencimiento > ahora:
+                        continue
+                    if (
+                        estado_expulsion == "removed"
+                        and item.get("renewal_notice_status")
+                        in ("failed", "sending")
+                    ):
+                        intento_aviso = _parsear_fecha_suscripcion(
+                            item.get("renewal_notice_attempt_at")
+                        )
+                        if (
+                            intento_aviso
+                            and ahora - intento_aviso < timedelta(minutes=5)
+                        ):
+                            continue
+                        reintentos.append(dict(item))
+                        conocidos.add(user_id)
+            vencidos.extend(reintentos)
             for usuario in vencidos:
                 try:
                     expulsar_usuario_vencido(usuario["id"])
@@ -9297,11 +9599,21 @@ def revisar_vencimientos():
                     app.logger.exception(
                         "No se pudo procesar un vencimiento VIP."
                     )
+            for registro in reintentos_aviso_pago:
+                try:
+                    _notificar_pago_stars(
+                        int(registro["id"]),
+                        registro,
+                    )
+                except Exception:
+                    app.logger.exception(
+                        "No se pudo reintentar la entrega tras el pago Stars."
+                    )
         except Exception:
             app.logger.exception(
                 "No se pudieron revisar los vencimientos VIP."
             )
-        time.sleep(3600)
+        time.sleep(60)
 
 def guardar_foto_compartir_asistente(message, foto_id):
     uid = message.from_user.id
@@ -9621,6 +9933,347 @@ def otro_metodo_pago(call):
     bot.answer_callback_query(call.id)
     mostrar_metodos_pago(call.message.chat.id)
 
+
+def _crear_payload_renovacion_stars(user_id):
+    marca_tiempo = int(time.time())
+    base = (
+        f"gpstars:v1:{int(user_id)}:{marca_tiempo}:{uuid.uuid4().hex}"
+    )
+    firma = hmac.new(
+        TOKEN.encode("utf-8"),
+        base.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{base}:{firma}"
+
+
+def _validar_payload_renovacion_stars(payload, user_id=None):
+    if not isinstance(payload, str):
+        return None
+    partes = payload.split(":")
+    if len(partes) != 6 or partes[:2] != ["gpstars", "v1"]:
+        return None
+    base = ":".join(partes[:-1])
+    firma_esperada = hmac.new(
+        TOKEN.encode("utf-8"),
+        base.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    if not hmac.compare_digest(partes[-1], firma_esperada):
+        return None
+    try:
+        user_id_payload = int(partes[2])
+        creado = int(partes[3])
+    except (TypeError, ValueError):
+        return None
+    ahora = int(time.time())
+    if creado > ahora + 120 or ahora - creado > 7 * 24 * 60 * 60:
+        return None
+    if user_id is not None and user_id_payload != int(user_id):
+        return None
+    return user_id_payload
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("renew_stars:")
+)
+def iniciar_renovacion_stars(call):
+    try:
+        user_id = int(call.data.split(":", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(
+            call.id,
+            "No pude validar este cobro.",
+            show_alert=True,
+        )
+        return
+    chat = getattr(call.message, "chat", None)
+    if (
+        getattr(chat, "type", None) != "private"
+        or int(call.from_user.id) != user_id
+        or int(getattr(chat, "id", 0) or 0) != user_id
+    ):
+        bot.answer_callback_query(
+            call.id,
+            "Esta renovación está vinculada a otra cuenta.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        bot.send_invoice(
+            chat_id=user_id,
+            title="Renovación GoldPass",
+            description=f"Acceso a GoldPass por {GOLDPASS_RENEWAL_DAYS} días.",
+            invoice_payload=_crear_payload_renovacion_stars(user_id),
+            provider_token="",
+            currency="XTR",
+            prices=[
+                types.LabeledPrice(
+                    label=f"GoldPass · {GOLDPASS_RENEWAL_DAYS} días",
+                    amount=GOLDPASS_STARS_AMOUNT,
+                )
+            ],
+            start_parameter=f"renew-goldpass-{user_id}",
+            protect_content=True,
+        )
+        bot.answer_callback_query(
+            call.id,
+            f"Factura enviada: {GOLDPASS_STARS_AMOUNT} Stars.",
+        )
+    except Exception as error:
+        app.logger.exception(
+            "No se pudo crear la factura XTR de renovación GoldPass "
+            "(user_id=%s).",
+            user_id,
+        )
+        bot.answer_callback_query(
+            call.id,
+            "No pude crear la factura. Prueba otra vez más tarde.",
+            show_alert=True,
+        )
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def validar_pre_checkout_stars(query):
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    payload_user_id = _validar_payload_renovacion_stars(
+        getattr(query, "invoice_payload", None),
+        user_id=user_id,
+    )
+    try:
+        amount = int(getattr(query, "total_amount", 0) or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    valido = (
+        payload_user_id is not None
+        and getattr(query, "currency", None) == "XTR"
+        and amount == GOLDPASS_STARS_AMOUNT
+    )
+    try:
+        bot.answer_pre_checkout_query(
+            query.id,
+            ok=valido,
+            error_message=(
+                None
+                if valido
+                else "No pude validar esta factura. Vuelve a solicitar la renovación."
+            ),
+        )
+    except Exception:
+        app.logger.exception(
+            "No se pudo responder la validación previa de pago Stars."
+        )
+
+
+def _notificar_pago_stars(user_id, registro):
+    """Entrega una única confirmación de pago con el acceso personal protegido."""
+    registro = dict(registro or {})
+    if registro.get("stars_delivery_status") == "sent":
+        return True
+    intento_anterior = _parsear_fecha_suscripcion(
+        registro.get("stars_delivery_attempt_at")
+    )
+    if (
+        registro.get("stars_delivery_status") == "sending"
+        and intento_anterior
+        and datetime.now() - intento_anterior < timedelta(minutes=5)
+    ):
+        return False
+
+    intento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    registro["stars_delivery_status"] = "sending"
+    registro["stars_delivery_attempt_at"] = intento
+    registro = _guardar_archivo_suscripcion(
+        registro,
+        metodo="Telegram Stars",
+    ) or registro
+    db.upsert(registro, Query().id == int(user_id))
+
+    vence = _parsear_fecha_suscripcion(registro.get("vence"))
+    vence_texto = (
+        vence.strftime("%d/%m/%Y %H:%M")
+        if vence
+        else "30 días desde el pago"
+    )
+    try:
+        mensaje = bot.send_message(
+            int(user_id),
+            "✅ <b>Pago recibido: "
+            f"{GOLDPASS_STARS_AMOUNT} Stars.</b>\n\n"
+            f"Tu renovación de GoldPass está activa hasta "
+            f"<b>{html.escape(vence_texto)}</b>. Pulsa abajo para recibir tu "
+            "enlace personal de acceso. 🔐",
+            parse_mode="HTML",
+            protect_content=True,
+            reply_markup=markup_acceso_vip(user_id),
+        )
+        registro["stars_delivery_status"] = "sent"
+        registro["stars_delivery_attempt_at"] = intento
+        registro["access_message_id"] = getattr(mensaje, "message_id", None)
+        _guardar_archivo_suscripcion(
+            registro,
+            metodo="Telegram Stars",
+        )
+        db.upsert(registro, Query().id == int(user_id))
+        return True
+    except Exception as error:
+        registro["stars_delivery_status"] = "failed"
+        registro["stars_delivery_error"] = str(error)[:400]
+        guardado = _guardar_archivo_suscripcion(
+            registro,
+            metodo="Telegram Stars",
+        ) or registro
+        db.upsert(registro, Query().id == int(user_id))
+        if not guardado.get("stars_delivery_error_notified"):
+            try:
+                bot.send_message(
+                    int(ADMIN_ID),
+                    "⚠️ Se recibió un pago Stars de "
+                    f"<code>{int(user_id)}</code>, pero falló la entrega del "
+                    "mensaje de acceso. El bot lo volverá a intentar; comprueba "
+                    "que esta persona no haya bloqueado el bot.",
+                    parse_mode="HTML",
+                    protect_content=True,
+                )
+                registro["stars_delivery_error_notified"] = True
+                _guardar_archivo_suscripcion(
+                    registro,
+                    metodo="Telegram Stars",
+                )
+            except Exception:
+                app.logger.exception(
+                    "No se pudo avisar al administrador del fallo de entrega Stars."
+                )
+        app.logger.warning(
+            "No se pudo enviar el acceso tras el pago Stars "
+            "(user_id=%s, error=%s).",
+            user_id,
+            type(error).__name__,
+        )
+        return False
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def procesar_pago_stars_exitoso(message):
+    pago = getattr(message, "successful_payment", None)
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if not pago or not user_id:
+        return
+    try:
+        user_id = int(user_id)
+        amount = int(getattr(pago, "total_amount", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    charge_id = str(
+        getattr(pago, "telegram_payment_charge_id", "") or ""
+    ).strip()
+    payload_user_id = _validar_payload_renovacion_stars(
+        getattr(pago, "invoice_payload", None),
+        user_id=user_id,
+    )
+    if (
+        payload_user_id is None
+        or getattr(pago, "currency", None) != "XTR"
+        or amount != GOLDPASS_STARS_AMOUNT
+        or not charge_id
+    ):
+        app.logger.error(
+            "Se recibió un pago Stars que no coincide con la renovación "
+            "(user_id=%s).",
+            user_id,
+        )
+        try:
+            bot.send_message(
+                int(ADMIN_ID),
+                "⚠️ Telegram reportó un pago Stars con datos que no coinciden "
+                f"para <code>{user_id}</code>. Revisa el cargo antes de entregar acceso.",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.exception(
+                "No se pudo avisar de un pago Stars que requiere revisión."
+            )
+        return
+
+    with PAID_ACCESS_LOCK:
+        archivado = SUSCRIPCIONES_ARCHIVO.get(Query().id == user_id) or {}
+        archivado = dict(archivado)
+        cargos = archivado.get("stars_payment_charge_ids") or []
+        if not isinstance(cargos, list):
+            cargos = [str(cargos)]
+        if charge_id in cargos:
+            registro = db.get(Query().id == user_id) or archivado
+            registro = dict(registro)
+            vence_actual = _parsear_fecha_suscripcion(registro.get("vence"))
+            if vence_actual and vence_actual > datetime.now():
+                db.upsert(registro, Query().id == user_id)
+                _notificar_pago_stars(user_id, registro)
+            return
+
+        existente = db.get(Query().id == user_id) or archivado
+        existente = dict(existente)
+        vencimiento_anterior = _parsear_fecha_suscripcion(
+            existente.get("vence")
+        )
+        ahora = datetime.now()
+        inicio = (
+            vencimiento_anterior
+            if vencimiento_anterior and vencimiento_anterior > ahora
+            else ahora
+        )
+        vence = inicio + timedelta(days=GOLDPASS_RENEWAL_DAYS)
+        vence_texto = vence.strftime("%Y-%m-%d %H:%M:%S")
+        cargos.append(charge_id)
+        registro = dict(existente)
+        registro.update(
+            {
+                "id": user_id,
+                "username": (
+                    getattr(getattr(message, "from_user", None), "username", "")
+                    or existente.get("username")
+                    or ""
+                ),
+                "vence": vence_texto,
+                "metodo_pago": "Telegram Stars",
+                "stars_payment_charge_ids": cargos,
+                "stars_last_charge_id": charge_id,
+                "stars_last_paid_at": ahora.strftime("%Y-%m-%d %H:%M:%S"),
+                "stars_last_paid_amount": amount,
+                "stars_delivery_status": "pending",
+                "stars_delivery_error": None,
+                "vip_access_sent": False,
+                "vip_access_sending": False,
+                "vip_access_sending_at": None,
+                "expiry_kick_status": "renewed",
+                "expiry_kick_attempt_at": None,
+                "expiry_kick_error": None,
+                "expiry_error_notified": False,
+                "renewal_notice_status": None,
+                "renewal_notice_attempt_at": None,
+                "renewal_notice_error": None,
+                "invite_link": None,
+                "invite_status": None,
+                "invite_created_at": None,
+                "invite_expires_at": None,
+                "invite_revoked_at": None,
+                "invite_revoke_error": None,
+                "access_cleanup_status": None,
+                "access_cleanup_updated_at": None,
+                "access_followup_message_id": None,
+            }
+        )
+        registro = _guardar_archivo_suscripcion(
+            registro,
+            metodo="Telegram Stars",
+        ) or registro
+        db.upsert(registro, Query().id == user_id)
+
+    _notificar_pago_stars(user_id, registro)
+    _supabase_guardar_local("paid", user_id)
+
+
 # ─── Pase Exprés: usuario lo solicita ───────────────────────────
 @bot.callback_query_handler(func=lambda call: call.data == "pase_expres_click")
 def pase_expres_solicitud(call):
@@ -9723,6 +10376,17 @@ def _crear_enlace_vip_individual(registro):
     vence = _parsear_fecha_suscripcion(registro.get("vence"))
     if not vence or vence <= datetime.now():
         raise ValueError("La suscripción no está vigente.")
+    bot_info = bot.get_me()
+    permisos = bot.get_chat_member(CANAL_ID, bot_info.id)
+    if getattr(permisos, "status", None) != "administrator":
+        raise PermissionError(
+            "Telegram indica que el bot no es administrador del canal GoldPass."
+        )
+    if not getattr(permisos, "can_invite_users", False):
+        raise PermissionError(
+            "El bot es administrador, pero Telegram no confirma el permiso "
+            "«Invitar usuarios mediante enlace» en el canal GoldPass."
+        )
     enlace = bot.create_chat_invite_link(
         CANAL_ID,
         expire_date=int(vence.timestamp()),
@@ -9732,6 +10396,16 @@ def _crear_enlace_vip_individual(registro):
     if not url:
         raise RuntimeError("Telegram no devolvió el enlace de invitación.")
     return url, vence.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _resumen_error_entrega_goldpass(error):
+    codigo = getattr(error, "error_code", None)
+    descripcion = getattr(error, "description", None)
+    if codigo is not None and descripcion:
+        return f"Telegram HTTP {codigo}: {str(descripcion)[:240]}"
+    if isinstance(error, (PermissionError, ValueError, RuntimeError)):
+        return str(error)[:240]
+    return f"{type(error).__name__}: no se completó la operación."
 
 
 def _revocar_enlace_vip_individual(user_id, registro=None, estado=None):
@@ -9990,6 +10664,7 @@ def confirmar_acceso_goldpass(call):
     _sincronizar_suscripcion_pagada_desde_db(user_id)
     enlace_vip = None
     bienvenida = None
+    fase_entrega = "revocar un enlace anterior"
     try:
         # Revoca un enlace personal anterior si se volvió a aprobar la cuenta.
         if suscripcion.get("invite_link"):
@@ -9998,8 +10673,10 @@ def confirmar_acceso_goldpass(call):
                 suscripcion,
                 estado="superseded",
             )
+        fase_entrega = "verificar permisos y crear el enlace personal"
         enlace_vip, invitacion_vence = _crear_enlace_vip_individual(suscripcion)
         fecha_emision = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fase_entrega = "guardar el enlace personal"
         estado_guardado = _guardar_estado_invitacion_vip(
             user_id,
             {
@@ -10016,6 +10693,7 @@ def confirmar_acceso_goldpass(call):
         )
         if not estado_guardado:
             raise RuntimeError("No se pudo guardar la invitación individual.")
+        fase_entrega = "enviar el mensaje privado de acceso"
         bienvenida = bot.send_message(
             user_id,
             "⌛ Preparando tu acceso personal a GoldPass…",
@@ -10033,6 +10711,7 @@ def confirmar_acceso_goldpass(call):
         )
         if not estado_mensaje_guardado:
             raise RuntimeError("La suscripción dejó de estar activa durante la entrega.")
+        fase_entrega = "mostrar el botón de acceso"
         bot.edit_message_text(
             "🎉 <b>¡Gracias por tu compra! Bienvenido/a a GoldPass.</b>\n\n"
             "Pulsa el botón para solicitar tu entrada. El bot verificará que "
@@ -10044,6 +10723,7 @@ def confirmar_acceso_goldpass(call):
             reply_markup=markup_enlace_canal_goldpass(enlace_vip),
             disable_web_page_preview=True,
         )
+        fase_entrega = "confirmar el registro del acceso"
         estado_entregado = _guardar_estado_invitacion_vip(
             user_id,
             {
@@ -10054,12 +10734,18 @@ def confirmar_acceso_goldpass(call):
         if not estado_entregado:
             raise RuntimeError("No se pudo confirmar la entrega del acceso individual.")
     except Exception as error:
+        enlace_revocado = not bool(enlace_vip)
         if enlace_vip:
-            _revocar_enlace_vip_individual(
-                user_id,
-                {"id": user_id, "invite_link": enlace_vip},
-                estado="delivery_failed",
-            )
+            try:
+                enlace_revocado = _revocar_enlace_vip_individual(
+                    user_id,
+                    {"id": user_id, "invite_link": enlace_vip},
+                    estado="delivery_failed",
+                )
+            except Exception:
+                app.logger.exception(
+                    "Falló la revocación de seguridad del enlace GoldPass."
+                )
         if bienvenida:
             try:
                 bot.edit_message_text(
@@ -10073,24 +10759,45 @@ def confirmar_acceso_goldpass(call):
                 app.logger.exception(
                     "No se pudo retirar un enlace GoldPass cuya entrega falló."
                 )
-        db.update(
-            {
-                "vip_access_sent": False,
-                "vip_access_sending": False,
-            },
-            consulta.id == user_id,
-        )
-        _sincronizar_suscripcion_pagada_desde_db(user_id)
+        try:
+            db.update(
+                {
+                    "vip_access_sent": False,
+                    "vip_access_sending": False,
+                },
+                consulta.id == user_id,
+            )
+        except Exception:
+            app.logger.exception(
+                "No se pudo restablecer el estado del acceso GoldPass."
+            )
+        try:
+            _sincronizar_suscripcion_pagada_desde_db(user_id)
+        except Exception:
+            app.logger.exception(
+                "No se pudo sincronizar el estado tras fallar el acceso GoldPass."
+            )
         app.logger.exception(
-            "No se pudo crear o entregar el enlace GoldPass individual."
+            "No se pudo completar el acceso GoldPass durante la fase: %s.",
+            fase_entrega,
+        )
+        diagnostico = _resumen_error_entrega_goldpass(error)
+        estado_enlace = (
+            "El enlace emitido se revocó por seguridad."
+            if enlace_revocado
+            else (
+                "No pude confirmar la revocación del enlace; no lo compartas y "
+                "revísalo en el canal."
+            )
         )
         try:
             bot.send_message(
                 int(ADMIN_ID),
                 "⚠️ No pude preparar el acceso individual de GoldPass para "
-                f"<code>{user_id}</code>. Verifica que el bot sea administrador "
-                "del canal y pueda gestionar invitaciones y solicitudes de ingreso. "
-                "No se envió el enlace compartido.",
+                f"<code>{user_id}</code>.\n"
+                f"Fase: {html.escape(fase_entrega)}.\n"
+                f"Detalle: {html.escape(diagnostico)}\n\n"
+                f"{html.escape(estado_enlace)}",
                 parse_mode="HTML",
                 protect_content=True,
             )
@@ -11181,10 +11888,21 @@ def expulsar_manual(message):
             return
 
     try:
-        expulsar_usuario_vencido(user_id)
-        bot.send_message(int(ADMIN_ID),
-            f"✅ Usuario <code>{user_id}</code> expulsado y notificado (prueba manual).",
-            parse_mode="HTML")
+        expulsado = expulsar_usuario_vencido(user_id, forzar=True)
+        if expulsado:
+            bot.send_message(
+                int(ADMIN_ID),
+                f"✅ Se procesó la expulsión de <code>{user_id}</code> "
+                "y se intentó notificarle (prueba manual).",
+                parse_mode="HTML",
+            )
+        else:
+            bot.send_message(
+                int(ADMIN_ID),
+                f"⚠️ No pude confirmar la expulsión de <code>{user_id}</code>. "
+                "Si quedó pendiente, el bot la reintentará automáticamente.",
+                parse_mode="HTML",
+            )
     except Exception as e:
         bot.send_message(int(ADMIN_ID),
             f"⚠️ No pude expulsar a <code>{user_id}</code>: {e}", parse_mode="HTML")
@@ -17372,6 +18090,76 @@ def proceso_obtener_usuario_reporte(message):
         bot.send_message(message.chat.id, "❌ Sin registros.")
 
 
+def _registrar_webhook_con_reintentos(webhook_url, max_attempts=3):
+    """Retry transient Telegram timeouts/rate limits instead of crash-looping Render."""
+    for intento in range(max_attempts):
+        try:
+            if bot.set_webhook(
+                url=webhook_url,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=WEBHOOK_ALLOWED_UPDATES,
+            ):
+                app.logger.info(
+                    "Webhook de Telegram registrado; actualizaciones habilitadas."
+                )
+                return True
+            raise RuntimeError("Telegram no aceptó el registro del webhook.")
+        except Exception as error:
+            error_code = getattr(error, "error_code", None)
+            transient_error = (
+                error_code == 429
+                or (isinstance(error_code, int) and 500 <= error_code < 600)
+                or isinstance(error, (urllib.error.URLError, TimeoutError))
+                or type(error).__name__
+                in {
+                    "ReadTimeout",
+                    "ConnectTimeout",
+                    "Timeout",
+                    "ConnectionError",
+                }
+            )
+            if not transient_error:
+                raise
+
+            retry_after = None
+            result_json = getattr(error, "result_json", None)
+            if isinstance(result_json, dict):
+                retry_after = (
+                    result_json.get("parameters", {}).get("retry_after")
+                )
+            try:
+                delay = max(1, int(retry_after))
+            except (TypeError, ValueError):
+                delay = 2 ** intento
+            if intento + 1 < max_attempts:
+                app.logger.warning(
+                    "Telegram no confirmó el registro del webhook "
+                    "(clase=%s, código=%s); reintento %s/%s en %s s.",
+                    type(error).__name__,
+                    error_code or "n/a",
+                    intento + 1,
+                    max_attempts - 1,
+                    delay,
+                )
+                time.sleep(min(delay, 15))
+                continue
+
+            # A ReadTimeout may happen after Telegram already accepted the
+            # webhook. Keep the service alive if the registered URL is correct.
+            try:
+                info = bot.get_webhook_info()
+                if getattr(info, "url", "") == webhook_url:
+                    app.logger.warning(
+                        "Telegram ya conserva el webhook de este servicio "
+                        "tras un registro con respuesta incierta."
+                    )
+                    return True
+            except Exception:
+                pass
+            raise
+    return False
+
+
 
 if __name__ == "__main__":
     comandos_privados_preservados = False
@@ -17496,8 +18284,7 @@ if __name__ == "__main__":
     elif mode=="webhook":
         base=(os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL") or "").rstrip("/")
         if not base: raise RuntimeError("Falta RENDER_EXTERNAL_URL o WEBHOOK_URL para registrar el webhook.")
-        if not bot.set_webhook(url=base+WEBHOOK_PATH,secret_token=WEBHOOK_SECRET,allowed_updates=WEBHOOK_ALLOWED_UPDATES):
+        if not _registrar_webhook_con_reintentos(base + WEBHOOK_PATH):
             raise RuntimeError("Telegram no aceptó el registro del webhook.")
-        app.logger.warning("Webhook de Telegram registrado; actualizaciones de mensajes habilitadas.")
     else: raise RuntimeError("BOT_MODE debe ser webhook o polling.")
     app.run(host="0.0.0.0",port=port,threaded=True,use_reloader=False)

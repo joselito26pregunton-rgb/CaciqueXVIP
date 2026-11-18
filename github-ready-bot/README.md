@@ -43,7 +43,7 @@ Después del despliegue, el administrador puede enviar `/gemini_test` al bot par
 
 ## Datos locales
 
-`config.json`, `payment_config.json`, `usuarios.json`, `business_welcome_users.json` y las bases de datos locales se crean o modifican durante la ejecución y están excluidos del ZIP. Conserva las copias del servicio de Render: pueden contener destinos, pagos, suscripciones y registros que no deben reemplazarse al subir este código. Mantén el repositorio privado porque el código contiene enlaces actuales del bot.
+El ZIP completo incluye una copia de los archivos JSON presentes en este espacio de trabajo, incluidos ajustes de pago y registros de usuarios. Pueden contener información financiera o identificadores; guarda el archivo y el repositorio como privados y no lo publiques. Si Render tiene archivos más recientes en un disco persistente, conserva esos archivos y actualiza solo el código; no los reemplaces con esta copia local. Configura `BOT_DATA_DIR` para que apunte al disco persistente de Render.
 
 ### Guardar las imágenes con Supabase en Render
 
@@ -56,4 +56,10 @@ Antes del primer uso, abre el **SQL Editor** del proyecto Supabase, ejecuta el c
 
 En la sección de fotos del panel de administración, el bot indica si Supabase respondió o si falta configurarlo. Si Supabase no responde al guardar una foto, el bot debe avisarlo y no confirmar el cambio como guardado. El plan gratuito de Supabase puede pausar un proyecto tras siete días con poca actividad; su documentación indica que se puede reanudar con sus datos y configuración durante un año. Tras una pausa, puede ser necesario reanudar el proyecto desde su panel.
 
-Esta conexión persiste únicamente las referencias de las dos fotos y las instrucciones de bienvenida de `/start`. Los métodos de pago, destinos, suscripciones y otros archivos siguen usando los archivos locales indicados arriba; para conservar también esos datos al volver a desplegar, hace falta configurar por separado el almacenamiento persistente de esos registros.
+La tabla `bot_persistent_settings` guarda las referencias de las fotos y los ajustes visuales; `bot_subscription_records` conserva el registro de accesos pagados y Free GoldPass cuando Supabase está configurado. Los métodos de pago, destinos y otros archivos de configuración siguen usando el almacenamiento local de Render, por lo que conviene conservar el disco persistente del servicio y no reemplazar sus archivos de estado al actualizar el código.
+
+### Renovaciones con Telegram Stars
+
+Al vencer una suscripción, el bot intenta retirar al usuario del canal privado y le ofrece **300 Stars** o los otros métodos de pago. Stars usa una factura real de Telegram (`XTR`), no un enlace de invitación; el pago confirmado extiende el acceso 30 días y registra el identificador del cargo para evitar duplicarlo. El usuario recibe un botón de acceso personal que solo funciona para su cuenta.
+
+Si Telegram rechaza una expulsión, el bot conserva el vencimiento pendiente en el historial y vuelve a intentarlo cada minuto. Para completar la expulsión, el bot debe ser administrador de `-1003914257220` con permiso para restringir miembros. Para emitir enlaces personales, también necesita permiso para invitar usuarios.

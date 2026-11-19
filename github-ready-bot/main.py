@@ -3582,12 +3582,18 @@ GROUP_KEYBOARD_LOCK = threading.RLock()
 
 
 def publicar_teclado_grupo(chat_id):
-    """Refresh the shared group keyboard while retaining one anchor message."""
+    """Publish the shared group keyboard once, using a persistent anchor."""
     chat_key = str(int(chat_id))
     with GROUP_KEYBOARD_LOCK:
         cfg = cargar_config()
         group = cfg.setdefault("group_settings", {}).setdefault(chat_key, {})
-        previous_id = group.get("reply_keyboard_message_id")
+        existing_id = group.get("reply_keyboard_message_id")
+        if existing_id:
+            # Telegram reply keyboards persist after their message is sent.
+            # Re-sending this anchor on every restart or member join fills the
+            # group history without improving the already-published keyboard.
+            return None
+
         mensaje = bot.send_message(
             int(chat_id),
             "🔱 Atajos del grupo",
@@ -3599,14 +3605,10 @@ def publicar_teclado_grupo(chat_id):
             guardar_config(cfg)
         except Exception:
             app.logger.exception(
-                "No se pudo guardar el ancla del teclado del grupo %s.",
+                "No se pudo guardar el ancla del teclado del grupo %s; "
+                "un reinicio podría volver a publicarla.",
                 chat_key,
             )
-        if previous_id and str(previous_id) != str(mensaje.message_id):
-            try:
-                bot.delete_message(int(chat_id), int(previous_id))
-            except Exception:
-                pass
         return mensaje
 
 

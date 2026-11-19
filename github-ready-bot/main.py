@@ -825,7 +825,13 @@ GroupReports = TinyDB(_state_path("group_reports.json"))
 GroupModerationLog = TinyDB(_state_path("group_moderation_log.json"))
 GroupBannedWords = TinyDB(_state_path("group_banned_words.json")).table("words")
 PromosAprobadas = TinyDB(_state_path("promos_aprobadas.json"))
+GroupSFSRequests = TinyDB(_state_path("group_sfs_requests.json"))
 RegistroActividad = TinyDB(_state_path("registro_actividad.json"))
+SFS_LOCK = threading.RLock()
+SFS_ALBUM_TIMERS = {}
+SFS_MAX_MEDIA = 3
+SFS_MAX_DESCRIPTION_CHARS = 3800
+SFS_INLINE_LINK_LIMIT = 8
 GROUP_MODERATION_QUEUE = queue.Queue(maxsize=150)
 GROUP_MODERATION_LOCK = threading.RLock()
 GROUP_MODERATION_PENDING = set()
@@ -3581,18 +3587,18 @@ def obtener_teclado_cuadritos():
 GROUP_KEYBOARD_LOCK = threading.RLock()
 
 
-def publicar_teclado_grupo(chat_id):
+def publicar_teclado_grupo(chat_id, reemplazar=False):
     """Publish the shared group keyboard once, using a persistent anchor."""
     chat_key = str(int(chat_id))
     with GROUP_KEYBOARD_LOCK:
         cfg = cargar_config()
         group = cfg.setdefault("group_settings", {}).setdefault(chat_key, {})
         existing_id = group.get("reply_keyboard_message_id")
-        if existing_id:
+        if existing_id and not reemplazar:
             # Telegram reply keyboards persist after their message is sent.
             # Re-sending this anchor on every restart or member join fills the
             # group history without improving the already-published keyboard.
-            return None
+            return None, None
 
         mensaje = bot.send_message(
             int(chat_id),
@@ -3606,37 +3612,36 @@ def publicar_teclado_grupo(chat_id):
         except Exception:
             app.logger.exception(
                 "No se pudo guardar el ancla del teclado del grupo %s; "
-                "un reinicio podría volver a publicarla.",
+                "se conserva el ancla anterior.",
                 chat_key,
             )
-        return mensaje
+            try:
+                bot.delete_message(int(chat_id), mensaje.message_id)
+            except Exception:
+                app.logger.warning(
+                    "No se pudo retirar el ancla nueva no guardada del grupo %s.",
+                    chat_key,
+                )
+            return None, "No se pudo guardar la configuración de la botonera."
 
-
-def _refrescar_teclados_grupos_configurados():
-    """Replace old reply-keyboard anchors in configured groups at startup."""
-    cfg = cargar_config()
-    for chat_id, info in cfg.get("group_settings", {}).items():
-        if isinstance(info, dict) and str(
-            info.get("type") or info.get("tipo") or ""
-        ).casefold() in ("canal", "channel"):
-            continue
-        try:
-            chat = bot.get_chat(int(chat_id))
-            if getattr(chat, "type", None) not in ("group", "supergroup"):
-                continue
-            publicar_teclado_grupo(chat.id)
-            app.logger.info(
-                "Se actualizó la botonera inferior del grupo %s.",
-                chat_id,
-            )
-        except Exception as error:
-            app.logger.warning(
-                "No se pudo actualizar la botonera inicial del grupo %s "
-                "(clase=%s, código=%s).",
-                chat_id,
-                type(error).__name__,
-                getattr(error, "error_code", "n/a"),
-            )
+        if existing_id and str(existing_id) != str(mensaje.message_id):
+            try:
+                bot.delete_message(int(chat_id), int(existing_id))
+            except Exception as error:
+                detalle = str(error).lower()
+                if "message to delete not found" not in detalle:
+                    app.logger.warning(
+                        "La botonera se publicó en %s, pero no se pudo borrar "
+                        "el ancla anterior (clase=%s, código=%s).",
+                        chat_key,
+                        type(error).__name__,
+                        getattr(error, "error_code", "n/a"),
+                    )
+                    return mensaje, (
+                        "La botonera se publicó, pero Telegram no permitió "
+                        "borrar el mensaje anterior."
+                    )
+        return mensaje, None
 
 
 def obtener_emoji_link(url):
@@ -12682,6 +12687,8 @@ def _ultima_actividad_grupo(chat_id):
         return ultima
     fechas = []
     for row in _registros_grupo(RegistroActividad, cid, legacy_principal=True):
+        if row.get("source") == "reporte_privado":
+            continue
         valor = str(row.get("date") or "")
         try:
             fecha = datetime.fromisoformat(valor)
@@ -13066,6 +13073,8 @@ def _eventos_publicacion_grupo(chat_id):
     )
     eventos = []
     for registro in actividad:
+        if registro.get("source") == "reporte_privado":
+            continue
         eventos.append({"date": registro.get("date", ""), "kind": "actividad", "record": registro})
     for registro in promos:
         eventos.append({"date": registro.get("approved_at", ""), "kind": "promocion", "record": registro})
@@ -13912,6 +13921,12 @@ def mostrar_panel_control_grupo(
         if registro.get("status", "active") == "active"
     ]
     publicaciones = _eventos_publicacion_grupo(cid)
+    sfs_pendientes = [
+        registro
+        for registro in GroupSFSRequests
+        if str(registro.get("group_id")) == cid
+        and registro.get("status") == "pending_review"
+    ]
     ajustes_grupo = _grupo_configuracion_moderacion(cid)
     gemini_configurado = bool(os.environ.get("GEMINI_API_KEY", "").strip())
     moderacion_activa = (
@@ -13954,6 +13969,10 @@ def mostrar_panel_control_grupo(
         ))
     supervisable = _es_grupo_chat_supervisable(cid)
     if supervisable:
+        markup.add(types.InlineKeyboardButton(
+            f"📥 SFS por revisar ({len(sfs_pendientes)})",
+            callback_data=f"mod_seccion|{dest_key}|sfs|0",
+        ))
         estado_moderacion = (
             "🧠 Gemini: Activo"
             if gemini_configurado and moderacion_activa
@@ -14026,6 +14045,7 @@ def mostrar_seccion_control_grupo(
         "sanciones": "⚠️ Advertencias y expulsiones",
         "blacklist": "⛔ Lista negra",
         "publicaciones": "📰 Actividad y publicaciones",
+        "sfs": "📥 Envíos SFS pendientes",
     }.get(section)
     if not titulo:
         return mostrar_panel_control_grupo(
@@ -14060,6 +14080,21 @@ def mostrar_seccion_control_grupo(
             if row.get("status", "active") == "active"
         ]
         registros.sort(key=lambda row: str(row.get("date", "")), reverse=True)
+    elif section == "sfs":
+        if not _es_grupo_chat_supervisable(cid):
+            return mostrar_panel_control_grupo(
+                chat_id, dest_key, destino, message=message,
+                aviso="Los envíos SFS solo se revisan para grupos autorizados.",
+            )
+        registros = [
+            row for row in GroupSFSRequests
+            if str(row.get("group_id")) == cid
+            and row.get("status") == "pending_review"
+        ]
+        registros.sort(
+            key=lambda row: str(row.get("submitted_at") or ""),
+            reverse=True,
+        )
     else:
         registros = _eventos_publicacion_grupo(cid)
 
@@ -14073,6 +14108,12 @@ def mostrar_seccion_control_grupo(
     for row in current:
         if section == "reportes":
             username = html.escape(str(row.get("reported_username") or "sin_usuario"))
+            reported_user_id = row.get("reported_user_id")
+            reported_user_id_text = (
+                html.escape(str(reported_user_id))
+                if reported_user_id is not None
+                else "sin ID verificado"
+            )
             source = row.get("source")
             reporter = (
                 "Gemini automático"
@@ -14083,19 +14124,74 @@ def mostrar_seccion_control_grupo(
                     else html.escape(str(row.get("reporter_id") or "desconocido"))
                 )
             )
-            action = html.escape(str(row.get("action") or "registrado"))
+            action_raw = str(row.get("action") or "registrado")
+            action = html.escape({
+                "muted_pending_review": "silencio temporal aplicado",
+                "mute_failed": "no se pudo aplicar el silencio",
+                "pending_identity": "identidad por confirmar",
+                "membership_unverified": "membresía por confirmar",
+                "admin_review_only": "requiere revisión manual",
+                "target_not_in_group": "no está en el grupo",
+                "manual_report_released": "restricción levantada",
+                "manual_report_expelled": "expulsión manual aplicada",
+            }.get(action_raw, action_raw))
+            review_status = str(row.get("status") or "")
+            review_label = {
+                "pending_review": "Pendiente de revisión",
+                "needs_identity": "Identidad por confirmar; no se sancionó",
+                "membership_unverified": "Membresía por confirmar; no se sancionó",
+                "admin_target": "Cuenta administradora; sin silencio automático",
+                "not_in_group": "No figura como miembro activo",
+                "released": "Revisado; se levantó el silencio",
+                "expelled": "Revisado; expulsión aplicada",
+            }.get(review_status, "")
             when = html.escape(str(row.get("date") or "fecha no registrada"))
             lines.append(
                 f"• <b>@{username}</b> · ID "
-                f"<code>{row.get('reported_user_id', '?')}</code>\n"
-                f"  Reportó: <code>{reporter}</code> · {action} · {when}"
+                f"<code>{reported_user_id_text}</code>\n"
+                f"  Reportó: <code>{reporter}</code> · {action}"
+                f"{' · ' + html.escape(review_label) if review_label else ''} · {when}"
             )
+            report_reason = str(row.get("reason") or "").strip()
+            if report_reason:
+                lines.append(
+                    f"  Detalle: {html.escape(report_reason[:220])}"
+                )
+            source_message_id = row.get("source_message_id")
+            if source_message_id:
+                lines.append(
+                    f"  Mensaje original: <code>{html.escape(str(source_message_id))}</code>"
+                )
             evidence_id = row.get("evidence_doc_id")
             if evidence_id:
                 markup.add(types.InlineKeyboardButton(
                     "👁️ Ver evidencia",
                     callback_data=f"mv|{dest_key}|a|{evidence_id}|r|{page}",
                 ))
+            source_message_url = str(row.get("message_url") or "")
+            if source_message_url.startswith("https://t.me/"):
+                markup.add(types.InlineKeyboardButton(
+                    "🔗 Abrir mensaje original",
+                    url=source_message_url,
+                ))
+            if (
+                review_status == "pending_review"
+                and row.get("reported_user_id")
+            ):
+                markup.add(
+                    types.InlineKeyboardButton(
+                        "🔊 Dejarlo en el grupo",
+                        callback_data=(
+                            f"report_review|release|{dest_key}|{row.doc_id}"
+                        ),
+                    ),
+                    types.InlineKeyboardButton(
+                        "⛔ Expulsar",
+                        callback_data=(
+                            f"report_review|expel|{dest_key}|{row.doc_id}"
+                        ),
+                    ),
+                )
         elif section == "sanciones":
             username = html.escape(str(row.get("username") or "sin_usuario"))
             user_id = row.get("user_id", row.get("id", "?"))
@@ -14155,6 +14251,25 @@ def mostrar_seccion_control_grupo(
                     callback_data=f"mod_mantener|{dest_key}|{cid}|{user_id}",
                 ),
             )
+        elif section == "sfs":
+            username = str(row.get("username") or "").strip()
+            user_label = (
+                f"@{html.escape(username)}"
+                if username
+                else f"ID <code>{html.escape(str(row.get('user_id') or '?'))}</code>"
+            )
+            description = html.escape(str(row.get("description") or ""))
+            description = description[:180] + ("…" if len(description) > 180 else "")
+            media_count = len(row.get("media_items") or [])
+            when = html.escape(str(row.get("submitted_at") or "fecha no registrada"))
+            lines.append(
+                f"• {user_label} · {media_count} archivo(s) · {when}\n"
+                f"  {description or 'Sin descripción'}"
+            )
+            markup.add(types.InlineKeyboardButton(
+                f"👁️ Revisar SFS #{row.doc_id}",
+                callback_data=f"sfs|review|{row.doc_id}",
+            ))
         else:
             kind = row.get("kind")
             if kind == "promocion":
@@ -14364,14 +14479,28 @@ def cb_destkeyboard_send(c):
         bot.answer_callback_query(c.id, "La barra de comandos solo se publica en grupos.")
         return
     try:
-        publicar_teclado_grupo(int(destino["chat_id"]))
-        bot.answer_callback_query(c.id, "Botonera publicada.")
+        publicada, advertencia = publicar_teclado_grupo(
+            int(destino["chat_id"]), reemplazar=True
+        )
+        if advertencia:
+            aviso = advertencia
+            bot.answer_callback_query(
+                c.id,
+                "Se publicó, pero no se pudo limpiar el ancla anterior.",
+                show_alert=True,
+            )
+        elif publicada is None:
+            aviso = "La botonera ya estaba configurada; no envié otro mensaje."
+            bot.answer_callback_query(c.id, "La botonera ya estaba activa.")
+        else:
+            aviso = "La barra de comandos se publicó en el grupo y se reemplazó el ancla anterior."
+            bot.answer_callback_query(c.id, "Botonera publicada.")
         mostrar_menu_botones_publicaciones(
             c.message.chat.id,
             key,
             destino,
             message=c.message,
-            aviso="La barra de comandos se publicó en el grupo.",
+            aviso=aviso,
         )
     except Exception:
         app.logger.exception("No se pudo publicar la botonera en un destino.")
@@ -15315,6 +15444,179 @@ def cb_mod_mantener_sancion(c):
     bot.answer_callback_query(c.id, "Se mantiene la sanción.")
 
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("report_review|"))
+def cb_report_review(c):
+    if not es_admin_privado(c):
+        bot.answer_callback_query(c.id, "⛔ Sin permiso.", show_alert=True)
+        return
+    try:
+        _, decision, key, raw_doc_id = c.data.split("|", 3)
+        report_doc_id = int(raw_doc_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(c.id, "El reporte no es válido.", show_alert=True)
+        return
+    destino = _destino_por_key(key)
+    if not destino:
+        bot.answer_callback_query(c.id, "Destino no disponible.", show_alert=True)
+        return
+    try:
+        chat_id = int(destino.get("chat_id"))
+    except (TypeError, ValueError):
+        bot.answer_callback_query(c.id, "Destino no válido.", show_alert=True)
+        return
+    reporte = GroupReports.get(doc_id=report_doc_id)
+    if (
+        not reporte
+        or str(reporte.get("chat_id")) != str(chat_id)
+        or reporte.get("status") != "pending_review"
+    ):
+        bot.answer_callback_query(
+            c.id,
+            "El reporte ya fue revisado o no pertenece a este grupo.",
+            show_alert=True,
+        )
+        return
+    try:
+        user_id = int(reporte.get("reported_user_id") or 0)
+    except (TypeError, ValueError):
+        user_id = 0
+    if user_id <= 0:
+        bot.answer_callback_query(
+            c.id,
+            "No hay una identidad confirmada para tomar esa acción.",
+            show_alert=True,
+        )
+        return
+
+    username = str(reporte.get("reported_username") or "sin_usuario")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if decision == "release":
+        if _usuario_en_lista_negra(user_id, chat_id):
+            bot.answer_callback_query(
+                c.id,
+                "Ese usuario ya está expulsado; usa la opción de reingreso.",
+                show_alert=True,
+            )
+            return
+        if _advertencias_usuario(chat_id, user_id):
+            bot.answer_callback_query(
+                c.id,
+                "Tiene una sanción automática activa. Para no levantarla por "
+                "error, revísala desde «Sanciones».",
+                show_alert=True,
+            )
+            return
+        another_pending_report = any(
+            row.doc_id != report_doc_id
+            and int(row.get("reported_user_id") or 0) == user_id
+            and row.get("status") == "pending_review"
+            and row.get("mute_applied")
+            for row in _registros_grupo(GroupReports, chat_id)
+        )
+        if another_pending_report:
+            bot.answer_callback_query(
+                c.id,
+                "Hay otro reporte pendiente con silencio activo. Revisa todos "
+                "antes de levantar la restricción.",
+                show_alert=True,
+            )
+            return
+        try:
+            bot.restrict_chat_member(
+                chat_id,
+                user_id,
+                can_send_messages=True,
+                use_independent_chat_permissions=False,
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo levantar la restricción de un reporte "
+                "(grupo=%s, clase=%s, código=%s).",
+                chat_id,
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
+            bot.answer_callback_query(
+                c.id,
+                "Telegram no permitió levantar el silencio. Revisa permisos y estado.",
+                show_alert=True,
+            )
+            return
+        status, action = "released", "manual_report_released"
+        confirmacion = "Restricción levantada; el usuario permanece en el grupo."
+    elif decision == "expel":
+        try:
+            bot.ban_chat_member(chat_id, user_id)
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo expulsar tras revisar un reporte "
+                "(grupo=%s, clase=%s, código=%s).",
+                chat_id,
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
+            bot.answer_callback_query(
+                c.id,
+                "Telegram no permitió expulsar al usuario. Revisa los permisos del bot.",
+                show_alert=True,
+            )
+            return
+        blacklist_rows = [
+            row for row in Blacklist.search(User.id == user_id)
+            if str(row.get("chat_id", "")) == str(chat_id)
+        ]
+        blacklist_data = {
+            "id": user_id,
+            "chat_id": str(chat_id),
+            "username": username,
+            "reason": "Expulsión tras revisión manual de un reporte",
+            "date": now,
+            "status": "active",
+        }
+        if blacklist_rows:
+            Blacklist.update(
+                blacklist_data,
+                doc_ids=[blacklist_rows[-1].doc_id],
+            )
+        else:
+            Blacklist.insert(blacklist_data)
+        status, action = "expelled", "manual_report_expelled"
+        confirmacion = "Usuario expulsado y agregado a la lista negra del grupo."
+    else:
+        bot.answer_callback_query(c.id, "Acción desconocida.", show_alert=True)
+        return
+
+    GroupReports.update(
+        {
+            "status": status,
+            "action": action,
+            "reviewed_at": now,
+            "reviewed_by": int(c.from_user.id),
+        },
+        doc_ids=[report_doc_id],
+    )
+    GroupModerationLog.insert({
+        "chat_id": str(chat_id),
+        "user_id": user_id,
+        "username": username,
+        "action": action,
+        "count": 0,
+        "reporter_id": reporte.get("reporter_id"),
+        "evidence_doc_id": reporte.get("evidence_doc_id"),
+        "reason": "Decisión administrativa tras revisión de reporte",
+        "source": "reporte_miembro",
+        "date": now,
+    })
+    bot.answer_callback_query(c.id, confirmacion)
+    mostrar_seccion_control_grupo(
+        c.message.chat.id,
+        key,
+        "reportes",
+        0,
+        message=c.message,
+    )
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("mv|"))
 def cb_mod_ver_publicacion(c):
     if not es_admin_privado(c):
@@ -15366,9 +15668,48 @@ def cb_mod_ver_publicacion(c):
         body = str(registro.get("text") or "Sin texto")
         media_type = str(registro.get("type") or "")
         date = str(registro.get("date") or "fecha no registrada")
+    saved_media_items = registro.get("media_items") or []
+    if (
+        record_kind == "p"
+        and len(saved_media_items) > 1
+        and len(saved_media_items) <= SFS_MAX_MEDIA
+    ):
+        try:
+            album = []
+            for index, item in enumerate(saved_media_items):
+                caption = f"Publicación aprobada · {date}" if index == 0 else None
+                if item.get("media_type") == "photo":
+                    album.append(types.InputMediaPhoto(item["media_id"], caption=caption))
+                elif item.get("media_type") == "video":
+                    album.append(types.InputMediaVideo(item["media_id"], caption=caption))
+            if len(album) == len(saved_media_items):
+                bot.send_media_group(
+                    c.message.chat.id, album, protect_content=True
+                )
+                preview_markup = _markup_botones_publicacion(
+                    registro.get("buttons") or []
+                ) or types.InlineKeyboardMarkup()
+                for row in back_markup.keyboard:
+                    preview_markup.keyboard.append(row)
+                bot.send_message(
+                    c.message.chat.id,
+                    f"Publicación de @{username}\n\n{body[:3800]}",
+                    reply_markup=preview_markup,
+                    parse_mode=None,
+                    protect_content=True,
+                )
+                bot.answer_callback_query(c.id)
+                return
+        except Exception:
+            app.logger.exception("No se pudo mostrar el álbum SFS archivado.")
     if registro.get("file_id") and media_type in ("photo", "video"):
+        title = (
+            "Evidencia privada de reporte"
+            if registro.get("source") == "reporte_privado"
+            else f"Publicación de @{username}"
+        )
         caption = (
-            f"📰 <b>Publicación de @{username}</b>\n"
+            f"🛡️ <b>{title}</b>\n"
             f"{html.escape(date)}\n\n{html.escape(body[:700])}"
         )
         try:
@@ -15393,8 +15734,13 @@ def cb_mod_ver_publicacion(c):
             bot.answer_callback_query(c.id, "No pude cargar el contenido.", show_alert=True)
         return
 
+    title = (
+        "Evidencia privada de reporte"
+        if registro.get("source") == "reporte_privado"
+        else f"Mensaje de @{username}"
+    )
     texto = (
-        f"📰 <b>Mensaje de @{username}</b>\n"
+        f"🛡️ <b>{title}</b>\n"
         f"{html.escape(date)}\n\n{html.escape(body[:3000])}"
     )
     editar_o_enviar_panel(
@@ -16425,23 +16771,43 @@ def start_payment(message):
             type(error).__name__,
         )
     payload=(message.text or "").split(maxsplit=1)
+    start_payload = payload[1].strip() if len(payload) > 1 else ""
+    if _procesar_payload_sfs(message, start_payload):
+        return
     if len(payload)>1 and payload[1].strip().lower().startswith("reporte"):
         partes = payload[1].strip().lower().split("_", 1)
         group_id = _grupo_reporte_seleccionado(partes[1] if len(partes) > 1 else None)
+        if not _es_grupo_chat_supervisable(group_id):
+            bot.send_message(
+                chat_id,
+                "Los reportes están disponibles solo desde un grupo autorizado.",
+                protect_content=True,
+            )
+            return
         markup=types.InlineKeyboardMarkup(row_width=1)
         markup.add(
+            types.InlineKeyboardButton(
+                "🔗 Reportar con enlace del mensaje",
+                callback_data=f"menu_reportar_enlace|{group_id}",
+            ),
             types.InlineKeyboardButton(
                 "👤 Reportar usuario por nombre",
                 callback_data=f"menu_reportar_nombre|{group_id}",
             ),
             types.InlineKeyboardButton(
-                "🖼️ Reportar multimedia",
+                "🗂️ Buscar multimedia por usuario",
                 callback_data=f"menu_reportar_multimedia|{group_id}",
+            ),
+            types.InlineKeyboardButton(
+                "📎 Enviar evidencia",
+                callback_data=f"menu_reportar_evidencia|{group_id}",
             ),
         )
         editar_o_enviar_panel(
             chat_id,
-            "🕵️ CENTRO DE REPORTES\n\nElige qué quieres reportar:",
+            "🕵️ CENTRO DE REPORTES\n\n"
+            "Elige qué quieres reportar. Si es la primera vez que abres este "
+            "chat, Telegram te pedirá pulsar Start antes de poder enviarme el reporte.",
             markup,
             protect_content=True,
             forzar_texto=True,
@@ -16449,7 +16815,6 @@ def start_payment(message):
         return
     if message.chat.type != "private":
         return
-    start_payload = payload[1].strip() if len(payload) > 1 else ""
     app.logger.warning("Diagnóstico: el manejador privado de /start se ejecutó.")
     resultado = _iniciar_inicio_pago_con_recuperacion(
         chat_id, uid, start_payload
@@ -17181,7 +17546,20 @@ def recibir_foto_pago(message):
             return
         return
 
+    if _sfs_active_for_user(uid):
+        _sfs_handle_member_message(message)
+        return
+
     info = solicitudes_info.get(uid)
+    if not info and _sfs_pending_for_user(uid):
+        eliminar_mensaje_disparador(message)
+        bot.send_message(
+            message.chat.id,
+            "Tu SFS ya está en revisión. El administrador recibirá el envío "
+            "y podrás iniciar otro después de que lo resuelva.",
+            protect_content=True,
+        )
+        return
     if info:
         comprobante = {
             "id": int(uid),
@@ -17671,38 +18049,6 @@ def registrar_miembro_suscripcion_goldpass(update):
         _procesar_ingreso_vip_individual(update, usuario.id)
 
 
-@bot.chat_member_handler()
-def actualizar_teclado_al_entrar_miembro(update):
-    chat = getattr(update, "chat", None)
-    if (
-        not chat
-        or getattr(chat, "type", None) not in ("group", "supergroup")
-        or not es_grupo_autorizado(chat.id)
-    ):
-        return
-    nuevo = getattr(update, "new_chat_member", None)
-    anterior = getattr(update, "old_chat_member", None)
-    usuario = getattr(nuevo, "user", None)
-    if not usuario or getattr(usuario, "is_bot", False):
-        return
-    estado_nuevo = getattr(nuevo, "status", "")
-    estado_anterior = getattr(anterior, "status", "")
-    if (
-        estado_nuevo not in ("member", "administrator")
-        or estado_anterior not in ("left", "kicked")
-    ):
-        return
-    try:
-        publicar_teclado_grupo(chat.id)
-    except Exception as error:
-        app.logger.warning(
-            "No se pudo actualizar el teclado tras entrar un miembro "
-            "(clase=%s, código=%s).",
-            type(error).__name__,
-            getattr(error, "error_code", "n/a"),
-        )
-
-
 @bot.my_chat_member_handler()
 def guardian_autorizacion(update):
     chat = getattr(update, "chat", None)
@@ -17850,14 +18196,15 @@ def guardian_autorizacion(update):
 def teclado_menu_miembro(chat_id=None):
     markup = types.InlineKeyboardMarkup(row_width=2)
     destino_id = chat_id if chat_id and int(chat_id) < 0 else _default_group_id()
+    bot_username = bot.get_me().username
     markup.add(
         types.InlineKeyboardButton(
-            "📢 Crear publicación",
-            callback_data="crear_promo",
+            "📢 Enviar SFS",
+            url=f"https://t.me/{bot_username}?start=sfs_{destino_id}",
         ),
         types.InlineKeyboardButton(
-            "🚩 Reportar usuario",
-            callback_data=f"menu_reportar_nombre|{destino_id}",
+            "🚩 Reportar usuario · abrir bot",
+            url=f"https://t.me/{bot_username}?start=reporte_{destino_id}",
         ),
     )
     return markup
@@ -17903,6 +18250,888 @@ def editar_panel_miembro(chat_id, texto, reply_markup=None):
     return panel
 
 
+SFS_DRAFT_STATUSES = {"collecting_media", "collecting_album", "awaiting_description"}
+
+
+def _sfs_get(doc_id):
+    try:
+        with SFS_LOCK:
+            return GroupSFSRequests.get(doc_id=int(doc_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sfs_active_for_user(user_id):
+    with SFS_LOCK:
+        matches = [
+            row for row in GroupSFSRequests
+            if str(row.get("user_id")) == str(user_id)
+            and row.get("status") in SFS_DRAFT_STATUSES
+        ]
+        return max(matches, key=lambda row: row.doc_id, default=None)
+
+
+def _sfs_pending_for_user(user_id):
+    with SFS_LOCK:
+        return any(
+            str(row.get("user_id")) == str(user_id)
+            and row.get("status") in ("pending_review", "publishing")
+            for row in GroupSFSRequests
+        )
+
+
+def _sfs_pending_record(user_id, group_id=None):
+    with SFS_LOCK:
+        matches = [
+            row for row in GroupSFSRequests
+            if str(row.get("user_id")) == str(user_id)
+            and row.get("status") in ("pending_review", "publishing")
+            and (
+                group_id is None
+                or str(row.get("group_id")) == str(group_id)
+            )
+        ]
+        return max(matches, key=lambda row: row.doc_id, default=None)
+
+
+def _sfs_user_markup(doc_id, can_submit=False):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if can_submit:
+        markup.add(types.InlineKeyboardButton(
+            "📨 Enviar SFS a revisión",
+            callback_data=f"sfs|submit|{int(doc_id)}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Cancelar envío",
+        callback_data=f"sfs|cancel|{int(doc_id)}",
+    ))
+    return markup
+
+
+def _sfs_update(doc_id, changes):
+    with SFS_LOCK:
+        GroupSFSRequests.update(changes, doc_ids=[int(doc_id)])
+
+
+def _iniciar_sfs(chat_id, user_id, group_id, from_user=None):
+    try:
+        group_id = int(group_id)
+        user_id = int(user_id)
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return
+    if chat_id != user_id:
+        return
+    if not _es_grupo_chat_supervisable(group_id):
+        editar_panel_miembro(
+            chat_id,
+            "⛔ El envío SFS no está habilitado para ese grupo.",
+        )
+        return
+    if _usuario_en_lista_negra(user_id, group_id):
+        editar_panel_miembro(
+            chat_id,
+            "⛔ No puedes enviar publicaciones SFS a este grupo.",
+        )
+        return
+
+    pending = _sfs_pending_record(user_id, group_id)
+    if pending:
+        editar_panel_miembro(
+            chat_id,
+            "📥 Ya tienes un SFS pendiente de revisión para este grupo. "
+            "El administrador te avisará cuando lo apruebe o rechace.",
+        )
+        return
+
+    with SFS_LOCK:
+        record = _sfs_active_for_user(user_id)
+        if record:
+            doc_id = record.doc_id
+            if record.get("status") == "collecting_album":
+                _sfs_update(doc_id, {
+                    "status": "awaiting_description",
+                    "media_group_id": None,
+                })
+                record = _sfs_get(doc_id)
+            if str(record.get("group_id")) != str(group_id):
+                _sfs_update(doc_id, {"group_id": str(group_id)})
+                record = _sfs_get(doc_id)
+        else:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            doc_id = GroupSFSRequests.insert({
+                "group_id": str(group_id),
+                "user_id": user_id,
+                "username": getattr(from_user, "username", None),
+                "user_name": " ".join(filter(None, [
+                    getattr(from_user, "first_name", None),
+                    getattr(from_user, "last_name", None),
+                ])),
+                "media_items": [],
+                "media_message_ids": [],
+                "description": "",
+                "buttons": [],
+                "status": "collecting_media",
+                "created_at": now,
+            })
+            record = _sfs_get(doc_id)
+
+    status = record.get("status")
+    if status == "awaiting_description":
+        media_count = len(record.get("media_items") or [])
+        texto = (
+            f"📢 Enviar SFS · {media_count}/{SFS_MAX_MEDIA} archivos\n\n"
+            "Ya recibí tu foto o video. Puedes enviar ahora una descripción "
+            "adicional con tus enlaces y luego tocar «Enviar SFS a revisión». "
+            "Si el pie de foto ya está completo, toca ese botón directamente.\n\n"
+            f"El texto final admite hasta {SFS_MAX_DESCRIPTION_CHARS} caracteres. "
+            "Tu envío solo se publica si el administrador lo aprueba."
+        )
+        if from_user:
+            _sfs_update(doc_id, {
+                "username": getattr(from_user, "username", None),
+                "user_name": " ".join(filter(None, [
+                    getattr(from_user, "first_name", None),
+                    getattr(from_user, "last_name", None),
+                ])),
+            })
+        _sfs_user_panel(user_id, doc_id, texto, can_submit=True)
+        return
+
+    texto = (
+        "📢 Enviar SFS al grupo\n\n"
+        f"Envía de 1 a {SFS_MAX_MEDIA} fotos o videos. Puedes mandarlos juntos "
+        "como álbum o de uno en uno. Añade un pie de foto o, después de enviar "
+        "el multimedia, manda una descripción y sus enlaces.\n\n"
+        "El SFS quedará pendiente y no aparecerá en el grupo hasta que el "
+        "administrador lo revise y apruebe. Los mensajes que envíes aquí se "
+        "borrarán cuando Telegram lo permita. Si nunca abriste este bot, "
+        "Telegram te pedirá pulsar Start."
+    )
+    if from_user:
+        _sfs_update(doc_id, {
+            "username": getattr(from_user, "username", None),
+            "user_name": " ".join(filter(None, [
+                getattr(from_user, "first_name", None),
+                getattr(from_user, "last_name", None),
+            ])),
+        })
+    _sfs_user_panel(user_id, doc_id, texto, can_submit=False)
+
+
+def _sfs_user_panel(chat_id, doc_id, texto, can_submit=False):
+    return editar_panel_miembro(
+        chat_id,
+        texto,
+        _sfs_user_markup(doc_id, can_submit=can_submit),
+    )
+
+
+def _procesar_payload_sfs(message, payload):
+    match = re.fullmatch(r"sfs_(-?\d+)", str(payload or "").strip(), re.I)
+    if not match:
+        return False
+    if message.chat.type != "private":
+        return True
+    try:
+        group_id = int(match.group(1))
+    except (TypeError, ValueError):
+        editar_panel_miembro(
+            message.chat.id, "⛔ El enlace de envío SFS no es válido."
+        )
+        return True
+    if not _es_grupo_chat_supervisable(group_id):
+        editar_panel_miembro(
+            message.chat.id,
+            "⛔ Ese grupo ya no está autorizado para recibir envíos SFS.",
+        )
+        return True
+    try:
+        registrar_inicio_bot_usuario(message)
+    except Exception:
+        pass
+    _iniciar_sfs(
+        message.chat.id, message.from_user.id, group_id,
+        from_user=message.from_user,
+    )
+    return True
+
+
+def _sfs_extraer_botones(descripcion):
+    candidatos = re.findall(
+        r"(?:https?://|www\.|t\.me/)[^\s<>()]+",
+        str(descripcion or ""),
+        flags=re.IGNORECASE,
+    )
+    botones = []
+    vistos = set()
+    for candidato in candidatos:
+        candidato = candidato.rstrip(".,!?;:)]}»”’")
+        if candidato.lower().startswith("http://"):
+            raise ValueError("Los enlaces deben usar HTTPS.")
+        if candidato.lower().startswith("www."):
+            url = "https://" + candidato
+        elif candidato.lower().startswith("t.me/"):
+            url = "https://" + candidato
+        else:
+            url = candidato
+        url = validar_url_boton_publicacion(url)
+        if url in vistos:
+            continue
+        vistos.add(url)
+        host = urllib.parse.urlsplit(url).hostname or "enlace"
+        host = host.removeprefix("www.")
+        texto = validar_texto_boton_publicacion(f"🔗 {host[:58]}")
+        botones.append({"texto": texto, "url": url})
+        if len(botones) > SFS_INLINE_LINK_LIMIT:
+            raise ValueError(
+                f"Puedes incluir hasta {SFS_INLINE_LINK_LIMIT} enlaces con botón."
+            )
+    return _validar_botones_publicacion(botones)
+
+
+def _sfs_media_item(message):
+    if message.content_type == "photo" and message.photo:
+        return {"media_type": "photo", "media_id": message.photo[-1].file_id}
+    if message.content_type == "video" and message.video:
+        return {"media_type": "video", "media_id": message.video.file_id}
+    return None
+
+
+def _sfs_delete_user_message(message):
+    try:
+        eliminar_mensaje_seguro(message.chat.id, message.message_id)
+    except Exception:
+        app.logger.debug("Telegram no permitió limpiar un mensaje de envío SFS.")
+
+
+def _sfs_schedule_album_finish(doc_id):
+    with SFS_LOCK:
+        previous = SFS_ALBUM_TIMERS.pop(int(doc_id), None)
+        if previous:
+            previous.cancel()
+        record = _sfs_get(doc_id)
+        message_ids = record.get("media_message_ids") or [] if record else []
+        last_message_id = message_ids[-1] if message_ids else None
+        timer = threading.Timer(
+            1.2,
+            _sfs_finish_album,
+            args=(int(doc_id), last_message_id),
+        )
+        timer.daemon = True
+        SFS_ALBUM_TIMERS[int(doc_id)] = timer
+        timer.start()
+
+
+def _sfs_finish_album(doc_id, expected_last_message_id=None, send_prompt=True):
+    with SFS_LOCK:
+        record = _sfs_get(doc_id)
+        if not record or record.get("status") != "collecting_album":
+            return False
+        message_ids = record.get("media_message_ids") or []
+        if (
+            expected_last_message_id is not None
+            and (
+                not message_ids
+                or str(message_ids[-1]) != str(expected_last_message_id)
+            )
+        ):
+            return False
+        timer = SFS_ALBUM_TIMERS.pop(int(doc_id), None)
+        if timer and timer is not threading.current_thread():
+            timer.cancel()
+        _sfs_update(doc_id, {
+            "status": "awaiting_description",
+            "media_group_id": None,
+        })
+        record = _sfs_get(doc_id)
+    if send_prompt:
+        _sfs_show_description_step(record)
+    return True
+
+
+def _sfs_show_description_step(record, aviso=None):
+    if not record:
+        return
+    doc_id = record.doc_id
+    media_count = len(record.get("media_items") or [])
+    texto = (
+        f"📢 SFS listo para completar · {media_count}/{SFS_MAX_MEDIA} archivos\n\n"
+        "Puedes enviar una descripción adicional con enlaces o tocar "
+        "«Enviar SFS a revisión» si el pie de foto ya está completo. "
+        "El administrador verá el contenido antes de decidir.\n\n"
+        f"Máximo del texto final: {SFS_MAX_DESCRIPTION_CHARS} caracteres."
+    )
+    if record.get("description"):
+        texto += "\n\nTexto recibido:\n" + (
+            str(record.get("description"))[:700]
+        )
+    if record.get("media_limit_reached"):
+        texto += (
+            f"\n\nSe incluyeron solo los primeros {SFS_MAX_MEDIA} archivos; "
+            "los adicionales se omitieron."
+        )
+    if aviso:
+        texto = f"⚠️ {str(aviso)}\n\n{texto}"
+    _sfs_user_panel(record.get("user_id"), doc_id, texto, can_submit=True)
+
+
+def _sfs_store_media(message, record):
+    with SFS_LOCK:
+        latest = _sfs_get(record.doc_id)
+        if not latest:
+            return True
+        return _sfs_store_media_locked(message, latest)
+
+
+def _sfs_store_media_locked(message, record):
+    doc_id = record.doc_id
+    media_item = _sfs_media_item(message)
+    if not media_item:
+        return False
+    media_group_id = getattr(message, "media_group_id", None)
+    current_items = list(record.get("media_items") or [])
+    message_ids = list(record.get("media_message_ids") or [])
+    if str(message.message_id) in {str(item) for item in message_ids}:
+        return True
+    if len(current_items) >= SFS_MAX_MEDIA:
+        _sfs_update(doc_id, {"media_limit_reached": True})
+        _sfs_delete_user_message(message)
+        if media_group_id and record.get("status") == "collecting_album":
+            _sfs_schedule_album_finish(doc_id)
+        else:
+            _sfs_show_description_step(
+                _sfs_get(doc_id),
+                f"Un SFS admite hasta {SFS_MAX_MEDIA} archivos. "
+                "Los archivos adicionales se omitieron.",
+            )
+        return True
+    if current_items and media_group_id:
+        current_group = record.get("media_group_id")
+        if current_group and str(current_group) != str(media_group_id):
+            _sfs_finish_album(doc_id, send_prompt=False)
+            return False
+    current_items.append(media_item)
+    message_ids.append(message.message_id)
+    caption = (getattr(message, "caption", None) or "").strip()
+    description = str(record.get("description") or "")
+    if caption:
+        description = f"{description}\n\n{caption}".strip() if description else caption
+    if len(description) > SFS_MAX_DESCRIPTION_CHARS:
+        _sfs_delete_user_message(message)
+        _sfs_show_description_step(
+            record,
+            f"El texto supera {SFS_MAX_DESCRIPTION_CHARS} caracteres. "
+            "Envía una descripción más corta.",
+        )
+        return True
+    update = {
+        "media_items": current_items,
+        "media_message_ids": message_ids,
+        "description": description,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if media_group_id:
+        update.update({
+            "status": "collecting_album",
+            "media_group_id": str(media_group_id),
+        })
+    else:
+        update.update({"status": "awaiting_description", "media_group_id": None})
+    _sfs_update(doc_id, update)
+    _sfs_delete_user_message(message)
+    if media_group_id:
+        _sfs_schedule_album_finish(doc_id)
+    else:
+        _sfs_show_description_step(_sfs_get(doc_id))
+    return True
+
+
+def _sfs_handle_member_message(message):
+    record = _sfs_active_for_user(message.from_user.id)
+    if not record:
+        return False
+    doc_id = record.doc_id
+    text = (getattr(message, "text", None) or "").strip()
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+    if command == "/cancelar" or text.lower() in ("cancelar", "❌ cancelar envío"):
+        _sfs_update(doc_id, {
+            "status": "cancelled",
+            "cancelled_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        _sfs_delete_user_message(message)
+        _sfs_user_panel(message.chat.id, doc_id, "El borrador SFS se canceló.")
+        return True
+
+    if record.get("status") == "collecting_album":
+        media_group_id = getattr(message, "media_group_id", None)
+        if message.content_type in ("photo", "video") and str(media_group_id) == str(
+            record.get("media_group_id")
+        ):
+            return _sfs_store_media(message, record)
+        _sfs_finish_album(doc_id)
+        record = _sfs_get(doc_id)
+
+    if message.content_type in ("photo", "video"):
+        if record.get("status") not in ("collecting_media", "awaiting_description"):
+            return True
+        return _sfs_store_media(message, record)
+
+    if message.content_type == "text":
+        if record.get("status") == "collecting_media":
+            _sfs_show_description_step(
+                record,
+                "Primero envía al menos una foto o video.",
+            )
+            _sfs_delete_user_message(message)
+            return True
+        incoming = text
+        incoming_command = (
+            incoming.split(maxsplit=1)[0].split("@", 1)[0].lower()
+            if incoming
+            else ""
+        )
+        if incoming_command == "/omitir":
+            _sfs_delete_user_message(message)
+            _sfs_show_description_step(_sfs_get(doc_id))
+            return True
+        previous = str(record.get("description") or "").strip()
+        description = f"{previous}\n\n{incoming}".strip() if previous else incoming
+        if len(description) > SFS_MAX_DESCRIPTION_CHARS:
+            _sfs_show_description_step(
+                record,
+                f"El texto supera {SFS_MAX_DESCRIPTION_CHARS} caracteres. "
+                "No se guardó; envía una versión más corta.",
+            )
+            return True
+        _sfs_update(doc_id, {
+            "description": description,
+            "status": "awaiting_description",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        _sfs_delete_user_message(message)
+        _sfs_show_description_step(_sfs_get(doc_id), "Texto añadido al borrador.")
+        return True
+    return True
+
+
+def _sfs_markup_admin(record):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for button in _validar_botones_publicacion(record.get("buttons") or []):
+        markup.add(types.InlineKeyboardButton(button["texto"], url=button["url"]))
+    markup.add(
+        types.InlineKeyboardButton(
+            "✅ Aprobar y publicar",
+            callback_data=f"sfs|approve|{int(record.doc_id)}",
+        ),
+        types.InlineKeyboardButton(
+            "❌ Rechazar",
+            callback_data=f"sfs|reject|{int(record.doc_id)}",
+        ),
+    )
+    return markup
+
+
+def _sfs_admin_header(record):
+    username = str(record.get("username") or "").strip()
+    sender = f"@{username}" if username else f"ID {record.get('user_id')}"
+    return (
+            f"📥 SFS #{record.doc_id} · {sender}\n"
+        f"Destino: {record.get('group_id')}"
+    )
+
+
+def _sfs_send_admin_preview(doc_id):
+    record = _sfs_get(doc_id)
+    if not record or record.get("status") != "pending_review":
+        return False
+    items = record.get("media_items") or []
+    if not items or len(items) > SFS_MAX_MEDIA:
+        return False
+    description = str(record.get("description") or "")
+    markup = _sfs_markup_admin(record)
+    header = _sfs_admin_header(record)
+    admin_message_id = None
+    media_message_ids = []
+    if len(items) > 1:
+        album = []
+        for index, item in enumerate(items):
+            media_type = item.get("media_type")
+            media_id = item.get("media_id")
+            caption = header if index == 0 else None
+            if media_type == "photo":
+                album.append(types.InputMediaPhoto(media_id, caption=caption))
+            elif media_type == "video":
+                album.append(types.InputMediaVideo(media_id, caption=caption))
+            else:
+                raise ValueError("El SFS contiene un tipo de archivo no permitido.")
+        sent_album = bot.send_media_group(
+            int(ADMIN_ID), album, protect_content=True
+        )
+        media_message_ids = [item.message_id for item in sent_album]
+        detail = f"{header}\n\n{description or 'Sin descripción'}"
+        detail_message = bot.send_message(
+            int(ADMIN_ID),
+            detail,
+            reply_markup=markup,
+            parse_mode=None,
+            protect_content=True,
+        )
+        admin_message_id = detail_message.message_id
+    else:
+        item = items[0]
+        use_caption = len(header) + len(description) + 2 <= 950
+        caption = f"{header}\n\n{description}" if use_caption else header
+        kwargs = {
+            "chat_id": int(ADMIN_ID),
+            "photo" if item["media_type"] == "photo" else "video": item["media_id"],
+            "caption": caption,
+            "parse_mode": None,
+            "protect_content": True,
+        }
+        if use_caption:
+            kwargs["reply_markup"] = markup
+        sent = (
+            bot.send_photo(**kwargs)
+            if item["media_type"] == "photo"
+            else bot.send_video(**kwargs)
+        )
+        media_message_ids = [sent.message_id]
+        admin_message_id = sent.message_id
+        if not use_caption:
+            detail_message = bot.send_message(
+                int(ADMIN_ID),
+                f"{header}\n\n{description or 'Sin descripción'}",
+                reply_markup=markup,
+                parse_mode=None,
+                protect_content=True,
+            )
+            admin_message_id = detail_message.message_id
+    _sfs_update(doc_id, {
+        "admin_chat_id": str(ADMIN_ID),
+        "admin_message_id": admin_message_id,
+        "admin_media_message_ids": media_message_ids,
+        "admin_notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return True
+
+
+def _sfs_publish_to_group(record):
+    group_id = int(record.get("group_id"))
+    if not _es_grupo_chat_supervisable(group_id):
+        raise ValueError("El grupo ya no está autorizado.")
+    description = str(record.get("description") or "").strip()
+    if not description or len(description) > SFS_MAX_DESCRIPTION_CHARS:
+        raise ValueError("La descripción está vacía o excede el límite permitido.")
+    items = record.get("media_items") or []
+    if not items or len(items) > SFS_MAX_MEDIA:
+        raise ValueError("El SFS no contiene multimedia válida.")
+    markup = _markup_botones_publicacion(record.get("buttons") or [])
+    sent_messages = []
+    try:
+        if len(items) == 1:
+            item = items[0]
+            caption = description if len(description) <= 900 else "📢 SFS aprobado"
+            media_args = {
+                "caption": caption,
+                "parse_mode": None,
+                "protect_content": True,
+            }
+            if len(description) <= 900 and markup:
+                media_args["reply_markup"] = markup
+            if item.get("media_type") == "photo":
+                sent = bot.send_photo(group_id, item["media_id"], **media_args)
+            elif item.get("media_type") == "video":
+                sent = bot.send_video(group_id, item["media_id"], **media_args)
+            else:
+                raise ValueError("El SFS contiene un tipo de archivo no permitido.")
+            sent_messages.append(sent)
+            if len(description) > 900:
+                sent_messages.append(bot.send_message(
+                    group_id,
+                    description,
+                    reply_markup=markup,
+                    parse_mode=None,
+                    protect_content=True,
+                ))
+            elif not markup:
+                # The caption itself is the complete public SFS when no links exist.
+                pass
+        else:
+            album = []
+            for index, item in enumerate(items):
+                caption = "📢 SFS aprobado" if index == 0 else None
+                if item.get("media_type") == "photo":
+                    album.append(types.InputMediaPhoto(item["media_id"], caption=caption))
+                elif item.get("media_type") == "video":
+                    album.append(types.InputMediaVideo(item["media_id"], caption=caption))
+                else:
+                    raise ValueError("El SFS contiene un tipo de archivo no permitido.")
+            sent_messages.extend(bot.send_media_group(
+                group_id, album, protect_content=True
+            ))
+            sent_messages.append(bot.send_message(
+                group_id,
+                description,
+                reply_markup=markup,
+                parse_mode=None,
+                protect_content=True,
+            ))
+    except Exception:
+        for sent in sent_messages:
+            try:
+                bot.delete_message(group_id, sent.message_id)
+            except Exception:
+                app.logger.warning(
+                    "No se pudo retirar una parte de una publicación SFS incompleta."
+                )
+        raise
+    return sent_messages
+
+
+def _sfs_set_preview_status(call, text):
+    try:
+        if call.message.content_type == "text":
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode=None,
+                reply_markup=None,
+            )
+        else:
+            bot.edit_message_caption(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode=None,
+                reply_markup=None,
+            )
+    except Exception:
+        app.logger.debug("No se pudo actualizar la vista previa SFS.")
+
+
+def _procesar_callback_sfs(call):
+    try:
+        _, accion, doc_id = call.data.split("|", 2)
+        doc_id = int(doc_id)
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "La solicitud SFS no es válida.")
+        return
+    record = _sfs_get(doc_id)
+    if not record:
+        bot.answer_callback_query(call.id, "La solicitud ya no está disponible.")
+        return
+    user_id = int(call.from_user.id)
+
+    if accion in ("submit", "cancel"):
+        if (
+            call.message.chat.type != "private"
+            or user_id != int(record.get("user_id") or 0)
+        ):
+            bot.answer_callback_query(call.id, "Este botón no corresponde a tu envío.")
+            return
+        if accion == "cancel":
+            with SFS_LOCK:
+                actual = _sfs_get(doc_id)
+                if not actual or actual.get("status") not in SFS_DRAFT_STATUSES:
+                    bot.answer_callback_query(call.id, "Este envío ya fue procesado.")
+                    return
+                _sfs_update(doc_id, {
+                    "status": "cancelled",
+                    "cancelled_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            bot.answer_callback_query(call.id, "Borrador cancelado.")
+            _sfs_user_panel(call.message.chat.id, doc_id, "El borrador SFS se canceló.")
+            return
+
+        if record.get("status") != "awaiting_description":
+            bot.answer_callback_query(call.id, "Envía primero una foto o un video.")
+            return
+        description = str(record.get("description") or "").strip()
+        if not description:
+            bot.answer_callback_query(
+                call.id, "Añade una descripción antes de enviar el SFS."
+            )
+            _sfs_show_description_step(
+                record, "Hace falta una descripción para poder revisar el SFS."
+            )
+            return
+        if len(description) > SFS_MAX_DESCRIPTION_CHARS:
+            bot.answer_callback_query(call.id, "La descripción es demasiado larga.")
+            _sfs_show_description_step(record)
+            return
+        try:
+            buttons = _sfs_extraer_botones(description)
+        except ValueError as error:
+            bot.answer_callback_query(call.id, str(error), show_alert=True)
+            _sfs_show_description_step(record, str(error))
+            return
+        if not _es_grupo_chat_supervisable(record.get("group_id")):
+            bot.answer_callback_query(
+                call.id, "El grupo ya no está autorizado para recibir SFS.",
+                show_alert=True,
+            )
+            return
+        with SFS_LOCK:
+            actual = _sfs_get(doc_id)
+            if not actual or actual.get("status") != "awaiting_description":
+                bot.answer_callback_query(call.id, "Este envío ya fue procesado.")
+                return
+            _sfs_update(doc_id, {
+                "status": "pending_review",
+                "buttons": buttons,
+                "description": description,
+                "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        bot.answer_callback_query(call.id, "Envío guardado para revisión.")
+        _sfs_user_panel(
+            call.message.chat.id,
+            doc_id,
+            "✅ Tu SFS quedó pendiente de revisión. Solo se publicará en el grupo "
+            "si el administrador lo aprueba.",
+        )
+        try:
+            _sfs_send_admin_preview(doc_id)
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo enviar la vista previa SFS al administrador (error=%s).",
+                type(error).__name__,
+            )
+        return
+
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "Solo el administrador puede revisar SFS.")
+        return
+    if accion == "review":
+        if record.get("status") != "pending_review":
+            bot.answer_callback_query(call.id, "Este SFS ya fue procesado.")
+            return
+        try:
+            _sfs_send_admin_preview(doc_id)
+            bot.answer_callback_query(call.id, "Vista previa enviada al chat privado.")
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo reconstruir la vista previa SFS (error=%s).",
+                type(error).__name__,
+            )
+            bot.answer_callback_query(
+                call.id, "No pude abrir la vista previa; la solicitud sigue guardada.",
+                show_alert=True,
+            )
+        return
+    if accion not in ("approve", "reject"):
+        bot.answer_callback_query(call.id, "Acción SFS desconocida.")
+        return
+    if record.get("status") != "pending_review":
+        bot.answer_callback_query(call.id, "Este SFS ya fue procesado o está en curso.")
+        return
+    if accion == "reject":
+        with SFS_LOCK:
+            actual = _sfs_get(doc_id)
+            if not actual or actual.get("status") != "pending_review":
+                bot.answer_callback_query(call.id, "Este SFS ya fue procesado.")
+                return
+            _sfs_update(doc_id, {
+                "status": "rejected",
+                "reviewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "reviewer_id": user_id,
+            })
+        try:
+            bot.send_message(
+                int(record.get("user_id")),
+                "❌ El administrador decidió no publicar tu SFS. Gracias por "
+                "enviarlo para revisión.",
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.info("No se pudo notificar al usuario del rechazo SFS.")
+        bot.answer_callback_query(call.id, "SFS rechazado.")
+        _sfs_set_preview_status(call, f"❌ SFS #{doc_id} rechazado.")
+        return
+
+    with SFS_LOCK:
+        actual = _sfs_get(doc_id)
+        if not actual or actual.get("status") != "pending_review":
+            bot.answer_callback_query(call.id, "Este SFS ya fue procesado.")
+            return
+        _sfs_update(doc_id, {
+            "status": "publishing",
+            "reviewer_id": user_id,
+            "review_started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        actual = _sfs_get(doc_id)
+    try:
+        sent_messages = _sfs_publish_to_group(actual)
+        first_item = (actual.get("media_items") or [{}])[0]
+        published_ids = [item.message_id for item in sent_messages]
+        PromosAprobadas.insert({
+            "kind": "sfs",
+            "sfs_request_id": doc_id,
+            "chat_id": str(actual.get("group_id")),
+            "user_id": actual.get("user_id"),
+            "uname": actual.get("username") or "sin_usuario",
+            "desc": actual.get("description") or "",
+            "file_id": first_item.get("media_id"),
+            "is_video": first_item.get("media_type") == "video",
+            "media_items": actual.get("media_items") or [],
+            "buttons": actual.get("buttons") or [],
+            "approved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "published_message_id": published_ids[0] if published_ids else None,
+            "published_message_ids": published_ids,
+        })
+        _sfs_update(doc_id, {
+            "status": "approved",
+            "reviewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "published_message_ids": published_ids,
+        })
+    except Exception as error:
+        _sfs_update(doc_id, {"status": "pending_review", "review_started_at": None})
+        app.logger.warning(
+            "No se pudo publicar un SFS aprobado (error=%s).",
+            type(error).__name__,
+        )
+        bot.answer_callback_query(
+            call.id,
+            "No pude publicar. El SFS sigue pendiente; revisa el grupo antes de reintentar.",
+            show_alert=True,
+        )
+        return
+    try:
+        bot.send_message(
+            int(actual.get("user_id")),
+            "✅ Tu SFS fue aprobado y publicado en el grupo.",
+            protect_content=True,
+        )
+    except Exception:
+        app.logger.info("No se pudo notificar al usuario de la aprobación SFS.")
+    bot.answer_callback_query(call.id, "SFS aprobado y publicado.")
+    _sfs_set_preview_status(call, f"✅ SFS #{doc_id} aprobado y publicado.")
+
+
+def _sfs_private_message_matches(message):
+    if message.chat.type != "private" or not message.from_user:
+        return False
+    text = (getattr(message, "text", None) or "").strip()
+    if text.startswith("/"):
+        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+        if command not in ("/cancelar", "/omitir"):
+            return False
+    return (
+        message.chat.type == "private"
+        and bool(message.from_user)
+        and _sfs_active_for_user(message.from_user.id) is not None
+    )
+
+
+@bot.message_handler(
+    func=_sfs_private_message_matches,
+    content_types=["text", "photo", "video"],
+)
+def recibir_mensaje_sfs(message):
+    _sfs_handle_member_message(message)
+
+
 def enviar_menu_miembro(chat_id):
     return editar_panel_miembro(
         chat_id,
@@ -17919,15 +19148,6 @@ def enviar_menu_miembro(chat_id):
 def group_menu_command(message):
     if message.chat.type in ("group", "supergroup"):
         eliminar_mensaje_seguro(message.chat.id, message.message_id)
-        try:
-            publicar_teclado_grupo(message.chat.id)
-        except Exception as error:
-            app.logger.warning(
-                "No se pudo actualizar el teclado al abrir /menu "
-                "(clase=%s, código=%s).",
-                type(error).__name__,
-                getattr(error, "error_code", "n/a"),
-            )
     enviar_menu_miembro(message.chat.id)
 
 
@@ -18090,17 +19310,27 @@ def motor_principal(message):
             markup = types.InlineKeyboardMarkup(row_width=1)
             markup.add(
                 types.InlineKeyboardButton(
+                    "🔗 Reportar con enlace del mensaje",
+                    callback_data=f"menu_reportar_enlace|{group_id}",
+                ),
+                types.InlineKeyboardButton(
                     "👤 REPORTAR USUARIO POR NOMBRE",
                     callback_data=f"menu_reportar_nombre|{group_id}",
                 ),
                 types.InlineKeyboardButton(
-                    "🖼️ REPORTAR MULTIMEDIA",
+                    "🗂️ BUSCAR MULTIMEDIA POR USUARIO",
                     callback_data=f"menu_reportar_multimedia|{group_id}",
+                ),
+                types.InlineKeyboardButton(
+                    "📎 ENVIAR EVIDENCIA",
+                    callback_data=f"menu_reportar_evidencia|{group_id}",
                 ),
             )
             editar_o_enviar_panel(
                 chat_id,
-                "🕵️ CENTRO DE REPORTES\n\nElige qué quieres reportar:",
+                "🕵️ CENTRO DE REPORTES\n\n"
+                "Elige qué quieres reportar. Si es la primera vez que abres este "
+                "chat, Telegram te pedirá pulsar Start antes de poder enviarme el reporte.",
                 markup,
                 protect_content=True,
                 forzar_texto=True,
@@ -18111,11 +19341,16 @@ def motor_principal(message):
                 eliminar_mensaje_seguro(chat_id, ULTIMOS_MSGS['reportar'])
             markup = types.InlineKeyboardMarkup().add(
                 types.InlineKeyboardButton(
-                    "🚩 REPORTAR AQUÍ",
+                    "🚩 REPORTAR EN PRIVADO",
                     url=f"https://t.me/{bot.get_me().username}?start=reporte_{group_id}",
                 )
             )
-            resp = bot.send_message(chat_id, f"👤 @{uname}, clica para denunciar.", reply_markup=markup)
+            resp = bot.send_message(
+                chat_id,
+                f"👤 @{uname}, toca el botón para reportar en privado. "
+                "Si nunca abriste el bot, Telegram te pedirá pulsar Start.",
+                reply_markup=markup,
+            )
             ULTIMOS_MSGS['reportar'] = resp.message_id
         return
 
@@ -18127,6 +19362,13 @@ def motor_principal(message):
         elif message.chat.type == "private":
             partes_start = message.text.split(maxsplit=1)
             payload_start = partes_start[1].strip() if len(partes_start) > 1 else ""
+            if _procesar_payload_sfs(message, payload_start):
+                if str(uid) == str(ADMIN_ID):
+                    try:
+                        asegurar_teclado_admin_privado(chat_id)
+                    except Exception:
+                        app.logger.exception("No se pudieron restaurar los atajos del administrador tras /start.")
+                return
             _iniciar_inicio_pago_con_recuperacion(
                 chat_id,
                 uid,
@@ -18238,8 +19480,11 @@ def manejar_clics(call):
         bot.answer_callback_query(call.id, "⚠️ Demasiadas acciones. Espera un momento.")
         return
 
+    if call.data.startswith("sfs|"):
+        _procesar_callback_sfs(call)
+
     # PANEL DE CONFIGURACIÓN ADMIN
-    if call.data == "admin_config_panel":
+    elif call.data == "admin_config_panel":
         if str(uid) != str(ADMIN_ID):
             bot.answer_callback_query(call.id, "❌ Acceso denegado: No eres el Cacique Supremo.")
             return
@@ -18317,13 +19562,40 @@ def manejar_clics(call):
 
     elif call.data == "crear_promo":
         try:
-            msg = bot.send_message(uid, "📸 Envía la foto o el video de tu publicación:")
-            bot.register_next_step_handler(msg, step_multimedia_promo)
-            bot.answer_callback_query(call.id)
+            group_id = (
+                call.message.chat.id
+                if call.message.chat.type in ("group", "supergroup")
+                else _default_group_id()
+            )
+            if not _es_grupo_chat_supervisable(group_id):
+                bot.answer_callback_query(
+                    call.id,
+                    "SFS solo está habilitado para grupos autorizados.",
+                    show_alert=True,
+                )
+                return
+            if call.message.chat.type == "private":
+                _iniciar_sfs(uid, uid, group_id, from_user=call.from_user)
+                bot.answer_callback_query(call.id)
+            else:
+                bot_username = bot.get_me().username
+                markup = types.InlineKeyboardMarkup().add(
+                    types.InlineKeyboardButton(
+                        "📢 Abrir Enviar SFS",
+                        url=f"https://t.me/{bot_username}?start=sfs_{group_id}",
+                    )
+                )
+                bot.send_message(
+                    call.message.chat.id,
+                    "Para enviar un SFS a revisión, abre el chat privado del bot.",
+                    reply_markup=markup,
+                    protect_content=True,
+                )
+                bot.answer_callback_query(call.id)
         except Exception:
             bot.answer_callback_query(
                 call.id,
-                "Abre el bot en privado y pulsa /start antes de crear una publicación.",
+                "Abre el bot en privado y pulsa Start para enviar un SFS.",
                 show_alert=True,
             )
 
@@ -18379,6 +19651,33 @@ def manejar_clics(call):
         bot.edit_message_caption("❌ **RECHAZADA**", ADMIN_ID, mid)
         bot.send_message(target_uid, "❌ **Tu publicación no fue aprobada.**")
 
+    elif call.data.startswith("menu_reportar_enlace"):
+        group_id = _grupo_reporte_seleccionado(
+            call.data.split("|", 1)[1] if "|" in call.data else None
+        )
+        if not _es_grupo_chat_supervisable(group_id):
+            bot.answer_callback_query(
+                call.id,
+                "Los reportes están disponibles solo desde un grupo autorizado.",
+                show_alert=True,
+            )
+            return
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(
+            uid,
+            "🔗 <b>REPORTAR UN MENSAJE DEL GRUPO</b>\n\n"
+            "1. En el grupo, abre el menú del mensaje que quieres reportar y "
+            "elige «Copiar enlace».\n"
+            "2. Pega aquí ese enlace. Si sabes el @usuario, añádelo; también "
+            "puedes escribir brevemente el motivo. Si el bot registró la "
+            "publicación, no hace falta el @usuario.\n\n"
+            "No reenvíes el contenido ni envíes capturas. El reporte será privado "
+            "y no revelará tu identidad al grupo ni a la persona reportada.",
+            parse_mode="HTML",
+            protect_content=True,
+        )
+        bot.register_next_step_handler(msg, step_reporte_por_enlace, group_id)
+
     elif call.data.startswith("menu_reportar_nombre"):
         group_id = _grupo_reporte_seleccionado(
             call.data.split("|", 1)[1] if "|" in call.data else None
@@ -18412,6 +19711,24 @@ def manejar_clics(call):
         )
         bot.register_next_step_handler(msg, step_reporte_multimedia_buscar, group_id)
 
+    elif call.data.startswith("menu_reportar_evidencia"):
+        group_id = _grupo_reporte_seleccionado(
+            call.data.split("|", 1)[1] if "|" in call.data else None
+        )
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(
+            uid,
+            "📎 <b>ENVIAR EVIDENCIA DEL REPORTE</b>\n\n"
+            "Puedes enviar una foto o video si Telegram te permite adjuntarlo. "
+            "Para contenido protegido, usa «Reportar con enlace del mensaje»; "
+            "no hace falta reenviar ni copiar el archivo.\n\n"
+            "La evidencia se muestra solo al administrador. Si no se puede "
+            "confirmar la identidad, no se silenciará a una persona por suposición.",
+            parse_mode="HTML",
+            protect_content=True,
+        )
+        bot.register_next_step_handler(msg, step_reporte_evidencia, group_id)
+
     elif call.data.startswith("rpt_media|"):
         try:
             _, group_id, target_id, report_message_id = call.data.split("|", 3)
@@ -18433,7 +19750,7 @@ def manejar_clics(call):
         if not evidencia:
             bot.answer_callback_query(call.id, "Ese contenido ya no está registrado.", show_alert=True)
             return
-        aplicar_castigo(
+        _registrar_reporte_miembro(
             group_id,
             target_id,
             evidencia.get("uname") or "sin_usuario",
@@ -18446,62 +19763,517 @@ def manejar_clics(call):
         parts = call.data.split("_", 3)
         t_id = int(parts[2])
         t_name = parts[3]
-        aplicar_castigo(GRUPO_ID, t_id, t_name, reporter_id=uid)
+        group_id = _grupo_reporte_seleccionado()
+        _registrar_reporte_miembro(
+            group_id,
+            t_id,
+            t_name,
+            reporter_id=uid,
+        )
         bot.answer_callback_query(call.id, "Reporte registrado.")
 
 
 # --- PASOS DE REPORTES ---
-def step_reporte_por_nombre(message, group_id=None):
-    uid = message.chat.id
-    target = message.text.strip().lstrip("@").lower()
-    group_id = _grupo_reporte_seleccionado(group_id)
-    registros = [
+def _usuario_registrado_en_grupo(group_id, username):
+    target = str(username or "").strip().lstrip("@").casefold()
+    if not re.fullmatch(r"[a-z0-9_]{5,32}", target):
+        return None
+    matches = [
         registro
         for registro in _registros_grupo(
             RegistroActividad, group_id, legacy_principal=True
         )
-        if str(registro.get("uname", "")).lower() == target
+        if str(registro.get("uname") or "").casefold() == target
+        and int(registro.get("id") or 0) > 0
+        and registro.get("source") != "reporte_privado"
+    ]
+    return max(matches, key=lambda item: str(item.get("date") or "")) if matches else None
+
+
+def _parsear_enlace_mensaje_reporte(texto, group_id):
+    """Valida un enlace copiado de un mensaje del grupo seleccionado."""
+    if not _es_grupo_chat_supervisable(group_id):
+        return None
+    match = re.search(
+        r"(?i)(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[^\s<>]+",
+        str(texto or ""),
+    )
+    if not match:
+        return None
+    raw_url = match.group(0).rstrip(".,;:!?)]}")
+    if not raw_url.lower().startswith(("https://", "http://")):
+        raw_url = f"https://{raw_url}"
+    try:
+        parsed = urllib.parse.urlsplit(raw_url)
+        host = (parsed.hostname or "").casefold()
+        if (
+            parsed.scheme.casefold() != "https"
+            or host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
+            or parsed.username
+            or parsed.password
+        ):
+            return None
+        parts = [part for part in parsed.path.split("/") if part]
+        target_group_id = int(group_id)
+        if len(parts) == 3 and parts[0].casefold() == "c":
+            internal_id, raw_message_id = parts[1], parts[2]
+            expected_internal_id = (
+                str(target_group_id)[4:]
+                if str(target_group_id).startswith("-100")
+                else ""
+            )
+            if not expected_internal_id or internal_id != expected_internal_id:
+                return None
+            message_id = int(raw_message_id)
+            canonical_url = f"https://t.me/c/{internal_id}/{message_id}"
+        elif len(parts) == 2 and re.fullmatch(
+            r"[A-Za-z0-9_]{5,32}", parts[0]
+        ):
+            username = parts[0]
+            message_id = int(parts[1])
+            try:
+                linked_chat = bot.get_chat(f"@{username}")
+            except Exception:
+                return None
+            if int(getattr(linked_chat, "id", 0)) != target_group_id:
+                return None
+            canonical_username = str(
+                getattr(linked_chat, "username", "") or username
+            )
+            canonical_url = (
+                f"https://t.me/{canonical_username}/{message_id}"
+            )
+        else:
+            return None
+        if message_id <= 0:
+            return None
+        return message_id, canonical_url
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _registro_mensaje_grupo(group_id, message_id):
+    """Busca el registro exacto sin mezclar reportes de otros destinos."""
+    registros = [
+        row for row in _registros_grupo(
+            RegistroActividad, group_id, legacy_principal=True
+        )
+        if str(row.get("msg_id")) == str(message_id)
+        and row.get("source") not in ("reporte_privado", "reporte_enlace")
     ]
     if not registros:
+        return None
+    return max(registros, key=lambda row: int(getattr(row, "doc_id", 0)))
+
+
+def _guardar_evidencia_reporte(
+    message, group_id, target_id=None, target_username=""
+):
+    if message.photo:
+        media_type, file_id = "photo", message.photo[-1].file_id
+    elif message.video:
+        media_type, file_id = "video", message.video.file_id
+    elif message.text or message.caption:
+        media_type, file_id = str(message.content_type or "text"), None
+    else:
+        return None
+    evidencia = {
+        "id": int(target_id or 0),
+        "chat_id": str(group_id),
+        "uname": str(target_username or "sin_usuario").casefold(),
+        "msg_id": int(message.message_id),
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "type": media_type,
+        "text": str(message.text or message.caption or ""),
+        "file_id": file_id,
+        "source": "reporte_privado",
+        "reporter_id": int(message.from_user.id),
+    }
+    doc_id = RegistroActividad.insert(evidencia)
+    return RegistroActividad.get(doc_id=doc_id)
+
+
+def _registrar_reporte_miembro(
+    group_id,
+    target_id,
+    target_username,
+    reporter_id,
+    evidence=None,
+    source_message_url=None,
+    source_message_id=None,
+    reason=None,
+):
+    group_id = _grupo_reporte_seleccionado(group_id)
+    if not _es_grupo_chat_supervisable(group_id):
+        try:
+            bot.send_message(
+                int(reporter_id),
+                "Este destino no admite reportes de miembros.",
+                protect_content=True,
+            )
+        except Exception:
+            pass
+        return None
+    try:
+        target_id = int(target_id)
+        if target_id <= 0:
+            target_id = None
+    except (TypeError, ValueError):
+        target_id = None
+    reporter_id = int(reporter_id)
+    target_username = str(target_username or "").strip().lstrip("@")[:64]
+    evidence_doc_id = getattr(evidence, "doc_id", None)
+    motivo_reporte = str(
+        reason or "Reporte de miembro; revisión manual pendiente"
+    ).strip()[:300]
+    source_message_url = str(source_message_url or "").strip()
+    if not re.fullmatch(
+        r"https://t\.me/(?:c/\d+/\d+|[A-Za-z0-9_]{5,32}/\d+)",
+        source_message_url,
+        flags=re.IGNORECASE,
+    ):
+        source_message_url = ""
+    try:
+        source_message_id = int(source_message_id)
+        if source_message_id <= 0:
+            source_message_id = None
+    except (TypeError, ValueError):
+        source_message_id = None
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status = "needs_identity" if target_id is None else "pending_review"
+    action = "pending_identity" if target_id is None else "mute_not_attempted"
+    mute_applied = False
+    target_role = ""
+
+    if target_id is not None:
+        try:
+            member = bot.get_chat_member(group_id, target_id)
+            target_role = str(getattr(member, "status", "") or "")
+            is_member = target_role in ("creator", "administrator", "member")
+            if target_role == "restricted":
+                is_member = bool(getattr(member, "is_member", False))
+            if target_role in ("creator", "administrator"):
+                status = "admin_target"
+                action = "admin_review_only"
+            elif not is_member:
+                status = "not_in_group"
+                action = "target_not_in_group"
+            else:
+                try:
+                    bot.restrict_chat_member(
+                        group_id,
+                        target_id,
+                        until_date=int(time.time()) + (35 * 60),
+                        can_send_messages=False,
+                    )
+                    mute_applied = True
+                    action = "muted_pending_review"
+                except Exception as error:
+                    action = "mute_failed"
+                    app.logger.warning(
+                        "No se pudo silenciar temporalmente al usuario reportado "
+                        "(grupo=%s, clase=%s, código=%s).",
+                        group_id,
+                        type(error).__name__,
+                        getattr(error, "error_code", "n/a"),
+                    )
+        except Exception as error:
+            # Keep the report for the administrator, but do not punish an
+            # account whose group membership Telegram could not verify.
+            status = "membership_unverified"
+            action = "membership_unverified"
+            app.logger.warning(
+                "No se pudo verificar al usuario reportado "
+                "(grupo=%s, clase=%s, código=%s).",
+                group_id,
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
+
+    report = {
+        "chat_id": str(group_id),
+        "reporter_id": reporter_id,
+        "reported_user_id": target_id,
+        "reported_username": target_username or "sin_usuario",
+        "action": action,
+        "count": 0,
+        "evidence_doc_id": evidence_doc_id,
+        "reason": motivo_reporte,
+        "source": "reporte_miembro",
+        "status": status,
+        "mute_applied": mute_applied,
+        "target_role": target_role,
+        "message_url": source_message_url or None,
+        "source_message_id": source_message_id,
+        "date": now,
+    }
+    report_doc_id = GroupReports.insert(report)
+    GroupModerationLog.insert({
+        "chat_id": str(group_id),
+        "user_id": target_id,
+        "username": target_username or "sin_usuario",
+        "action": action,
+        "count": 0,
+        "reporter_id": reporter_id,
+        "evidence_doc_id": evidence_doc_id,
+        "reason": report["reason"],
+        "source": "reporte_miembro",
+        "message_url": report.get("message_url"),
+        "source_message_id": report.get("source_message_id"),
+        "date": now,
+    })
+
+    if mute_applied:
+        try:
+            bot.send_message(
+                group_id,
+                "⚠️ Moderación: un miembro fue silenciado temporalmente mientras "
+                "se revisa una incidencia. No se compartirá quién la reportó.",
+            )
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo publicar el aviso neutral del reporte "
+                "(grupo=%s, clase=%s, código=%s).",
+                group_id,
+                type(error).__name__,
+                getattr(error, "error_code", "n/a"),
+            )
+
+    if status == "needs_identity":
+        confirmacion = (
+            (
+                "Recibí el enlace del mensaje, pero no pude confirmar quién lo "
+                "publicó. Lo envié al administrador y no silencié a nadie por "
+                "suposición."
+                if source_message_url
+                else "Recibí la evidencia, pero no pude confirmar quién la publicó. "
+                "La envié al administrador y no silencié a nadie por suposición."
+            )
+        )
+    elif status == "membership_unverified":
+        confirmacion = (
+            "Recibí el reporte, pero Telegram no me permitió confirmar que esa "
+            "cuenta pertenezca al grupo. Lo envié al administrador sin aplicar "
+            "una sanción."
+        )
+    elif status == "admin_target":
+        confirmacion = (
+            "Recibí el reporte para revisión del administrador. "
+            "No apliqué silencio automático a una cuenta administradora."
+        )
+    elif status == "not_in_group":
+        confirmacion = (
+            "Recibí el reporte para revisión. No encontré a esa cuenta como "
+            "miembro activo del grupo, así que no apliqué una sanción."
+        )
+    elif mute_applied:
+        confirmacion = (
+            "Tu reporte quedó registrado. La persona fue silenciada por "
+            "35 minutos mientras el administrador revisa la evidencia."
+        )
+    else:
+        confirmacion = (
+            "Tu reporte quedó registrado para revisión. Telegram no permitió "
+            "aplicar el silencio temporal; el administrador decidirá qué hacer."
+        )
+    try:
+        bot.send_message(reporter_id, confirmacion, protect_content=True)
+    except Exception:
+        app.logger.info(
+            "No se pudo enviar la confirmación privada del reporte a %s.",
+            reporter_id,
+        )
+    return GroupReports.get(doc_id=report_doc_id)
+
+
+def step_reporte_por_nombre(message, group_id=None):
+    uid = message.chat.id
+    target = str(message.text or "").strip().lstrip("@").casefold()
+    group_id = _grupo_reporte_seleccionado(group_id)
+    registro = _usuario_registrado_en_grupo(group_id, target)
+    if not registro:
+        markup = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                "📎 Enviar evidencia",
+                callback_data=f"menu_reportar_evidencia|{group_id}",
+            )
+        )
         bot.send_message(
             uid,
-            f"❌ **No encontré registros de @{target}** en el grupo.\n\n"
-            "Verifica que el usuario haya participado recientemente y que el @usuario sea correcto."
+            "No encontré ese @usuario en la actividad registrada del grupo. "
+            "Verifica el nombre o envía el mensaje/multimedia como evidencia. "
+            "No silenciaré a alguien si no puedo confirmar su identidad.",
+            reply_markup=markup,
+            protect_content=True,
         )
         return
-    registro = max(registros, key=lambda item: str(item.get("date", "")))
-    aplicar_castigo(
+    _registrar_reporte_miembro(
         group_id,
-        registro["id"],
+        registro.get("id"),
         target,
         reporter_id=uid,
         evidence=registro,
     )
 
 
+def step_reporte_por_enlace(message, group_id=None):
+    reporter_id = int(message.chat.id)
+    group_id = _grupo_reporte_seleccionado(group_id)
+    if not _es_grupo_chat_supervisable(group_id):
+        bot.send_message(
+            reporter_id,
+            "Este destino no admite reportes de miembros.",
+            protect_content=True,
+        )
+        return
+    if message.content_type != "text":
+        msg = bot.send_message(
+            reporter_id,
+            "Pega el enlace del mensaje en texto. No hace falta reenviar el "
+            "contenido ni enviar una captura.",
+            protect_content=True,
+        )
+        bot.register_next_step_handler(msg, step_reporte_por_enlace, group_id)
+        return
+
+    texto = str(message.text or "").strip()
+    referencia = _parsear_enlace_mensaje_reporte(texto, group_id)
+    if not referencia:
+        msg = bot.send_message(
+            reporter_id,
+            "No pude validar ese enlace para este grupo. Copia el enlace del "
+            "mensaje original desde el grupo supervisado y vuelve a pegarlo. "
+            "Puedes añadir el @usuario en el mismo mensaje.",
+            protect_content=True,
+        )
+        bot.register_next_step_handler(msg, step_reporte_por_enlace, group_id)
+        return
+
+    source_message_id, source_message_url = referencia
+    supplied_match = re.search(
+        r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{5,32})", texto
+    )
+    supplied_username = supplied_match.group(1) if supplied_match else ""
+    link_match = re.search(
+        r"(?i)(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/[^\s<>]+",
+        texto,
+    )
+    reason_text = texto
+    if link_match:
+        reason_text = reason_text.replace(link_match.group(0), " ")
+    reason_text = re.sub(
+        r"(?<![A-Za-z0-9_])@[A-Za-z0-9_]{5,32}",
+        " ",
+        reason_text,
+    )
+    reason_text = re.sub(r"[\s—–|,:;.!?]+", " ", reason_text).strip()[:220]
+    evidence = _registro_mensaje_grupo(group_id, source_message_id)
+    target_id = None
+    target_username = supplied_username or "sin_usuario"
+    reason = (
+        (
+            f"Motivo indicado: {reason_text}"
+            if reason_text
+            else "Enlace de mensaje para revisión manual."
+        )
+        if evidence is None
+        else (
+            f"Motivo indicado: {reason_text}"
+            if reason_text
+            else "Reporte por enlace al mensaje; revisión administrativa pendiente."
+        )
+    )
+
+    if evidence:
+        recorded_id = evidence.get("id")
+        recorded_username = str(evidence.get("uname") or "")
+        username_is_known = recorded_username.casefold() not in (
+            "",
+            "anonimo",
+            "sin_usuario",
+        )
+        username_mismatch = bool(
+            supplied_username
+            and username_is_known
+            and supplied_username.casefold() != recorded_username.casefold()
+        )
+        if username_mismatch:
+            mismatch_reason = (
+                "El @usuario indicado no coincide con el autor registrado del "
+                "mensaje; requiere revisión manual."
+            )
+            reason = (
+                f"{mismatch_reason} Motivo: {reason_text}"
+                if reason_text
+                else mismatch_reason
+            )
+        else:
+            try:
+                target_id = int(recorded_id)
+                if target_id <= 0:
+                    target_id = None
+            except (TypeError, ValueError):
+                target_id = None
+            target_username = (
+                recorded_username
+                if username_is_known
+                else supplied_username or "sin_usuario"
+            )
+            if target_id is None:
+                reason = (
+                    "El enlace fue recibido, pero el autor no pudo identificarse; "
+                    "requiere revisión manual."
+                )
+
+    _registrar_reporte_miembro(
+        group_id,
+        target_id,
+        target_username,
+        reporter_id=reporter_id,
+        evidence=evidence,
+        source_message_url=source_message_url,
+        source_message_id=source_message_id,
+        reason=reason,
+    )
+
+
 def step_reporte_multimedia_buscar(message, group_id=None):
     uid = message.chat.id
-    target = message.text.strip().lstrip("@").lower()
+    target = str(message.text or "").strip().lstrip("@").casefold()
     group_id = _grupo_reporte_seleccionado(group_id)
     todos = [
         registro
         for registro in _registros_grupo(
             RegistroActividad, group_id, legacy_principal=True
         )
-        if str(registro.get("uname", "")).lower() == target
+        if str(registro.get("uname", "")).casefold() == target
+        and int(registro.get("id") or 0) > 0
+        and registro.get("source") != "reporte_privado"
     ]
-    ultimos = sorted(todos, key=lambda item: str(item.get("date", "")), reverse=True)[:6]
+    ultimos = sorted(
+        todos, key=lambda item: str(item.get("date", "")), reverse=True
+    )[:6]
     if not ultimos:
+        markup = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                "📎 Enviar evidencia",
+                callback_data=f"menu_reportar_evidencia|{group_id}",
+            )
+        )
         bot.send_message(
             uid,
-            f"❌ **Sin publicaciones registradas de @{target}**.\n\n"
-            "Verifica que el usuario haya enviado fotos, videos o mensajes en el grupo."
+            f"No encontré multimedia registrada de @{target}. "
+            "Puedes enviar aquí el mensaje o archivo como evidencia.",
+            reply_markup=markup,
+            protect_content=True,
         )
         return
     bot.send_message(
         uid,
-        f"🔍 **Últimas publicaciones de @{target}**\n\n"
-        f"Encontré *{len(ultimos)}* registro(s). Pulsa 🚩 REPORTAR en el que quieras denunciar:"
+        f"🔍 Últimas publicaciones de @{target}\n\n"
+        f"Encontré {len(ultimos)} registro(s). Pulsa 🚩 REPORTAR en el contenido "
+        "que quieras enviar al administrador:",
+        protect_content=True,
     )
     for r in ultimos:
         markup = types.InlineKeyboardMarkup().add(
@@ -18510,17 +20282,84 @@ def step_reporte_multimedia_buscar(message, group_id=None):
                 callback_data=f"rpt_media|{group_id}|{r['id']}|{r['msg_id']}",
             )
         )
-        try:
-            if r.get('type') == 'photo' and r.get('file_id'):
-                bot.send_photo(uid, r['file_id'], caption=f"📸 Foto de @{target}\n_{r.get('text','') or 'Sin texto'}_", reply_markup=markup)
-            elif r.get('type') == 'video' and r.get('file_id'):
-                bot.send_video(uid, r['file_id'], caption=f"🎥 Video de @{target}\n_{r.get('text','') or 'Sin texto'}_", reply_markup=markup)
-            else:
-                txt = r.get('text', '[sin texto]') or '[sin texto]'
-                bot.send_message(uid, f"💬 **Mensaje de @{target}:**\n_{txt}_", reply_markup=markup)
-        except:
-            txt = r.get('text', '[contenido no disponible]') or '[contenido no disponible]'
-            bot.send_message(uid, f"⚠️ @{target}: _{txt}_", reply_markup=markup)
+        tipo = {
+            "photo": "foto",
+            "video": "video",
+            "text": "mensaje",
+        }.get(str(r.get("type") or ""), "contenido")
+        descripcion = str(r.get("text") or "Sin texto adjunto")[:700]
+        fecha = str(r.get("date") or "fecha no registrada")
+        bot.send_message(
+            uid,
+            f"📎 Evidencia registrada de @{target}\n"
+            f"Tipo: {tipo} · {fecha}\n"
+            f"Descripción: {descripcion}\n\n"
+            "El archivo original no se reenvía al reportante. Al enviarlo, "
+            "el administrador podrá revisarlo desde el panel privado.",
+            reply_markup=markup,
+            protect_content=True,
+        )
+
+
+def step_reporte_evidencia(message, group_id=None):
+    reporter_id = int(message.chat.id)
+    group_id = _grupo_reporte_seleccionado(group_id)
+    if not _es_grupo_chat_supervisable(group_id):
+        bot.send_message(
+            reporter_id,
+            "Este destino no admite reportes de miembros.",
+            protect_content=True,
+        )
+        return
+    if message.content_type not in ("text", "photo", "video"):
+        msg = bot.send_message(
+            reporter_id,
+            "Envía texto, una foto o un video. Para otro tipo de archivo, "
+            "describe el contenido y vuelve a adjuntar una imagen o video.",
+            protect_content=True,
+        )
+        bot.register_next_step_handler(msg, step_reporte_evidencia, group_id)
+        return
+
+    texto = str(message.text or message.caption or "")
+    origin = getattr(message, "forward_origin", None)
+    origin_user = getattr(origin, "sender_user", None) or getattr(
+        message, "forward_from", None
+    )
+    target_id = getattr(origin_user, "id", None)
+    target_username = str(getattr(origin_user, "username", "") or "")
+    if not target_username:
+        match = re.search(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{5,32})", texto)
+        target_username = match.group(1) if match else ""
+    target_record = (
+        _usuario_registrado_en_grupo(group_id, target_username)
+        if target_username and not target_id
+        else None
+    )
+    if target_record:
+        target_id = target_record.get("id")
+        target_username = str(target_record.get("uname") or target_username)
+    evidence = _guardar_evidencia_reporte(
+        message,
+        group_id,
+        target_id=target_id,
+        target_username=target_username,
+    )
+    if not evidence:
+        msg = bot.send_message(
+            reporter_id,
+            "No encontré evidencia válida. Envía texto, foto o video.",
+            protect_content=True,
+        )
+        bot.register_next_step_handler(msg, step_reporte_evidencia, group_id)
+        return
+    _registrar_reporte_miembro(
+        group_id,
+        target_id,
+        target_username,
+        reporter_id=reporter_id,
+        evidence=evidence,
+    )
 
 
 # --- PASOS PROMO ---
@@ -18762,11 +20601,6 @@ if __name__ == "__main__":
         "📬 Saludo Business listo para "
         f"{len(_perfiles_business_autorizados())} perfil(es) autorizado(s)."
     )
-    threading.Thread(
-        target=_refrescar_teclados_grupos_configurados,
-        name="group-keyboard-refresh",
-        daemon=True,
-    ).start()
     threading.Thread(target=revisar_vencimientos, name="vip-expiry", daemon=True).start()
     threading.Thread(
         target=bucle_supervision_gemini,

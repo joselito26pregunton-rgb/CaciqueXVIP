@@ -58,6 +58,12 @@ En la sección de fotos del panel de administración, el bot indica si Supabase 
 
 La tabla `bot_persistent_settings` guarda las referencias de las fotos y los ajustes visuales; `bot_subscription_records` conserva el registro de accesos pagados y Free GoldPass cuando Supabase está configurado. Los métodos de pago, destinos y otros archivos de configuración siguen usando el almacenamiento local de Render, por lo que conviene conservar el disco persistente del servicio y no reemplazar sus archivos de estado al actualizar el código.
 
+### Bandeja persistente de solicitudes de pago
+
+La tabla `bot_payment_requests` conserva las solicitudes pendientes aunque Render reinicie el proceso. Para instalarla, vuelve a ejecutar **el contenido completo y actualizado** de `supabase/schema.sql` desde el SQL Editor de Supabase; sus instrucciones usan `IF NOT EXISTS` y se pueden ejecutar de nuevo sin borrar las tablas existentes. La tabla tiene RLS activado, deniega acceso a `anon` y `authenticated`, y permite acceso al bot mediante la clave `service_role`/`SUPABASE_SECRET_KEY`.
+
+La tabla almacena identidad básica del solicitante, método y opción elegidos, estado y fechas; **no guarda números de cuenta ni el contenido de los métodos de pago**. El bot solo confirma una solicitud después de que Supabase la haya guardado. Si la tabla falta o Supabase no responde, se avisa y no se presenta como registrada. La bandeja de administración muestra únicamente solicitudes pendientes; al cancelar, rechazar o aprobar, la solicitud se conserva con su estado final.
+
 ### Renovaciones con Telegram Stars
 
 Al vencer una suscripción, el bot intenta retirar al usuario del canal privado y le ofrece **300 Stars** o los otros métodos de pago. Stars usa una factura real de Telegram (`XTR`), no un enlace de invitación; el pago confirmado extiende el acceso 30 días y registra el identificador del cargo para evitar duplicarlo. El usuario recibe un botón de acceso personal que solo funciona para su cuenta.

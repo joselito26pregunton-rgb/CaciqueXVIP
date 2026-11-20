@@ -357,6 +357,12 @@ SUPABASE_SETTINGS_TABLE = "bot_persistent_settings"
 SUPABASE_SETTINGS_ROW_KEY = "visual_settings"
 SUPABASE_SETTINGS_CACHE_TTL_SECONDS = 15
 SUPABASE_SUBSCRIPTIONS_TABLE = "bot_subscription_records"
+SUPABASE_PAYMENT_REQUESTS_TABLE = "bot_payment_requests"
+SUPABASE_PAYMENT_REQUESTS_CACHE_TTL_SECONDS = 5
+SUPABASE_PAYMENT_REQUESTS_STATUS = "not_checked"
+SUPABASE_PAYMENT_REQUESTS_ERROR = ""
+SUPABASE_PAYMENT_REQUESTS_CACHE = []
+SUPABASE_PAYMENT_REQUESTS_CACHE_AT = 0.0
 SUPABASE_SUBSCRIPTIONS_SYNC_TTL_SECONDS = 60
 SUPABASE_SUBSCRIPTIONS_STATUS = "not_checked"
 SUPABASE_SUBSCRIPTIONS_SYNC_AT = 0.0
@@ -371,6 +377,7 @@ SUPABASE_SUBSCRIPTIONS_COUNTS = {
     "archivos": {},
 }
 SUPABASE_SUBSCRIPTIONS_LOCK = threading.RLock()
+SUPABASE_PAYMENT_REQUESTS_LOCK = threading.RLock()
 SUPABASE_SETTINGS_LOCK = threading.RLock()
 SUPABASE_SETTINGS_CACHE = None
 SUPABASE_SETTINGS_CACHE_AT = 0.0
@@ -829,7 +836,7 @@ GroupSFSRequests = TinyDB(_state_path("group_sfs_requests.json"))
 RegistroActividad = TinyDB(_state_path("registro_actividad.json"))
 SFS_LOCK = threading.RLock()
 SFS_ALBUM_TIMERS = {}
-SFS_MAX_MEDIA = 3
+TELEGRAM_MEDIA_GROUP_MAX = 10
 SFS_MAX_DESCRIPTION_CHARS = 3800
 SFS_INLINE_LINK_LIMIT = 8
 GROUP_MODERATION_QUEUE = queue.Queue(maxsize=150)
@@ -1010,6 +1017,453 @@ def _supabase_pedir(
     with urllib.request.urlopen(request, timeout=12) as response:
         raw = response.read()
     return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _payment_request_safe_error(error):
+    if isinstance(error, urllib.error.HTTPError):
+        status = int(getattr(error, "code", 0) or 0)
+        if status in (401, 403):
+            return (
+                f"Supabase rechazó el acceso (HTTP {status}); revisa que Render "
+                "use la clave secreta/de servicio."
+            )
+        if status == 404:
+            return (
+                "No existe la tabla de solicitudes de pago. Ejecuta la versión "
+                "actualizada de supabase/schema.sql en Supabase."
+            )
+        if status == 400:
+            return (
+                "La tabla de solicitudes de pago no coincide con el esquema "
+                "esperado; vuelve a ejecutar la migración actualizada."
+            )
+        if status == 409:
+            return "La solicitud ya existe o entra en conflicto con otra pendiente."
+        return f"Supabase respondió con HTTP {status} al guardar solicitudes."
+    if isinstance(error, urllib.error.URLError):
+        reason = getattr(error, "reason", None)
+        if isinstance(reason, TimeoutError):
+            return "La conexión con Supabase agotó el tiempo de espera."
+        return "Render no pudo conectar con Supabase."
+    if isinstance(error, TimeoutError):
+        return "La conexión con Supabase agotó el tiempo de espera."
+    if isinstance(error, RuntimeError):
+        return "Faltan SUPABASE_URL o SUPABASE_SECRET_KEY en Render."
+    if isinstance(error, ValueError):
+        return "Supabase devolvió una respuesta inesperada."
+    return "No se pudo confirmar la solicitud en Supabase."
+
+
+def _payment_request_set_error(error):
+    global SUPABASE_PAYMENT_REQUESTS_STATUS, SUPABASE_PAYMENT_REQUESTS_ERROR
+    if not SUPABASE_URL and not SUPABASE_SECRET_KEY:
+        SUPABASE_PAYMENT_REQUESTS_STATUS = "not_configured"
+    elif not _supabase_configurado():
+        SUPABASE_PAYMENT_REQUESTS_STATUS = "incomplete"
+    else:
+        SUPABASE_PAYMENT_REQUESTS_STATUS = "error"
+    SUPABASE_PAYMENT_REQUESTS_ERROR = _payment_request_safe_error(error)
+    app.logger.warning(
+        "No se pudo consultar o guardar una solicitud de pago "
+        "(diagnóstico=%s; clase=%s).",
+        SUPABASE_PAYMENT_REQUESTS_ERROR,
+        type(error).__name__,
+    )
+
+
+def _payment_request_info_from_row(row, include_private=False):
+    if not isinstance(row, dict):
+        return {}
+    try:
+        user_id = int(row.get("user_id"))
+    except (TypeError, ValueError):
+        return {}
+    info = {
+        "request_id": str(row.get("request_id") or ""),
+        "metodo": str(row.get("method") or ""),
+        "username": str(row.get("username") or "sin_usuario"),
+        "nombre": str(row.get("display_name") or "Usuario"),
+        "payment_option_index": row.get("payment_option_index"),
+        "payment_option_label": str(row.get("payment_option_label") or ""),
+        "created_at": str(row.get("created_at") or ""),
+        "usuario_chat_id": row.get("user_chat_id") or user_id,
+        "usuario_msg_id": row.get("user_message_id"),
+        "notif_msg_id": row.get("admin_notification_message_id"),
+        "payment_request_status": str(row.get("status") or "pending"),
+    }
+    if include_private:
+        info["payment_option_data"] = ""
+    return info
+
+
+def _payment_request_apply_row(row, include_private=False):
+    try:
+        user_id = int(row.get("user_id"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    info = _payment_request_info_from_row(row, include_private=include_private)
+    if not info.get("request_id") or info.get("metodo") not in NOMBRE_METODO:
+        return None
+    actual = dict(solicitudes_info.get(user_id) or {})
+    actual.update(info)
+    if include_private:
+        # Payment values are deliberately not persisted in the request table.
+        # Copying reads the currently configured option only in the admin chat.
+        actual.pop("payment_option_data", None)
+    solicitudes_info[user_id] = actual
+    solicitudes_pendientes[user_id] = actual["metodo"]
+    try:
+        comprobante = COMPROBANTES_PENDIENTES.get(Query().id == user_id)
+        if (
+            comprobante
+            and comprobante.get("request_id") == actual["request_id"]
+        ):
+            actual.update({
+                "comprobante_file_id": comprobante.get("file_id"),
+                "comprobante_tipo": comprobante.get("file_type", "photo"),
+                "comprobante_fecha": comprobante.get("received_at"),
+            })
+    except Exception:
+        pass
+    return user_id, actual
+
+
+def _payment_request_refresh_pending(force=False):
+    global SUPABASE_PAYMENT_REQUESTS_STATUS
+    global SUPABASE_PAYMENT_REQUESTS_ERROR
+    global SUPABASE_PAYMENT_REQUESTS_CACHE
+    global SUPABASE_PAYMENT_REQUESTS_CACHE_AT
+    with SUPABASE_PAYMENT_REQUESTS_LOCK:
+        now = time.monotonic()
+        if (
+            not force
+            and SUPABASE_PAYMENT_REQUESTS_STATUS == "connected"
+            and now - SUPABASE_PAYMENT_REQUESTS_CACHE_AT
+            < SUPABASE_PAYMENT_REQUESTS_CACHE_TTL_SECONDS
+        ):
+            return [dict(row) for row in SUPABASE_PAYMENT_REQUESTS_CACHE]
+        if not _supabase_configurado():
+            error = RuntimeError("Supabase no está configurado.")
+            _payment_request_set_error(error)
+            return [dict(row) for row in SUPABASE_PAYMENT_REQUESTS_CACHE]
+        try:
+            registros = []
+            offset = 0
+            # Never select payment_option_data into the list cache.
+            fields = (
+                "request_id,user_id,username,display_name,method,"
+                "payment_option_index,payment_option_label,user_chat_id,"
+                "user_message_id,admin_notification_message_id,status,created_at"
+            )
+            while True:
+                pagina = _supabase_pedir(
+                    "GET",
+                    table=SUPABASE_PAYMENT_REQUESTS_TABLE,
+                    query_parameters={
+                        "select": fields,
+                        "status": "eq.pending",
+                        "order": "created_at.desc",
+                        "limit": "1000",
+                        "offset": str(offset),
+                    },
+                )
+                if not isinstance(pagina, list):
+                    raise ValueError("Lista de solicitudes no válida.")
+                registros.extend(pagina)
+                if len(pagina) < 1000:
+                    break
+                offset += len(pagina)
+            SUPABASE_PAYMENT_REQUESTS_CACHE = [
+                dict(row) for row in registros if isinstance(row, dict)
+            ]
+            SUPABASE_PAYMENT_REQUESTS_CACHE_AT = now
+            SUPABASE_PAYMENT_REQUESTS_STATUS = "connected"
+            SUPABASE_PAYMENT_REQUESTS_ERROR = ""
+            for row in SUPABASE_PAYMENT_REQUESTS_CACHE:
+                _payment_request_apply_row(row)
+            active_ids = {
+                str(row.get("request_id"))
+                for row in SUPABASE_PAYMENT_REQUESTS_CACHE
+            }
+            # Keep non-payment requests (such as Free Gold Pass) untouched,
+            # while dropping payment requests already resolved elsewhere.
+            for user_id, info in list(solicitudes_info.items()):
+                if (
+                    isinstance(info, dict)
+                    and info.get("request_id")
+                    and info.get("metodo") in NOMBRE_METODO
+                    and str(info.get("request_id")) not in active_ids
+                ):
+                    solicitudes_info.pop(user_id, None)
+                    solicitudes_pendientes.pop(user_id, None)
+            return [dict(row) for row in SUPABASE_PAYMENT_REQUESTS_CACHE]
+        except Exception as error:
+            _payment_request_set_error(error)
+            return [dict(row) for row in SUPABASE_PAYMENT_REQUESTS_CACHE]
+
+
+def _payment_request_fetch(request_id, safe_only=False):
+    global SUPABASE_PAYMENT_REQUESTS_STATUS, SUPABASE_PAYMENT_REQUESTS_ERROR
+    if not _supabase_configurado():
+        error = RuntimeError("Supabase no está configurado.")
+        _payment_request_set_error(error)
+        raise error
+    fields = (
+        "request_id,user_id,username,display_name,method,payment_option_index,"
+        "payment_option_label,user_chat_id,user_message_id,"
+        "admin_notification_message_id,status,created_at,updated_at,resolved_at"
+    )
+    try:
+        rows = _supabase_pedir(
+            "GET",
+            table=SUPABASE_PAYMENT_REQUESTS_TABLE,
+            query_parameters={
+                "select": fields,
+                "request_id": f"eq.{request_id}",
+                "limit": "1",
+            },
+        )
+        if not isinstance(rows, list):
+            raise ValueError("La ficha de solicitud no es válida.")
+        SUPABASE_PAYMENT_REQUESTS_STATUS = "connected"
+        SUPABASE_PAYMENT_REQUESTS_ERROR = ""
+        return rows[0] if rows else None
+    except Exception as error:
+        _payment_request_set_error(error)
+        raise
+
+
+def _payment_request_find_for_user(user_id):
+    global SUPABASE_PAYMENT_REQUESTS_STATUS, SUPABASE_PAYMENT_REQUESTS_ERROR
+    if not _supabase_configurado():
+        error = RuntimeError("Supabase no está configurado.")
+        _payment_request_set_error(error)
+        raise error
+    fields = (
+        "request_id,user_id,username,display_name,method,payment_option_index,"
+        "payment_option_label,user_chat_id,user_message_id,"
+        "admin_notification_message_id,status,created_at"
+    )
+    try:
+        rows = _supabase_pedir(
+            "GET",
+            table=SUPABASE_PAYMENT_REQUESTS_TABLE,
+            query_parameters={
+                "select": fields,
+                "user_id": f"eq.{int(user_id)}",
+                "status": "eq.pending",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+        if not isinstance(rows, list):
+            raise ValueError("La solicitud del usuario no es válida.")
+        SUPABASE_PAYMENT_REQUESTS_STATUS = "connected"
+        SUPABASE_PAYMENT_REQUESTS_ERROR = ""
+        return rows[0] if rows else None
+    except Exception as error:
+        _payment_request_set_error(error)
+        raise
+
+
+def _payment_request_create(info):
+    global SUPABASE_PAYMENT_REQUESTS_STATUS, SUPABASE_PAYMENT_REQUESTS_ERROR
+    global SUPABASE_PAYMENT_REQUESTS_CACHE
+    global SUPABASE_PAYMENT_REQUESTS_CACHE_AT
+    if not _supabase_configurado():
+        error = RuntimeError("Supabase no está configurado.")
+        _payment_request_set_error(error)
+        raise error
+    user_id = int(info["user_id"])
+    request_id = str(info.get("request_id") or uuid.uuid4().hex)
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "request_id": request_id,
+        "user_id": user_id,
+        "username": str(info.get("username") or ""),
+        "display_name": str(info.get("display_name") or "Usuario"),
+        "method": str(info.get("method") or ""),
+        "payment_option_index": info.get("payment_option_index"),
+        "payment_option_label": str(info.get("payment_option_label") or ""),
+        "user_chat_id": int(info.get("user_chat_id") or user_id),
+        "user_message_id": info.get("user_message_id"),
+        "admin_notification_message_id": None,
+        "status": "pending",
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        with SUPABASE_PAYMENT_REQUESTS_LOCK:
+            existing = _payment_request_find_for_user(user_id)
+            if existing:
+                return {"created": False, "record": existing}
+            rows = _supabase_pedir(
+                "POST",
+                payload,
+                table=SUPABASE_PAYMENT_REQUESTS_TABLE,
+                query_parameters={"select": "*"},
+                prefer="return=representation",
+            )
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("Supabase no confirmó el registro de pago.")
+        record = rows[0]
+        safe_record = _payment_request_info_from_row(record)
+        if not safe_record.get("request_id"):
+            raise ValueError("Supabase no devolvió el ID de solicitud.")
+        SUPABASE_PAYMENT_REQUESTS_STATUS = "connected"
+        SUPABASE_PAYMENT_REQUESTS_ERROR = ""
+        SUPABASE_PAYMENT_REQUESTS_CACHE = [
+            row for row in SUPABASE_PAYMENT_REQUESTS_CACHE
+            if int(row.get("user_id") or 0) != user_id
+        ]
+        SUPABASE_PAYMENT_REQUESTS_CACHE.insert(0, {
+            key: record.get(key)
+            for key in (
+                "request_id", "user_id", "username", "display_name", "method",
+                "payment_option_index", "payment_option_label", "user_chat_id",
+                "user_message_id", "admin_notification_message_id", "status",
+                "created_at",
+            )
+        })
+        SUPABASE_PAYMENT_REQUESTS_CACHE_AT = time.monotonic()
+        _payment_request_apply_row(record)
+        return {"created": True, "record": record}
+    except Exception as error:
+        _payment_request_set_error(error)
+        # The database may have committed before a network timeout. Confirm
+        # whether a pending row exists instead of telling the user that it was
+        # not saved when it actually was.
+        try:
+            existing = _payment_request_find_for_user(user_id)
+            if existing:
+                return {"created": False, "record": existing}
+        except Exception:
+            pass
+        raise
+
+
+def _payment_request_update_fields(
+    request_id, changes, require_pending=True, expected_status=None
+):
+    global SUPABASE_PAYMENT_REQUESTS_STATUS, SUPABASE_PAYMENT_REQUESTS_ERROR
+    global SUPABASE_PAYMENT_REQUESTS_CACHE
+    global SUPABASE_PAYMENT_REQUESTS_CACHE_AT
+    if not _supabase_configurado():
+        error = RuntimeError("Supabase no está configurado.")
+        _payment_request_set_error(error)
+        raise error
+    params = {"request_id": f"eq.{request_id}"}
+    if expected_status:
+        params["status"] = f"eq.{expected_status}"
+    elif require_pending:
+        params["status"] = "eq.pending"
+    try:
+        rows = _supabase_pedir(
+            "PATCH",
+            changes,
+            table=SUPABASE_PAYMENT_REQUESTS_TABLE,
+            query_parameters=params,
+            prefer="return=representation",
+        )
+        if not isinstance(rows, list):
+            raise ValueError("Supabase no confirmó el cambio de solicitud.")
+        if rows:
+            row = rows[0]
+            SUPABASE_PAYMENT_REQUESTS_STATUS = "connected"
+            SUPABASE_PAYMENT_REQUESTS_ERROR = ""
+            _payment_request_apply_row(row)
+            if row.get("status") != "pending":
+                SUPABASE_PAYMENT_REQUESTS_CACHE = [
+                    item for item in SUPABASE_PAYMENT_REQUESTS_CACHE
+                    if str(item.get("request_id")) != str(request_id)
+                ]
+            else:
+                safe = {
+                    key: row.get(key)
+                    for key in (
+                        "request_id", "user_id", "username", "display_name",
+                        "method", "payment_option_index", "payment_option_label",
+                        "user_chat_id", "user_message_id",
+                        "admin_notification_message_id", "status", "created_at",
+                    )
+                }
+                SUPABASE_PAYMENT_REQUESTS_CACHE = [
+                    item for item in SUPABASE_PAYMENT_REQUESTS_CACHE
+                    if str(item.get("request_id")) != str(request_id)
+                ]
+                SUPABASE_PAYMENT_REQUESTS_CACHE.insert(0, safe)
+            SUPABASE_PAYMENT_REQUESTS_CACHE_AT = time.monotonic()
+            return row
+        return None
+    except Exception as error:
+        _payment_request_set_error(error)
+        raise
+
+
+def _payment_request_resolve(request_id, status):
+    if status not in ("approved", "rejected", "cancelled"):
+        raise ValueError("Estado final de solicitud no válido.")
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        return _payment_request_update_fields(
+            request_id,
+            {
+                "status": status,
+                "resolved_at": now,
+                "updated_at": now,
+            },
+            require_pending=True,
+        )
+    except Exception:
+        # A REST timeout can happen after the database accepted the update.
+        # Read back the row before deciding whether to retry or leave it open.
+        record = _payment_request_fetch(request_id)
+        if record and record.get("status") == status:
+            return record
+        return None
+
+
+def _payment_request_reopen_after_failed_approval(request_id):
+    now = datetime.now(timezone.utc).isoformat()
+    return _payment_request_update_fields(
+        request_id,
+        {
+            "status": "pending",
+            "resolved_at": None,
+            "updated_at": now,
+        },
+        require_pending=False,
+        expected_status="approved",
+    )
+
+
+def _payment_request_cancel_by_user(user_id, request_id=None):
+    user_id = int(user_id)
+    request_id = str(request_id or "").strip()
+    if not request_id:
+        return False
+    record = _payment_request_fetch(request_id)
+    if (
+        not record
+        or int(record.get("user_id") or 0) != user_id
+        or record.get("status") != "pending"
+    ):
+        return False
+    return bool(_payment_request_resolve(request_id, "cancelled"))
+
+
+def _payment_request_load_into_memory(request_id):
+    row = _payment_request_fetch(request_id)
+    if not row or row.get("status") != "pending":
+        return None
+    return _payment_request_apply_row(row, include_private=True)
+
+
+def _payment_request_load_pending_for_user(user_id):
+    row = _payment_request_find_for_user(int(user_id))
+    if not row:
+        return None
+    return _payment_request_load_into_memory(row.get("request_id"))
 
 
 def _supabase_sembrar_desde_archivos(config_local=None, settings_actuales=None):
@@ -4691,6 +5145,13 @@ def mostrar_metodos_pago(chat_id, aviso=None, language=None):
 
 def markup_admin_config_pagos():
     estado_free = "ACTIVADO" if free_goldpass_activo() else "DESACTIVADO"
+    solicitudes = _solicitudes_pago_pendientes()
+    if SUPABASE_PAYMENT_REQUESTS_STATUS == "connected":
+        etiqueta_solicitudes = (
+            f"📥 Solicitudes de métodos de pago · {len(solicitudes)}"
+        )
+    else:
+        etiqueta_solicitudes = "📥 Solicitudes de métodos de pago · no disponible"
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton(
@@ -4708,6 +5169,10 @@ def markup_admin_config_pagos():
         types.InlineKeyboardButton(
             "👥 Administrar suscripciones",
             callback_data="admin_suscripciones|0",
+        ),
+        types.InlineKeyboardButton(
+            etiqueta_solicitudes,
+            callback_data="admin_payment_queue|0",
         ),
         types.InlineKeyboardButton(
             "📤 Compartir asistente",
@@ -5917,6 +6382,7 @@ def mostrar_admin_config_pagos(
     chat_id, message=None, message_id=None, aviso=None
 ):
     estado_free = free_goldpass_config()
+    solicitudes = _solicitudes_pago_pendientes()
     texto = (
         "💳 <b>Métodos de pagos y configuración general</b>\n\n"
         "Administra los métodos de pago sin mostrar aquí sus datos privados. "
@@ -5930,6 +6396,17 @@ def mostrar_admin_config_pagos(
         "Los datos de pago, las acciones de los botones y las reglas de acceso "
         "se mantienen protegidos."
     )
+    if SUPABASE_PAYMENT_REQUESTS_STATUS == "connected":
+        texto += (
+            f"\n\n📥 Solicitudes de métodos de pago pendientes: "
+            f"<b>{len(solicitudes)}</b>."
+        )
+    else:
+        texto += (
+            "\n\n⚠️ La bandeja persistente de solicitudes no está disponible: "
+            f"{html.escape(SUPABASE_PAYMENT_REQUESTS_ERROR or 'configura Supabase y ejecuta el esquema actualizado')} "
+            "No se confirmarán nuevas solicitudes como guardadas."
+        )
     if aviso:
         texto = f"✅ {html.escape(aviso)}\n\n" + texto
     return editar_o_enviar_panel(
@@ -9289,9 +9766,22 @@ def admin_cancelar_comprobante_aprobacion(call):
         info = solicitudes_info[user_id]
         datos_id = info.get("datos_msg_id")
         if datos_id:
+            request_id = str(info.get("request_id") or "")
             markup = types.InlineKeyboardMarkup().add(
-                types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
-                types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
+                types.InlineKeyboardButton(
+                    "✅ Aprobado",
+                    callback_data=(
+                        f"adap_{user_id}_{request_id}"
+                        if request_id else f"adap_{user_id}"
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    "❌ Rechazado",
+                    callback_data=(
+                        f"adrec_{user_id}_{request_id}"
+                        if request_id else f"adrec_{user_id}"
+                    ),
+                ),
             )
             try:
                 bot.edit_message_reply_markup(
@@ -11448,82 +11938,34 @@ def pago_usa_submenu(call):
     )
 
 # ─── Helper: solicitud de Pago por Link (compartido entre usa_link y visa_mc) ──
-def _markup_solicitud_usuario():
+def _markup_solicitud_usuario(request_id=None):
+    request_id = str(request_id or "")
+    volver_callback = (
+        f"volver_metodos_pago|{request_id}"
+        if request_id
+        else "volver_metodos_pago"
+    )
+    cancelar_callback = (
+        f"cancelar_solicitud|{request_id}"
+        if request_id
+        else "cancelar_solicitud"
+    )
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        types.InlineKeyboardButton("🔙 Volver",             callback_data="volver_metodos_pago"),
-        types.InlineKeyboardButton("❌ Cancelar solicitud", callback_data="cancelar_solicitud"),
+        types.InlineKeyboardButton("🔙 Volver", callback_data=volver_callback),
+        types.InlineKeyboardButton(
+            "❌ Cancelar solicitud", callback_data=cancelar_callback
+        ),
     )
     return markup
 
+
 def _procesar_solicitud_link(call, metodo):
-    user_id  = call.from_user.id
-    username = call.from_user.username or "sin_usuario"
-    nombre   = call.from_user.first_name or "Usuario"
-
-    bot.answer_callback_query(call.id)
-    solicitudes_pendientes[user_id] = metodo
-
-    msg_usuario = editar_o_enviar_panel(
-        call.message.chat.id,
-        obtener_mensaje_solicitud_enlace(metodo),
-        _markup_solicitud_usuario(),
-        message=call.message,
-        protect_content=True,
+    return _crear_solicitud_pago_durable(
+        call,
+        metodo,
+        mensaje_usuario=obtener_mensaje_solicitud_enlace(metodo),
     )
-
-    nombre_metodo  = NOMBRE_METODO.get(metodo, metodo)
-    mencion_html   = f'<a href="tg://user?id={user_id}">{nombre}</a>'
-    tiene_username = username != "sin_usuario"
-
-    markup_admin = types.InlineKeyboardMarkup(row_width=1)
-    if tiene_username:
-        markup_admin.add(types.InlineKeyboardButton(
-            "💬 Abrir chat del usuario", url=f"https://t.me/{username}"))
-    markup_admin.add(
-        types.InlineKeyboardButton("🔗 Crear enlace de pago",
-                                   callback_data=f"ac_{user_id}_{metodo}"),
-        types.InlineKeyboardButton("❌ Rechazar solicitud",
-                                   callback_data=f"admin_no_{user_id}"),
-    )
-    markup_admin.add(types.InlineKeyboardButton(
-        f"📥 Otras solicitudes ({len(_solicitudes_pago_pendientes()) + 1})",
-        callback_data="admin_payment_queue|0",
-    ))
-
-    texto_admin = (
-        f"🔔 <b>NUEVA SOLICITUD DE PAGO</b>\n\n"
-        f"👤 Nombre: {mencion_html}\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"📛 Usuario: {'@' + username if tiene_username else '(sin @username)'}\n\n"
-        f"💳 Método elegido: <b>{nombre_metodo}</b>"
-    )
-
-    try:
-        notif_msg    = bot.send_message(
-            int(ADMIN_ID), texto_admin,
-            parse_mode="HTML", reply_markup=markup_admin,
-            _force_new_message=True,
-        )
-        notif_msg_id = notif_msg.message_id
-    except Exception as e:
-        try:
-            notif_msg    = bot.send_message(int(ADMIN_ID),
-                                            texto_admin + f"\n\n⚠️ Error al cargar botones: {e}",
-                                            parse_mode="HTML",
-                                            _force_new_message=True)
-            notif_msg_id = notif_msg.message_id
-        except:
-            notif_msg_id = None
-
-    solicitudes_info[user_id] = {
-        'metodo': metodo, 'username': username,
-        'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'request_id': uuid.uuid4().hex,
-        'notif_msg_id': notif_msg_id, 'datos_msg_id': None,
-        'usuario_chat_id': call.message.chat.id,
-        'usuario_msg_id': msg_usuario.message_id,
-    }
 
 # ─── Pago por Link (desde sub-menú Cuenta USA) ────────────────────
 @bot.callback_query_handler(func=lambda call: call.data == "pago_usa_link")
@@ -11590,15 +12032,16 @@ def solicitar_pago_movil_seleccionado(call):
 
 
 def _solicitudes_pago_pendientes():
+    rows = _payment_request_refresh_pending()
     salida = []
-    for user_id, info in solicitudes_info.items():
-        if not isinstance(info, dict) or not info.get("metodo"):
+    for row in rows:
+        item = _payment_request_apply_row(row)
+        if not item:
             continue
+        user_id, info = item
         if info.get("metodo") not in NOMBRE_METODO:
             continue
-        if not info.get("usuario_chat_id"):
-            continue
-        salida.append((int(user_id), info))
+        salida.append((user_id, info))
     salida.sort(key=lambda item: item[1].get("created_at", ""), reverse=True)
     return salida
 
@@ -11627,24 +12070,33 @@ def _tarjeta_solicitud_pago_admin(user_id, info, cantidad_pendientes=None):
         )
 
     markup = types.InlineKeyboardMarkup(row_width=1)
-    if tiene_username:
+    request_id = str(info.get("request_id") or "")
+    page = max(0, int(info.get("queue_page") or 0))
+    if request_id:
         markup.add(types.InlineKeyboardButton(
-            "💬 Abrir chat del usuario",
-            url=f"https://t.me/{username}",
+            "📂 Abrir solicitud guardada",
+            callback_data=f"payreq|open|{request_id}|{page}",
         ))
-    if metodo in _METODOS_LINK:
-        markup.add(types.InlineKeyboardButton(
-            "🔗 Crear enlace de pago",
-            callback_data=f"ac_{int(user_id)}_{metodo}",
-        ))
+        reject_callback = f"payreq|reject|{request_id}|{page}"
     else:
+        if tiene_username:
+            markup.add(types.InlineKeyboardButton(
+                "💬 Abrir chat del usuario",
+                url=f"https://t.me/{username}",
+            ))
+        if metodo in _METODOS_LINK:
+            callback = f"ac_{int(user_id)}_{metodo}"
+        else:
+            callback = f"ac_{int(user_id)}_{metodo}"
         markup.add(types.InlineKeyboardButton(
-            "📋 Ver datos para copiar",
-            callback_data=f"ac_{int(user_id)}_{metodo}",
+            "🔗 Crear enlace de pago" if metodo in _METODOS_LINK
+            else "📋 Ver datos para copiar",
+            callback_data=callback,
         ))
+        reject_callback = f"admin_no_{int(user_id)}"
     markup.add(types.InlineKeyboardButton(
         "❌ Rechazar solicitud",
-        callback_data=f"admin_no_{int(user_id)}",
+        callback_data=reject_callback,
     ))
     if cantidad_pendientes is None:
         cantidad_pendientes = len(_solicitudes_pago_pendientes())
@@ -11655,9 +12107,336 @@ def _tarjeta_solicitud_pago_admin(user_id, info, cantidad_pendientes=None):
     return texto, markup
 
 
+def _payment_request_send_admin_notification(record):
+    item = _payment_request_apply_row(record)
+    if not item:
+        return False
+    user_id, info = item
+    request_id = str(info.get("request_id") or "")
+    if not request_id:
+        return False
+    info["queue_page"] = 0
+    pending_count = len(_solicitudes_pago_pendientes())
+    texto, markup = _tarjeta_solicitud_pago_admin(
+        user_id,
+        info,
+        cantidad_pendientes=pending_count,
+    )
+    notification = None
+    try:
+        notification = bot.send_message(
+            int(ADMIN_ID),
+            texto,
+            parse_mode="HTML",
+            reply_markup=markup,
+            protect_content=True,
+            _force_new_message=True,
+        )
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo enviar la notificación inmediata de pago (error=%s).",
+            type(error).__name__,
+        )
+        fallback = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                "📥 Abrir solicitudes pendientes",
+                callback_data="admin_payment_queue|0",
+            )
+        )
+        try:
+            notification = bot.send_message(
+                int(ADMIN_ID),
+                "⚠️ Una solicitud de pago quedó guardada en Supabase, pero "
+                "no pude mostrar sus botones directos. Ábrela desde la bandeja.",
+                reply_markup=fallback,
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.exception(
+                "No se pudo entregar la notificación de pago al administrador."
+            )
+            return False
+    info["notif_msg_id"] = notification.message_id
+    try:
+        _payment_request_update_fields(
+            request_id,
+            {
+                "admin_notification_message_id": notification.message_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as error:
+        # The request itself is already durable and remains in the inbox.
+        app.logger.warning(
+            "La solicitud de pago está guardada, pero no su mensaje de aviso "
+            "(error=%s).",
+            type(error).__name__,
+        )
+    return True
+
+
+def _payment_request_show_detail(
+    chat_id, request_id, pagina=0, message=None
+):
+    try:
+        record = _payment_request_fetch(request_id)
+    except Exception:
+        texto = (
+            "⚠️ No pude abrir esta solicitud porque Supabase no está disponible. "
+            "La solicitud sigue guardada; vuelve a intentarlo más tarde."
+        )
+        return editar_o_enviar_panel(
+            chat_id,
+            texto,
+            types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "🔙 Volver a solicitudes",
+                    callback_data=f"admin_payment_queue|{max(0, int(pagina))}",
+                )
+            ),
+            message=message,
+            protect_content=True,
+            forzar_texto=True,
+        )
+    if not record:
+        return editar_o_enviar_panel(
+            chat_id,
+            "La solicitud ya no está disponible.",
+            types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "🔙 Volver a solicitudes",
+                    callback_data=f"admin_payment_queue|{max(0, int(pagina))}",
+                )
+            ),
+            message=message,
+            protect_content=True,
+            forzar_texto=True,
+        )
+    status = str(record.get("status") or "")
+    if status != "pending":
+        estado = {
+            "approved": "aprobada",
+            "rejected": "rechazada",
+            "cancelled": "cancelada por el usuario",
+        }.get(status, "ya resuelta")
+        return editar_o_enviar_panel(
+            chat_id,
+            f"ℹ️ Esta solicitud está {estado}.",
+            types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    "🔙 Volver a solicitudes",
+                    callback_data=f"admin_payment_queue|{max(0, int(pagina))}",
+                )
+            ),
+            message=message,
+            protect_content=True,
+            forzar_texto=True,
+        )
+    item = _payment_request_apply_row(record, include_private=True)
+    if not item:
+        return editar_o_enviar_panel(
+            chat_id,
+            "No pude leer los datos de esta solicitud.",
+            types.InlineKeyboardMarkup(),
+            message=message,
+            protect_content=True,
+            forzar_texto=True,
+        )
+    user_id, info = item
+    info["queue_page"] = max(0, int(pagina))
+    username = str(info.get("username") or "").strip().lstrip("@")
+    nombre = str(info.get("nombre") or "Usuario")
+    metodo = NOMBRE_METODO.get(info.get("metodo"), info.get("metodo", "Método"))
+    opcion = str(info.get("payment_option_label") or "")
+    fecha = str(info.get("created_at") or "no registrada")
+    texto = (
+        "📥 <b>Solicitud de método de pago</b>\n\n"
+        f"👤 Nombre: {html.escape(nombre)}\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"📛 Usuario: "
+        f"{html.escape('@' + username if username and username != 'sin_usuario' else '(sin @username)')}\n"
+        f"💳 Método: <b>{html.escape(str(metodo))}</b>\n"
+        + (f"🏦 Opción solicitada: <b>{html.escape(opcion)}</b>\n" if opcion else "")
+        + f"🕒 Fecha: <b>{html.escape(fecha)}</b>\n"
+        "📌 Estado: <b>Pendiente</b>\n\n"
+        "Los datos bancarios no se muestran aquí; usa el botón para copiarlos "
+        "en este chat privado."
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton(
+        "💬 Abrir chat del usuario",
+        url=f"tg://user?id={user_id}",
+    ))
+    if info.get("metodo") in _METODOS_LINK:
+        markup.add(types.InlineKeyboardButton(
+            "🔗 Crear enlace de pago",
+            callback_data=f"payreq|link|{info['request_id']}|{pagina}",
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            "📋 Copiar datos del método",
+            callback_data=f"payreq|copy|{info['request_id']}|{pagina}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Rechazar solicitud",
+        callback_data=f"payreq|reject|{info['request_id']}|{pagina}",
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a solicitudes",
+        callback_data=f"admin_payment_queue|{pagina}",
+    ))
+    return editar_o_enviar_panel(
+        chat_id,
+        texto,
+        markup,
+        message=message,
+        protect_content=True,
+        forzar_texto=True,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("payreq|")
+)
+def admin_accion_solicitud_pago(call):
+    if not es_admin_privado(call):
+        bot.answer_callback_query(call.id, "⛔ Solo el administrador puede abrirlo en privado.")
+        return
+    try:
+        _, action, request_id, raw_page = call.data.split("|", 3)
+        pagina = max(0, int(raw_page))
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "La solicitud no es válida.", show_alert=True)
+        return
+
+    if action == "open":
+        bot.answer_callback_query(call.id)
+        _payment_request_show_detail(
+            int(ADMIN_ID), request_id, pagina, message=call.message
+        )
+        return
+
+    if action == "copy":
+        try:
+            item = _payment_request_load_into_memory(request_id)
+        except Exception:
+            bot.answer_callback_query(
+                call.id, "No pude cargar los datos; la solicitud sigue pendiente.",
+                show_alert=True,
+            )
+            return
+        if not item:
+            bot.answer_callback_query(
+                call.id, "La solicitud ya no está pendiente.", show_alert=True
+            )
+            return
+        user_id, info = item
+        info["queue_page"] = pagina
+        bot.answer_callback_query(call.id)
+        _mostrar_datos_pago_admin(
+            user_id,
+            info.get("metodo"),
+            indice=0,
+            message=call.message,
+        )
+        return
+
+    if action == "link":
+        try:
+            item = _payment_request_load_into_memory(request_id)
+        except Exception:
+            bot.answer_callback_query(
+                call.id, "No pude cargar la solicitud desde Supabase.",
+                show_alert=True,
+            )
+            return
+        if not item:
+            bot.answer_callback_query(
+                call.id, "La solicitud ya no está pendiente.", show_alert=True
+            )
+            return
+        user_id, info = item
+        metodo = str(info.get("metodo") or "")
+        if metodo not in _METODOS_LINK:
+            bot.answer_callback_query(
+                call.id, "Esta solicitud no usa un enlace de pago.",
+                show_alert=True,
+            )
+            return
+        info["queue_page"] = pagina
+        admin_estado[call.from_user.id] = {
+            "paso": "esperando_link_pago",
+            "user_id_pago": user_id,
+            "metodo_link": metodo,
+            "request_id": request_id,
+        }
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            int(ADMIN_ID),
+            "🔗 <b>Crea el enlace de cobro</b> en tu plataforma y envíamelo aquí:\n\n"
+            "<i>(Debe comenzar con https://)</i>",
+            parse_mode="HTML",
+            protect_content=True,
+        )
+        return
+
+    if action == "reject":
+        try:
+            record = _payment_request_fetch(request_id)
+            if not record or int(record.get("user_id") or 0) <= 0:
+                raise ValueError("Solicitud no encontrada.")
+            if record.get("status") != "pending":
+                bot.answer_callback_query(
+                    call.id, "La solicitud ya fue resuelta.", show_alert=True
+                )
+                return
+            user_id = int(record["user_id"])
+            resolved = _payment_request_resolve(request_id, "rejected")
+            if not resolved:
+                bot.answer_callback_query(
+                    call.id, "No pude resolverla; sigue pendiente.", show_alert=True
+                )
+                return
+        except Exception:
+            bot.answer_callback_query(
+                call.id,
+                "Supabase no confirmó el rechazo. La solicitud sigue pendiente.",
+                show_alert=True,
+            )
+            return
+        solicitudes_info.pop(user_id, None)
+        solicitudes_pendientes.pop(user_id, None)
+        try:
+            with SUSCRIPCIONES_LOCK:
+                COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
+        except Exception:
+            pass
+        try:
+            bot.send_message(
+                user_id,
+                "❌ <b>Tu solicitud ha sido rechazada.</b>\n\n"
+                "Si crees que es un error, vuelve a iniciar el bot para "
+                "solicitar un método de pago.",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.info("No se pudo notificar al usuario del rechazo de pago.")
+        bot.answer_callback_query(call.id, "Solicitud rechazada.")
+        _mostrar_cola_solicitudes_pago(
+            int(ADMIN_ID),
+            pagina=pagina,
+            message=call.message,
+            aviso=f"Solicitud de {user_id} rechazada.",
+        )
+        return
+
+    bot.answer_callback_query(call.id, "Acción de solicitud desconocida.")
+
+
 def _markup_cola_solicitudes_pago():
     pendientes = _solicitudes_pago_pendientes()
-    if not pendientes:
+    if SUPABASE_PAYMENT_REQUESTS_STATUS != "connected" or not pendientes:
         return types.InlineKeyboardMarkup()
     return types.InlineKeyboardMarkup().add(
         types.InlineKeyboardButton(
@@ -11693,13 +12472,18 @@ def _mostrar_cola_solicitudes_pago(chat_id, pagina=0, message=None, aviso=None):
     inicio = pagina * por_pagina
     for user_id, info in pendientes[inicio:inicio + por_pagina]:
         metodo = str(info.get("metodo") or "")
-        username = str(info.get("username") or "sin_usuario")
-        etiqueta = f"👤 {username} · {NOMBRE_METODO.get(metodo, metodo)}"
-        if info.get("payment_option_label"):
-            etiqueta += f" · {info['payment_option_label']}"
+        username = str(info.get("username") or "").strip().lstrip("@")
+        nombre = str(info.get("nombre") or "Usuario")
+        identidad = f"@{username}" if username and username != "sin_usuario" else f"ID {user_id}"
+        etiqueta = f"📂 {identidad} · {NOMBRE_METODO.get(metodo, metodo)}"
+        request_id = str(info.get("request_id") or "")
         markup.add(types.InlineKeyboardButton(
             etiqueta[:60],
-            callback_data=f"ac_{user_id}_{metodo}",
+            callback_data=(
+                f"payreq|open|{request_id}|{pagina}"
+                if request_id
+                else f"ac_{user_id}_{metodo}"
+            ),
         ))
     navegacion = []
     if pagina:
@@ -11708,13 +12492,71 @@ def _mostrar_cola_solicitudes_pago(chat_id, pagina=0, message=None, aviso=None):
         navegacion.append(types.InlineKeyboardButton("Siguiente ➡️", callback_data=f"admin_payment_queue|{pagina + 1}"))
     if navegacion:
         markup.row(*navegacion)
-    markup.add(types.InlineKeyboardButton("🔙 Volver al panel", callback_data="admin_home"))
-    texto = (
-        f"📥 <b>Solicitudes de pago pendientes</b> · página {pagina + 1}/{paginas}\n\n"
-        "Selecciona una solicitud para revisar sus datos."
-        if pendientes
-        else "✅ No hay solicitudes de pago pendientes."
-    )
+    if SUPABASE_PAYMENT_REQUESTS_STATUS != "connected":
+        markup.add(types.InlineKeyboardButton(
+            "🔄 Reintentar conexión",
+            callback_data=f"admin_payment_queue|{pagina}",
+        ))
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a métodos y configuración",
+        callback_data="admin_pagos",
+    ))
+    if SUPABASE_PAYMENT_REQUESTS_STATUS == "connected":
+        lineas = []
+        for indice, (user_id, info) in enumerate(
+            pendientes[inicio:inicio + por_pagina], start=inicio + 1
+        ):
+            username = str(info.get("username") or "").strip().lstrip("@")
+            nombre = str(info.get("nombre") or "Usuario")
+            identidad = (
+                f"@{html.escape(username)}"
+                if username and username != "sin_usuario"
+                else f"ID <code>{int(user_id)}</code>"
+            )
+            metodo = html.escape(
+                NOMBRE_METODO.get(str(info.get("metodo") or ""), "Método")
+            )
+            opcion = html.escape(str(info.get("payment_option_label") or ""))
+            fecha = html.escape(str(info.get("created_at") or "fecha no registrada"))
+            nombre_html = html.escape(nombre)
+            lineas.append(
+                f"{indice}. <b>{nombre_html}</b> · {identidad}\n"
+                f"   💳 {metodo}"
+                + (f" · 🏦 {opcion}" if opcion else "")
+                + f"\n   🕒 {fecha}"
+            )
+        texto = (
+            f"📥 <b>Solicitudes de métodos de pago</b> · "
+            f"{len(pendientes)} pendiente(s) · página {pagina + 1}/{paginas}\n\n"
+            + "\n\n".join(lineas)
+            if pendientes
+            else "✅ No hay solicitudes de métodos de pago pendientes."
+        )
+    else:
+        warning = html.escape(
+            SUPABASE_PAYMENT_REQUESTS_ERROR
+            or "No se pudo consultar la bandeja persistente."
+        )
+        texto = (
+            "⚠️ <b>No pude confirmar la bandeja persistente.</b>\n"
+            f"{warning}\n\n"
+            "La lista en memoria puede estar incompleta. No se confirmarán "
+            "solicitudes nuevas como guardadas hasta recuperar Supabase."
+        )
+        if pendientes:
+            texto += "\n\n📋 Solicitudes conocidas en esta sesión:"
+            for user_id, info in pendientes[inicio:inicio + por_pagina]:
+                username = str(info.get("username") or "").strip().lstrip("@")
+                nombre = html.escape(str(info.get("nombre") or "Usuario"))
+                metodo = html.escape(
+                    NOMBRE_METODO.get(str(info.get("metodo") or ""), "Método")
+                )
+                identidad = (
+                    f"@{html.escape(username)}"
+                    if username and username != "sin_usuario"
+                    else f"ID <code>{int(user_id)}</code>"
+                )
+                texto += f"\n• {nombre} · {identidad} · {metodo}"
     if aviso:
         texto = f"ℹ️ {html.escape(str(aviso))}\n\n{texto}"
     editar_o_enviar_panel(
@@ -11727,15 +12569,27 @@ def _mostrar_cola_solicitudes_pago(chat_id, pagina=0, message=None, aviso=None):
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("pago_"))
-def solicitud_pago(call):
-    _procesar_solicitud_metodo_pago(call, call.data)
+def _crear_solicitud_pago_durable(
+    call, metodo, opcion_indice=None, opcion_etiqueta=None,
+    mensaje_usuario=None,
+):
+    user_id = int(call.from_user.id)
+    chat = getattr(getattr(call, "message", None), "chat", None)
+    if (
+        getattr(chat, "type", None) != "private"
+        or str(getattr(chat, "id", "")) != str(user_id)
+    ):
+        bot.answer_callback_query(
+            call.id, "Solicita el método de pago desde el chat privado del bot.",
+            show_alert=True,
+        )
+        return None
+    if metodo not in NOMBRE_METODO:
+        bot.answer_callback_query(call.id, "Ese método de pago no está disponible.")
+        return None
 
-
-def _procesar_solicitud_metodo_pago(call, metodo, opcion_indice=None, opcion_etiqueta=None):
-    user_id  = call.from_user.id
-    username = call.from_user.username or "sin_usuario"
-    nombre   = call.from_user.first_name or "Usuario"
+    username = str(getattr(call.from_user, "username", None) or "sin_usuario")
+    nombre = str(getattr(call.from_user, "first_name", None) or "Usuario")
     opciones_configuradas = _opciones_guardadas_pago(metodo)
     opcion_texto = (
         opciones_configuradas[opcion_indice]
@@ -11743,74 +12597,232 @@ def _procesar_solicitud_metodo_pago(call, metodo, opcion_indice=None, opcion_eti
         and 0 <= opcion_indice < len(opciones_configuradas)
         else None
     )
+    try:
+        existente = _payment_request_find_for_user(user_id)
+        if existente:
+            item = _payment_request_apply_row(existente)
+            existing_id = str(existente.get("request_id") or "")
+            if item and existing_id:
+                info = item[1]
+                info["queue_page"] = 0
+                bot.answer_callback_query(
+                    call.id, "Ya tienes una solicitud pendiente.", show_alert=True
+                )
+                fecha = html.escape(str(info.get("created_at") or ""))
+                metodo_actual = html.escape(
+                    NOMBRE_METODO.get(info.get("metodo"), info.get("metodo", ""))
+                )
+                editar_o_enviar_panel(
+                    user_id,
+                    "⏳ Ya tienes una solicitud de pago pendiente.\n\n"
+                    f"Método: <b>{metodo_actual}</b>\n"
+                    f"Fecha: {fecha}\n\n"
+                    "No creé una solicitud duplicada. Puedes cancelarla aquí "
+                    "si deseas empezar otra.",
+                    _markup_solicitud_usuario(existing_id),
+                    message=call.message,
+                    protect_content=True,
+                )
+                return info
+    except Exception as error:
+        _payment_request_set_error(error)
+        bot.answer_callback_query(
+            call.id,
+            "No pude verificar Supabase; la solicitud no fue guardada.",
+            show_alert=True,
+        )
+        editar_o_enviar_panel(
+            user_id,
+            "⚠️ No pude guardar tu solicitud de forma persistente porque "
+            "Supabase no respondió. Inténtalo de nuevo más tarde.",
+            types.InlineKeyboardMarkup(),
+            message=call.message,
+            protect_content=True,
+        )
+        try:
+            bot.send_message(
+                int(ADMIN_ID),
+                "⚠️ No se registró una solicitud de método de pago en Supabase. "
+                f"ID del usuario: <code>{user_id}</code>. "
+                f"{html.escape(SUPABASE_PAYMENT_REQUESTS_ERROR)}",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.warning("No se pudo avisar al administrador de un fallo de pago.")
+        return None
 
-    bot.answer_callback_query(call.id)
-    solicitudes_pendientes[user_id] = metodo
+    request_id = uuid.uuid4().hex
+    nuevo = {
+        "request_id": request_id,
+        "user_id": user_id,
+        "username": username,
+        "display_name": nombre,
+        "method": metodo,
+        "payment_option_index": opcion_indice,
+        "payment_option_label": str(opcion_etiqueta or ""),
+        "user_chat_id": user_id,
+        "user_message_id": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        resultado = _payment_request_create(nuevo)
+    except Exception:
+        error_text = html.escape(SUPABASE_PAYMENT_REQUESTS_ERROR)
+        bot.answer_callback_query(
+            call.id,
+            "No pude guardar la solicitud; no se confirmó como recibida.",
+            show_alert=True,
+        )
+        editar_o_enviar_panel(
+            user_id,
+            "⚠️ No pude guardar tu solicitud de forma persistente. "
+            "No la envié para revisión; inténtalo de nuevo más tarde.",
+            types.InlineKeyboardMarkup(),
+            message=call.message,
+            protect_content=True,
+        )
+        try:
+            bot.send_message(
+                int(ADMIN_ID),
+                "⚠️ No se registró una solicitud de método de pago en Supabase. "
+                f"ID del usuario: <code>{user_id}</code>. {error_text}",
+                parse_mode="HTML",
+                protect_content=True,
+            )
+        except Exception:
+            app.logger.warning("No se pudo avisar al administrador de un fallo de pago.")
+        return None
 
-    # Mensaje al usuario: espera + aviso de comprobante
-    msg_usuario = editar_o_enviar_panel(
-        call.message.chat.id,
+    record = resultado["record"]
+    if not resultado.get("created"):
+        item = _payment_request_apply_row(record)
+        if item:
+            existing_info = item[1]
+            existing_info["queue_page"] = 0
+            bot.answer_callback_query(
+                call.id, "Ya tienes una solicitud pendiente.", show_alert=True
+            )
+            editar_o_enviar_panel(
+                user_id,
+                "⏳ Ya tienes una solicitud de pago pendiente. No creé otra. "
+                "Puedes cancelarla aquí antes de iniciar una nueva.",
+                _markup_solicitud_usuario(existing_info.get("request_id")),
+                message=call.message,
+                protect_content=True,
+            )
+            return existing_info
+        bot.answer_callback_query(
+            call.id, "Ya existe una solicitud pendiente para tu cuenta.",
+            show_alert=True,
+        )
+        return None
+
+    item = _payment_request_apply_row(record)
+    if not item:
+        bot.answer_callback_query(
+            call.id,
+            "Supabase guardó la solicitud, pero no pude preparar su panel.",
+            show_alert=True,
+        )
+        return None
+    info = item[1]
+    info["queue_page"] = 0
+    if isinstance(opcion_texto, str) and opcion_texto.strip():
+        # Kept only in process memory for the immediate admin copy action.
+        # The bank details are never written to the request table or list.
+        info["payment_option_data"] = opcion_texto
+
+    bot.answer_callback_query(call.id, "Solicitud guardada.")
+    texto_usuario = mensaje_usuario or (
         "✨ <b>¡SOLICITUD RECIBIDA!</b> ✨\n\n"
         "⏳ Tu solicitud está <b>en proceso</b>.\n\n"
         "Nos comunicaremos contigo en breve con los datos de pago.\n\n"
-        "🙏 <i>Gracias por tu paciencia.</i>",
-        _markup_solicitud_usuario(),
-        message=call.message,
-        protect_content=True,
+        "🙏 <i>Gracias por tu paciencia.</i>"
     )
-
-    texto_admin, markup_admin = _tarjeta_solicitud_pago_admin(
-        user_id,
-        {
-            "metodo": metodo,
-            "username": username,
-            "nombre": nombre,
-            "payment_option_label": opcion_etiqueta,
-        },
-        cantidad_pendientes=len(_solicitudes_pago_pendientes()) + 1,
-    )
-
     try:
-        notif_msg = bot.send_message(
-            int(ADMIN_ID), texto_admin,
-            parse_mode="HTML", reply_markup=markup_admin,
-            _force_new_message=True,
+        mensaje = editar_o_enviar_panel(
+            user_id,
+            texto_usuario,
+            _markup_solicitud_usuario(request_id),
+            message=call.message,
+            protect_content=True,
         )
-        notif_msg_id = notif_msg.message_id
-    except Exception as e:
-        # Intento sin markup si hubo error con los botones
-        try:
-            notif_msg = bot.send_message(
-                int(ADMIN_ID),
-                texto_admin + f"\n\n⚠️ Error al cargar botones: {e}",
-                parse_mode="HTML",
-                _force_new_message=True,
-            )
-            notif_msg_id = notif_msg.message_id
-        except:
-            notif_msg_id = None
+        info["usuario_msg_id"] = mensaje.message_id
+        _payment_request_update_fields(
+            request_id,
+            {
+                "user_message_id": mensaje.message_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as error:
+        app.logger.warning(
+            "Solicitud guardada, pero no se pudo actualizar el panel del usuario "
+            "(error=%s).",
+            type(error).__name__,
+        )
+    _payment_request_send_admin_notification(record)
+    return info
 
-    # Guardar info de la solicitud para poder borrar mensajes después
-    solicitudes_info[user_id] = {
-        'metodo':         metodo,
-        'username':       username,
-        'nombre':         nombre,
-        'payment_option_index': opcion_indice,
-        'payment_option_label': opcion_etiqueta,
-        'payment_option_data': opcion_texto,
-        'created_at':     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        'request_id':     uuid.uuid4().hex,
-        'notif_msg_id':   notif_msg_id,
-        'datos_msg_id':   None,
-        'usuario_chat_id': call.message.chat.id,
-        'usuario_msg_id':  msg_usuario.message_id,
-    }
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pago_"))
+def solicitud_pago(call):
+    _procesar_solicitud_metodo_pago(call, call.data)
+
+
+def _procesar_solicitud_metodo_pago(call, metodo, opcion_indice=None, opcion_etiqueta=None):
+    return _crear_solicitud_pago_durable(
+        call,
+        metodo,
+        opcion_indice=opcion_indice,
+        opcion_etiqueta=opcion_etiqueta,
+    )
 
 # ─── Volver al menú de métodos de pago ───────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data == "volver_metodos_pago")
+@bot.callback_query_handler(
+    func=lambda call: call.data == "volver_metodos_pago"
+    or call.data.startswith("volver_metodos_pago|")
+)
 def volver_metodos(call):
-    bot.answer_callback_query(call.id)
     user_id = call.from_user.id
+    request_id = (
+        call.data.split("|", 1)[1]
+        if "|" in str(call.data)
+        else ""
+    )
+    if not request_id:
+        # Generic navigation links also appear before a request exists. Only
+        # the request-specific button is allowed to cancel a saved request.
+        bot.answer_callback_query(call.id)
+        mostrar_metodos_pago(call.message.chat.id)
+        return
+    try:
+        cancelled = _payment_request_cancel_by_user(user_id, request_id)
+    except Exception:
+        bot.answer_callback_query(
+            call.id,
+            "No pude guardar la cancelación; tu solicitud sigue pendiente.",
+            show_alert=True,
+        )
+        editar_o_enviar_panel(
+            user_id,
+            "⚠️ No pude registrar la cancelación en Supabase. Tu solicitud "
+            "sigue pendiente; vuelve a intentarlo cuando se restablezca la conexión.",
+            _markup_solicitud_usuario(request_id),
+            message=call.message,
+            protect_content=True,
+        )
+        return
+    if not cancelled:
+        bot.answer_callback_query(
+            call.id,
+            "No encontré una solicitud pendiente para cancelar.",
+            show_alert=True,
+        )
+        mostrar_metodos_pago(call.message.chat.id)
+        return
+    bot.answer_callback_query(call.id, "Solicitud cancelada.")
     solicitudes_pendientes.pop(user_id, None)
     solicitudes_info.pop(user_id, None)
     _mostrar_cola_solicitudes_pago(
@@ -11820,15 +12832,26 @@ def volver_metodos(call):
     mostrar_metodos_pago(call.message.chat.id)
 
 # ─── Cancelar solicitud: pedir motivo ────────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data == "cancelar_solicitud")
+@bot.callback_query_handler(
+    func=lambda call: call.data == "cancelar_solicitud"
+    or call.data.startswith("cancelar_solicitud|")
+)
 def cancelar_solicitud_motivo(call):
+    if call.message.chat.type != "private" or int(call.from_user.id) != int(call.message.chat.id):
+        bot.answer_callback_query(call.id, "Abre la solicitud en tu chat privado.")
+        return
     bot.answer_callback_query(call.id)
+    request_id = (
+        call.data.split("|", 1)[1]
+        if "|" in str(call.data)
+        else ""
+    )
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(
         types.InlineKeyboardButton("💳 Método de pago equivocado",
-                                   callback_data="cancel_razon_metodo"),
+                                   callback_data=f"cancel_razon_metodo|{request_id}" if request_id else "cancel_razon_metodo"),
         types.InlineKeyboardButton("🚫 No quiero la suscripción por ahora",
-                                   callback_data="cancel_razon_nosub"),
+                                   callback_data=f"cancel_razon_nosub|{request_id}" if request_id else "cancel_razon_nosub"),
     )
     try:
         bot.edit_message_text(
@@ -11844,18 +12867,48 @@ def cancelar_solicitud_motivo(call):
         )
 
 # ─── Cancelar solicitud: procesar motivo ─────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data in ("cancel_razon_metodo", "cancel_razon_nosub"))
+@bot.callback_query_handler(
+    func=lambda call: call.data.split("|", 1)[0]
+    in ("cancel_razon_metodo", "cancel_razon_nosub")
+)
 def cancelar_solicitud_razon(call):
-    bot.answer_callback_query(call.id)
+    if call.message.chat.type != "private" or int(call.from_user.id) != int(call.message.chat.id):
+        bot.answer_callback_query(call.id, "Abre la solicitud en tu chat privado.")
+        return
     user_id  = call.from_user.id
-    username = call.from_user.username or "sin_usuario"
-    nombre   = call.from_user.first_name or "Usuario"
+    partes = str(call.data).split("|", 1)
+    razon_code = partes[0]
+    request_id = partes[1] if len(partes) > 1 else ""
 
     razon_map = {
         "cancel_razon_metodo": "💳 Método de pago equivocado",
         "cancel_razon_nosub":  "🚫 No quiero la suscripción por ahora",
     }
-    razon = razon_map[call.data]
+    razon = razon_map[razon_code]
+    try:
+        cancelled = _payment_request_cancel_by_user(user_id, request_id)
+    except Exception:
+        bot.answer_callback_query(
+            call.id,
+            "No pude guardar la cancelación; la solicitud sigue pendiente.",
+            show_alert=True,
+        )
+        editar_o_enviar_panel(
+            user_id,
+            "⚠️ No pude registrar la cancelación en Supabase. La solicitud "
+            "sigue pendiente; vuelve a intentarlo más tarde.",
+            _markup_solicitud_usuario(request_id),
+            message=call.message,
+            protect_content=True,
+        )
+        return
+    if not cancelled:
+        bot.answer_callback_query(
+            call.id, "La solicitud ya no está pendiente.", show_alert=True
+        )
+        mostrar_metodos_pago(call.message.chat.id)
+        return
+    bot.answer_callback_query(call.id, "Solicitud cancelada.")
 
     solicitudes_pendientes.pop(user_id, None)
     solicitudes_info.pop(user_id, None)
@@ -11886,14 +12939,28 @@ def admin_crear_enlace_link(call):
     if str(call.from_user.id) != str(ADMIN_ID):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
-    bot.answer_callback_query(call.id)
     partes    = call.data.split("_")
     user_id   = int(partes[1])
     metodo    = "_".join(partes[2:])
+    try:
+        item = _payment_request_load_pending_for_user(user_id)
+    except Exception:
+        item = None
+    info = item[1] if item else solicitudes_info.get(user_id, {})
+    if info.get("metodo") and info.get("metodo") != metodo:
+        bot.answer_callback_query(
+            call.id,
+            "Esta notificación ya no coincide con la solicitud pendiente.",
+            show_alert=True,
+        )
+        return
+    bot.answer_callback_query(call.id)
     admin_estado[call.from_user.id] = {
         "paso":       "esperando_link_pago",
         "user_id_pago": user_id,
         "metodo_link":  metodo,
+        "request_id": info.get("request_id"),
+        "queue_page": info.get("queue_page", 0),
     }
     bot.send_message(
         call.message.chat.id,
@@ -11916,8 +12983,7 @@ def _mostrar_datos_pago_admin(user_id, metodo, indice=0, message=None):
         return editar_o_enviar_panel(
             int(ADMIN_ID),
             f"⚠️ No hay información configurada para {html.escape(nombre_metodo)}. "
-            "Ve a /admin → Métodos de pagos y configuración general → "
-            "Configuración general de /start para actualizarla.",
+            "Revísala en /admin → Métodos de pago antes de copiar o enviar datos.",
             _markup_cola_solicitudes_pago(),
             message=message,
             protect_content=True,
@@ -11942,12 +13008,31 @@ def _mostrar_datos_pago_admin(user_id, metodo, indice=0, message=None):
     except Exception:
         partes_copia = 0
     markup.add(
-        types.InlineKeyboardButton("✅ Aprobado", callback_data=f"adap_{user_id}"),
-        types.InlineKeyboardButton("❌ Rechazado", callback_data=f"adrec_{user_id}"),
+        types.InlineKeyboardButton(
+            "✅ Aprobado",
+            callback_data=(
+                f"adap_{user_id}_{info['request_id']}"
+                if info.get("request_id")
+                else f"adap_{user_id}"
+            ),
+        ),
+        types.InlineKeyboardButton(
+            "❌ Rechazado",
+            callback_data=(
+                f"adrec_{user_id}_{info['request_id']}"
+                if info.get("request_id")
+                else f"adrec_{user_id}"
+            ),
+        ),
+    )
+    back_callback = (
+        f"payreq|open|{info['request_id']}|{max(0, int(info.get('queue_page') or 0))}"
+        if info.get("request_id")
+        else f"admin_payment_request|{user_id}"
     )
     markup.add(types.InlineKeyboardButton(
         "🔙 Volver",
-        callback_data=f"admin_payment_request|{user_id}",
+        callback_data=back_callback,
     ))
     if len(opciones) > 1 and not isinstance(seleccion, int):
         navegacion = []
@@ -12006,7 +13091,12 @@ def admin_cambiar_opcion_datos_pago(call):
     try:
         _, raw_user_id, raw_index = call.data.split("|", 2)
         user_id, indice = int(raw_user_id), int(raw_index)
-        info = solicitudes_info[user_id]
+        info = solicitudes_info.get(user_id)
+        if not info:
+            item = _payment_request_load_pending_for_user(user_id)
+            info = item[1] if item else None
+        if not info:
+            raise KeyError("solicitud no disponible")
         metodo = info["metodo"]
     except (ValueError, KeyError, TypeError):
         bot.answer_callback_query(call.id, "La solicitud ya no está disponible.", show_alert=True)
@@ -12032,6 +13122,19 @@ def admin_ver_datos(call):
     except (IndexError, TypeError, ValueError):
         bot.answer_callback_query(call.id, "No pude identificar la solicitud.")
         return
+    info = solicitudes_info.get(user_id)
+    if not info:
+        try:
+            item = _payment_request_load_pending_for_user(user_id)
+            info = item[1] if item else None
+        except Exception:
+            info = None
+    if not info or info.get("metodo") != metodo:
+        bot.answer_callback_query(
+            call.id, "La solicitud ya no está pendiente o cambió.",
+            show_alert=True,
+        )
+        return
     bot.answer_callback_query(call.id)
     _mostrar_datos_pago_admin(
         user_id,
@@ -12050,7 +13153,12 @@ def admin_volver_solicitud_pago(call):
         return
     try:
         user_id = int(call.data.split("|", 1)[1])
-        info = solicitudes_info[user_id]
+        info = solicitudes_info.get(user_id)
+        if not info:
+            item = _payment_request_load_pending_for_user(user_id)
+            info = item[1] if item else None
+        if not info:
+            raise KeyError("solicitud no disponible")
         metodo = str(info.get("metodo") or "")
         if metodo not in NOMBRE_METODO:
             raise KeyError("solicitud no disponible")
@@ -12101,13 +13209,47 @@ def admin_aprobar(call):
     if str(call.from_user.id) != str(ADMIN_ID):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
-    user_id = int(call.data.split("_")[1])
+    try:
+        partes = call.data.split("_", 2)
+        user_id = int(partes[1])
+        callback_request_id = partes[2] if len(partes) > 2 else ""
+    except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(call.id, "La solicitud no es válida.")
+        return
     info = solicitudes_info.get(user_id)
+    if callback_request_id:
+        if not info or str(info.get("request_id") or "") != callback_request_id:
+            try:
+                item = _payment_request_load_into_memory(callback_request_id)
+                info = item[1] if item else None
+            except Exception:
+                info = None
+        if not info or int(info.get("user_id") or user_id) != user_id:
+            bot.answer_callback_query(
+                call.id,
+                "La solicitud ya no está pendiente o no coincide.",
+                show_alert=True,
+            )
+            return
+    elif not info:
+        try:
+            item = _payment_request_load_pending_for_user(user_id)
+            info = item[1] if item else None
+        except Exception:
+            info = None
+    request_id = str(
+        callback_request_id or (info or {}).get("request_id") or ""
+    )
     if not info:
         bot.answer_callback_query(
             call.id,
             "La solicitud ya no está disponible. Pide al usuario que vuelva a solicitar acceso.",
             show_alert=True,
+        )
+        return
+    if request_id and str(info.get("request_id") or "") != request_id:
+        bot.answer_callback_query(
+            call.id, "Esta tarjeta pertenece a otra solicitud.", show_alert=True
         )
         return
     comprobante = COMPROBANTES_PENDIENTES.get(Query().id == user_id)
@@ -12126,7 +13268,7 @@ def admin_aprobar(call):
         admin_estado[call.from_user.id] = {
             "paso": "esperando_comprobante_aprobacion",
             "user_id_comprobante": user_id,
-            "request_id": info.get("request_id"),
+            "request_id": request_id or info.get("request_id"),
         }
         markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton(
             "Cancelar",
@@ -12143,32 +13285,64 @@ def admin_aprobar(call):
         )
         return
 
+    if request_id:
+        try:
+            resolved = _payment_request_resolve(request_id, "approved")
+        except Exception:
+            resolved = None
+        if not resolved:
+            bot.answer_callback_query(
+                call.id,
+                "Supabase no confirmó la aprobación; la solicitud sigue pendiente.",
+                show_alert=True,
+            )
+            return
     bot.answer_callback_query(call.id)
     info = solicitudes_info.pop(user_id, {})
+    solicitudes_pendientes.pop(user_id, None)
 
-    # Registrar suscripción VIP (30 días). El usuario confirma el acceso en
-    # el bot y después recibe el enlace de invitación del canal.
-    vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-    username = info.get('username', '')
-    if username == 'sin_usuario':
-        username = ''
-    registro_nuevo = _nuevo_registro_suscripcion_pagada(
-        user_id,
-        vencimiento,
-        username,
-    )
-    db.upsert(registro_nuevo, Query().id == user_id)
-    _guardar_archivo_suscripcion(
-        registro_nuevo,
-        comprobante={
-            "file_id": info.get("comprobante_file_id"),
-            "file_type": info.get("comprobante_tipo", "photo"),
-            "received_at": info.get("comprobante_fecha"),
-        },
-        metodo=info.get("metodo"),
-    )
-    with SUSCRIPCIONES_LOCK:
-        COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
+    try:
+        # Registrar suscripción VIP (30 días). El usuario confirma el acceso
+        # en el bot y después recibe el enlace individual del canal.
+        vencimiento = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+        username = info.get('username', '')
+        if username == 'sin_usuario':
+            username = ''
+        registro_nuevo = _nuevo_registro_suscripcion_pagada(
+            user_id,
+            vencimiento,
+            username,
+        )
+        db.upsert(registro_nuevo, Query().id == user_id)
+        _guardar_archivo_suscripcion(
+            registro_nuevo,
+            comprobante={
+                "file_id": info.get("comprobante_file_id"),
+                "file_type": info.get("comprobante_tipo", "photo"),
+                "received_at": info.get("comprobante_fecha"),
+            },
+            metodo=info.get("metodo"),
+        )
+        with SUSCRIPCIONES_LOCK:
+            COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
+    except Exception as error:
+        solicitudes_info[user_id] = info
+        if request_id:
+            try:
+                _payment_request_reopen_after_failed_approval(request_id)
+            except Exception:
+                app.logger.exception(
+                    "No se pudo devolver a pendiente una solicitud tras fallar la aprobación."
+                )
+        app.logger.exception("No se pudo completar la aprobación de pago.")
+        bot.send_message(
+            int(ADMIN_ID),
+            "⚠️ No pude completar la aprobación; la solicitud continúa en la "
+            "bandeja para reintentar. Revisa el estado de suscripción antes "
+            "de volver a aprobarla.",
+            protect_content=True,
+        )
+        return
 
     user_chat_id = info.get("usuario_chat_id") or user_id
     try:
@@ -12208,10 +13382,51 @@ def admin_rechazar_datos(call):
     if str(call.from_user.id) != str(ADMIN_ID):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
+    try:
+        partes = call.data.split("_", 2)
+        user_id = int(partes[1])
+        callback_request_id = partes[2] if len(partes) > 2 else ""
+    except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(call.id, "La solicitud no es válida.")
+        return
+    info = solicitudes_info.get(user_id)
+    if callback_request_id and (
+        not info or str(info.get("request_id") or "") != callback_request_id
+    ):
+        try:
+            item = _payment_request_load_into_memory(callback_request_id)
+            info = item[1] if item else None
+        except Exception:
+            info = None
+    elif not info:
+        try:
+            item = _payment_request_load_pending_for_user(user_id)
+            info = item[1] if item else None
+        except Exception:
+            info = None
+    request_id = str(
+        callback_request_id or (info or {}).get("request_id") or ""
+    )
+    if not info:
+        bot.answer_callback_query(
+            call.id, "La solicitud ya no está pendiente.", show_alert=True
+        )
+        return
+    if request_id:
+        try:
+            resolved = _payment_request_resolve(request_id, "rejected")
+        except Exception:
+            resolved = None
+        if not resolved:
+            bot.answer_callback_query(
+                call.id,
+                "Supabase no confirmó el rechazo; la solicitud sigue pendiente.",
+                show_alert=True,
+            )
+            return
     bot.answer_callback_query(call.id)
-
-    user_id = int(call.data.split("_")[1])
-    info    = solicitudes_info.pop(user_id, {})
+    info = solicitudes_info.pop(user_id, info)
+    solicitudes_pendientes.pop(user_id, None)
     with SUSCRIPCIONES_LOCK:
         COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
 
@@ -12241,9 +13456,38 @@ def admin_rechazar_notif(call):
     if str(call.from_user.id) != str(ADMIN_ID):
         bot.answer_callback_query(call.id, "⛔ Sin permiso.")
         return
-    bot.answer_callback_query(call.id)
-    user_id = int(call.data.split("_")[2])
+    try:
+        user_id = int(call.data.split("_", 2)[2])
+    except (IndexError, TypeError, ValueError):
+        bot.answer_callback_query(call.id, "La solicitud no es válida.")
+        return
+    info = solicitudes_info.get(user_id)
+    if not info:
+        try:
+            item = _payment_request_load_pending_for_user(user_id)
+            info = item[1] if item else None
+        except Exception:
+            info = None
+    if not info:
+        bot.answer_callback_query(
+            call.id, "La solicitud ya no está pendiente.", show_alert=True
+        )
+        return
+    if info and info.get("request_id"):
+        try:
+            resolved = _payment_request_resolve(info["request_id"], "rejected")
+        except Exception:
+            resolved = None
+        if not resolved:
+            bot.answer_callback_query(
+                call.id,
+                "Supabase no confirmó el rechazo; la solicitud sigue pendiente.",
+                show_alert=True,
+            )
+            return
+    bot.answer_callback_query(call.id, "Solicitud rechazada.")
     solicitudes_info.pop(user_id, None)
+    solicitudes_pendientes.pop(user_id, None)
     with SUSCRIPCIONES_LOCK:
         COMPROBANTES_PENDIENTES.remove(Query().id == user_id)
     try:
@@ -14266,10 +15510,26 @@ def mostrar_seccion_control_grupo(
                 f"• {user_label} · {media_count} archivo(s) · {when}\n"
                 f"  {description or 'Sin descripción'}"
             )
-            markup.add(types.InlineKeyboardButton(
-                f"👁️ Revisar SFS #{row.doc_id}",
-                callback_data=f"sfs|review|{row.doc_id}",
-            ))
+            markup.row(
+                types.InlineKeyboardButton(
+                    f"👁️ Vista previa #{row.doc_id}",
+                    callback_data=_sfs_admin_callback_data(
+                        "review", row.doc_id, dest_key, page, "list"
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    "✅ Aprobar",
+                    callback_data=_sfs_admin_callback_data(
+                        "approve", row.doc_id, dest_key, page, "list"
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    "❌ Rechazar",
+                    callback_data=_sfs_admin_callback_data(
+                        "reject", row.doc_id, dest_key, page, "list"
+                    ),
+                ),
+            )
         else:
             kind = row.get("kind")
             if kind == "promocion":
@@ -15669,37 +16929,28 @@ def cb_mod_ver_publicacion(c):
         media_type = str(registro.get("type") or "")
         date = str(registro.get("date") or "fecha no registrada")
     saved_media_items = registro.get("media_items") or []
-    if (
-        record_kind == "p"
-        and len(saved_media_items) > 1
-        and len(saved_media_items) <= SFS_MAX_MEDIA
-    ):
+    if record_kind == "p" and len(saved_media_items) > 1:
         try:
-            album = []
-            for index, item in enumerate(saved_media_items):
-                caption = f"Publicación aprobada · {date}" if index == 0 else None
-                if item.get("media_type") == "photo":
-                    album.append(types.InputMediaPhoto(item["media_id"], caption=caption))
-                elif item.get("media_type") == "video":
-                    album.append(types.InputMediaVideo(item["media_id"], caption=caption))
-            if len(album) == len(saved_media_items):
-                bot.send_media_group(
-                    c.message.chat.id, album, protect_content=True
-                )
-                preview_markup = _markup_botones_publicacion(
-                    registro.get("buttons") or []
-                ) or types.InlineKeyboardMarkup()
-                for row in back_markup.keyboard:
-                    preview_markup.keyboard.append(row)
-                bot.send_message(
-                    c.message.chat.id,
-                    f"Publicación de @{username}\n\n{body[:3800]}",
-                    reply_markup=preview_markup,
-                    parse_mode=None,
-                    protect_content=True,
-                )
-                bot.answer_callback_query(c.id)
-                return
+            _sfs_send_media_batches(
+                c.message.chat.id,
+                saved_media_items,
+                first_caption=f"Publicación aprobada · {date}",
+                protect_content=True,
+            )
+            preview_markup = _markup_botones_publicacion(
+                registro.get("buttons") or []
+            ) or types.InlineKeyboardMarkup()
+            for row in back_markup.keyboard:
+                preview_markup.keyboard.append(row)
+            bot.send_message(
+                c.message.chat.id,
+                f"Publicación de @{username}\n\n{body[:3800]}",
+                reply_markup=preview_markup,
+                parse_mode=None,
+                protect_content=True,
+            )
+            bot.answer_callback_query(c.id)
+            return
         except Exception:
             app.logger.exception("No se pudo mostrar el álbum SFS archivado.")
     if registro.get("file_id") and media_type in ("photo", "video"):
@@ -17503,7 +18754,43 @@ def flujo_admin_pago(message):
         if not text.startswith("https://"):
 
             eliminar_mensaje_seguro(message.chat.id,message.message_id); bot.send_message(message.chat.id,"El enlace debe comenzar con https://. Inténtalo de nuevo.",protect_content=True); return
-        target=state.get("user_id_pago"); method=state.get("metodo_link","pago_usa_link"); admin_estado.pop(message.from_user.id,None); eliminar_mensaje_seguro(message.chat.id,message.message_id)
+        target=state.get("user_id_pago")
+        method=state.get("metodo_link","pago_usa_link")
+        request_id=str(state.get("request_id") or "")
+        info=solicitudes_info.get(target)
+        if request_id and (
+            not info or str(info.get("request_id") or "") != request_id
+        ):
+            try:
+                item=_payment_request_load_into_memory(request_id)
+                info=item[1] if item else None
+            except Exception as error:
+                eliminar_mensaje_seguro(message.chat.id,message.message_id)
+                bot.send_message(
+                    int(ADMIN_ID),
+                    "⚠️ No pude confirmar en Supabase que esta solicitud siga "
+                    "pendiente. No envié el enlace de pago; vuelve a abrirla "
+                    "desde la bandeja cuando se restablezca la conexión.",
+                    protect_content=True,
+                )
+                app.logger.warning(
+                    "No se pudo revalidar la solicitud de enlace de pago "
+                    "(error=%s).",
+                    type(error).__name__,
+                )
+                return
+            if not info:
+                eliminar_mensaje_seguro(message.chat.id,message.message_id)
+                bot.send_message(
+                    int(ADMIN_ID),
+                    "ℹ️ Esta solicitud ya no está pendiente. No envié el enlace.",
+                    protect_content=True,
+                )
+                return
+        if info and info.get("request_id"):
+            request_id=str(info["request_id"])
+        admin_estado.pop(message.from_user.id,None)
+        eliminar_mensaje_seguro(message.chat.id,message.message_id)
         markup=types.InlineKeyboardMarkup(row_width=2)
         datos_pago = texto_pago_con_aviso(text)
         partes_copia = 0
@@ -17511,8 +18798,20 @@ def flujo_admin_pago(message):
             partes_copia = agregar_botones_copiar(markup, datos_pago, "📋 Copiar enlace")
         except Exception: pass
         markup.add(
-            types.InlineKeyboardButton("✅ Aprobado",callback_data=f"adap_{target}"),
-            types.InlineKeyboardButton("❌ Rechazado",callback_data=f"adrec_{target}"),
+            types.InlineKeyboardButton(
+                "✅ Aprobado",
+                callback_data=(
+                    f"adap_{target}_{request_id}"
+                    if request_id else f"adap_{target}"
+                ),
+            ),
+            types.InlineKeyboardButton(
+                "❌ Rechazado",
+                callback_data=(
+                    f"adrec_{target}_{request_id}"
+                    if request_id else f"adrec_{target}"
+                ),
+            ),
         )
         aviso_copia = (
             "\n\n<i>El texto excede el límite de copia de Telegram; "
@@ -17520,8 +18819,18 @@ def flujo_admin_pago(message):
             if partes_copia > 1
             else ""
         )
-        msg=bot.send_message(int(ADMIN_ID),f"🔗 <b>PAGO POR LINK</b>\n\n{html.escape(datos_pago)}{aviso_copia}",parse_mode="HTML",reply_markup=markup,protect_content=True)
-        info=solicitudes_info.setdefault(target,{"metodo":method,"username":"sin_usuario","notif_msg_id":None})
+        msg=bot.send_message(
+            int(ADMIN_ID),
+            f"🔗 <b>PAGO POR LINK</b>\n\n{html.escape(datos_pago)}{aviso_copia}",
+            parse_mode="HTML",
+            reply_markup=markup,
+            protect_content=True,
+        )
+        info=solicitudes_info.setdefault(
+            target,{"metodo":method,"username":"sin_usuario","notif_msg_id":None}
+        )
+        if request_id:
+            info["request_id"]=request_id
         info["datos_msg_id"]=msg.message_id
 
 @bot.message_handler(func=lambda m: m.chat.type=="private", content_types=["photo"])
@@ -17551,6 +18860,25 @@ def recibir_foto_pago(message):
         return
 
     info = solicitudes_info.get(uid)
+    if not info:
+        try:
+            item = _payment_request_load_pending_for_user(uid)
+            info = item[1] if item else None
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo consultar la solicitud pendiente al recibir un comprobante "
+                "(error=%s).",
+                type(error).__name__,
+            )
+            eliminar_mensaje_disparador(message)
+            bot.send_message(
+                message.chat.id,
+                "⚠️ No pude confirmar tu solicitud de pago en este momento. "
+                "No asocié el comprobante; inténtalo de nuevo cuando el bot "
+                "recupere la conexión.",
+                protect_content=True,
+            )
+            return
     if not info and _sfs_pending_for_user(uid):
         eliminar_mensaje_disparador(message)
         bot.send_message(
@@ -17586,7 +18914,15 @@ def recibir_foto_pago(message):
             else ""
         )
         markup_admin = types.InlineKeyboardMarkup(row_width=1)
-        if info and info.get("metodo"):
+        if info and info.get("request_id"):
+            markup_admin.add(types.InlineKeyboardButton(
+                "📋 Revisar solicitud",
+                callback_data=(
+                    f"payreq|copy|{info['request_id']}|"
+                    f"{max(0, int(info.get('queue_page') or 0))}"
+                ),
+            ))
+        elif info and info.get("metodo"):
             markup_admin.add(types.InlineKeyboardButton(
                 "📋 Revisar datos y comprobante",
                 callback_data=f"ac_{uid}_{info['metodo']}",
@@ -17629,6 +18965,21 @@ def procesar_comprobante_admin(message, file_id, file_type):
             bot.send_message(message.chat.id, "No pude identificar la solicitud a la que pertenece la captura.")
             return
         info = solicitudes_info.get(user_id)
+        request_id = str(estado.get("request_id") or "")
+        if request_id and (
+            not info or str(info.get("request_id") or "") != request_id
+        ):
+            try:
+                item = _payment_request_load_into_memory(request_id)
+                info = item[1] if item else None
+            except Exception:
+                info = None
+        elif not info:
+            try:
+                item = _payment_request_load_pending_for_user(user_id)
+                info = item[1] if item else None
+            except Exception:
+                info = None
         if not info:
             admin_estado.pop(message.from_user.id, None)
             eliminar_mensaje_disparador(message)
@@ -17661,9 +19012,22 @@ def procesar_comprobante_admin(message, file_id, file_type):
         admin_estado.pop(message.from_user.id, None)
         eliminar_mensaje_disparador(message)
         markup = types.InlineKeyboardMarkup(row_width=2)
+        request_id = str(info.get("request_id") or "")
         markup.add(
-            types.InlineKeyboardButton("✅ Aprobar acceso", callback_data=f"adap_{user_id}"),
-            types.InlineKeyboardButton("❌ Rechazar", callback_data=f"adrec_{user_id}"),
+            types.InlineKeyboardButton(
+                "✅ Aprobar acceso",
+                callback_data=(
+                    f"adap_{user_id}_{request_id}"
+                    if request_id else f"adap_{user_id}"
+                ),
+            ),
+            types.InlineKeyboardButton(
+                "❌ Rechazar",
+                callback_data=(
+                    f"adrec_{user_id}_{request_id}"
+                    if request_id else f"adrec_{user_id}"
+                ),
+            ),
         )
         caption = (
             "🧾 <b>Comprobante archivado para revisión</b>\n"
@@ -18380,10 +19744,10 @@ def _iniciar_sfs(chat_id, user_id, group_id, from_user=None):
     if status == "awaiting_description":
         media_count = len(record.get("media_items") or [])
         texto = (
-            f"📢 Enviar SFS · {media_count}/{SFS_MAX_MEDIA} archivos\n\n"
-            "Ya recibí tu foto o video. Puedes enviar ahora una descripción "
-            "adicional con tus enlaces y luego tocar «Enviar SFS a revisión». "
-            "Si el pie de foto ya está completo, toca ese botón directamente.\n\n"
+            f"📢 Enviar SFS · {media_count} archivos recibidos\n\n"
+            "Puedes seguir enviando fotos o videos, o añadir una descripción "
+            "con tus enlaces y tocar «Enviar SFS a revisión». Si ya terminaste, "
+            "toca ese botón directamente.\n\n"
             f"El texto final admite hasta {SFS_MAX_DESCRIPTION_CHARS} caracteres. "
             "Tu envío solo se publica si el administrador lo aprueba."
         )
@@ -18400,9 +19764,10 @@ def _iniciar_sfs(chat_id, user_id, group_id, from_user=None):
 
     texto = (
         "📢 Enviar SFS al grupo\n\n"
-        f"Envía de 1 a {SFS_MAX_MEDIA} fotos o videos. Puedes mandarlos juntos "
-        "como álbum o de uno en uno. Añade un pie de foto o, después de enviar "
-        "el multimedia, manda una descripción y sus enlaces.\n\n"
+        "Envía tantas fotos o videos como necesites, juntos por tandas "
+        "(Telegram admite hasta 10 archivos por álbum) o de uno en uno. "
+        "Añade un pie de foto o, después del multimedia, manda una descripción "
+        "y sus enlaces.\n\n"
         "El SFS quedará pendiente y no aparecerá en el grupo hasta que el "
         "administrador lo revise y apruebe. Los mensajes que envíes aquí se "
         "borrarán cuando Telegram lo permita. Si nunca abriste este bot, "
@@ -18556,7 +19921,7 @@ def _sfs_show_description_step(record, aviso=None):
     doc_id = record.doc_id
     media_count = len(record.get("media_items") or [])
     texto = (
-        f"📢 SFS listo para completar · {media_count}/{SFS_MAX_MEDIA} archivos\n\n"
+        f"📢 SFS listo para completar · {media_count} archivos recibidos\n\n"
         "Puedes enviar una descripción adicional con enlaces o tocar "
         "«Enviar SFS a revisión» si el pie de foto ya está completo. "
         "El administrador verá el contenido antes de decidir.\n\n"
@@ -18565,11 +19930,6 @@ def _sfs_show_description_step(record, aviso=None):
     if record.get("description"):
         texto += "\n\nTexto recibido:\n" + (
             str(record.get("description"))[:700]
-        )
-    if record.get("media_limit_reached"):
-        texto += (
-            f"\n\nSe incluyeron solo los primeros {SFS_MAX_MEDIA} archivos; "
-            "los adicionales se omitieron."
         )
     if aviso:
         texto = f"⚠️ {str(aviso)}\n\n{texto}"
@@ -18593,18 +19953,6 @@ def _sfs_store_media_locked(message, record):
     current_items = list(record.get("media_items") or [])
     message_ids = list(record.get("media_message_ids") or [])
     if str(message.message_id) in {str(item) for item in message_ids}:
-        return True
-    if len(current_items) >= SFS_MAX_MEDIA:
-        _sfs_update(doc_id, {"media_limit_reached": True})
-        _sfs_delete_user_message(message)
-        if media_group_id and record.get("status") == "collecting_album":
-            _sfs_schedule_album_finish(doc_id)
-        else:
-            _sfs_show_description_step(
-                _sfs_get(doc_id),
-                f"Un SFS admite hasta {SFS_MAX_MEDIA} archivos. "
-                "Los archivos adicionales se omitieron.",
-            )
         return True
     if current_items and media_group_id:
         current_group = record.get("media_group_id")
@@ -18715,20 +20063,60 @@ def _sfs_handle_member_message(message):
     return True
 
 
-def _sfs_markup_admin(record):
-    markup = types.InlineKeyboardMarkup(row_width=1)
+def _sfs_admin_callback_data(
+    action, doc_id, dest_key=None, page=0, origin="card"
+):
+    try:
+        page = max(0, int(page))
+    except (TypeError, ValueError):
+        page = 0
+    return (
+        f"sfs|{action}|{int(doc_id)}|{dest_key or '-'}|{page}|{origin}"
+    )
+
+
+def _sfs_resolve_admin_dest_key(record, preferred=None):
+    group_id = str(record.get("group_id") or "")
+    if preferred and preferred != "-":
+        destino = _destino_por_key(preferred)
+        if destino and str(destino.get("chat_id")) == group_id:
+            return preferred
+        return None
+    return _destino_key_por_chat_id(group_id)
+
+
+def _sfs_markup_admin(record, dest_key=None, page=0, origin="card"):
+    doc_id = int(record.doc_id)
+    markup = types.InlineKeyboardMarkup(row_width=2)
     for button in _validar_botones_publicacion(record.get("buttons") or []):
         markup.add(types.InlineKeyboardButton(button["texto"], url=button["url"]))
-    markup.add(
+    markup.add(types.InlineKeyboardButton(
+        "👁️ Vista previa",
+        callback_data=_sfs_admin_callback_data(
+            "preview", doc_id, dest_key, page, origin
+        ),
+    ))
+    markup.row(
         types.InlineKeyboardButton(
             "✅ Aprobar y publicar",
-            callback_data=f"sfs|approve|{int(record.doc_id)}",
+            callback_data=_sfs_admin_callback_data(
+                "approve", doc_id, dest_key, page, origin
+            ),
         ),
         types.InlineKeyboardButton(
             "❌ Rechazar",
-            callback_data=f"sfs|reject|{int(record.doc_id)}",
+            callback_data=_sfs_admin_callback_data(
+                "reject", doc_id, dest_key, page, origin
+            ),
         ),
     )
+    if dest_key:
+        markup.add(types.InlineKeyboardButton(
+            "🔙 Volver a la lista",
+            callback_data=_sfs_admin_callback_data(
+                "back", doc_id, dest_key, page, origin
+            ),
+        ))
     return markup
 
 
@@ -18741,79 +20129,209 @@ def _sfs_admin_header(record):
     )
 
 
-def _sfs_send_admin_preview(doc_id):
+def _sfs_send_media_batches(
+    chat_id, items, first_caption=None, protect_content=True,
+    sent_messages=None,
+):
+    """Send any number of SFS media items in Telegram-compatible batches."""
+    sent_messages = sent_messages if sent_messages is not None else []
+    if not items:
+        return sent_messages
+
+    for start in range(0, len(items), TELEGRAM_MEDIA_GROUP_MAX):
+        batch = items[start:start + TELEGRAM_MEDIA_GROUP_MAX]
+        caption = first_caption if start == 0 else None
+        if len(batch) == 1:
+            item = batch[0]
+            media_type = item.get("media_type")
+            media_id = item.get("media_id")
+            if media_type == "photo":
+                sent = bot.send_photo(
+                    chat_id, media_id, caption=caption,
+                    parse_mode=None, protect_content=protect_content,
+                )
+            elif media_type == "video":
+                sent = bot.send_video(
+                    chat_id, media_id, caption=caption,
+                    parse_mode=None, protect_content=protect_content,
+                )
+            else:
+                raise ValueError("El SFS contiene un tipo de archivo no permitido.")
+            sent_messages.append(sent)
+            continue
+
+        album = []
+        for index, item in enumerate(batch):
+            item_caption = caption if index == 0 else None
+            media_type = item.get("media_type")
+            media_id = item.get("media_id")
+            if media_type == "photo":
+                album.append(types.InputMediaPhoto(media_id, caption=item_caption))
+            elif media_type == "video":
+                album.append(types.InputMediaVideo(media_id, caption=item_caption))
+            else:
+                raise ValueError("El SFS contiene un tipo de archivo no permitido.")
+        sent_messages.extend(bot.send_media_group(
+            chat_id, album, protect_content=protect_content
+        ))
+    return sent_messages
+
+
+def _sfs_delete_admin_preview_media(record):
+    message_ids = record.get("admin_media_message_ids") or []
+    for message_id in message_ids:
+        try:
+            bot.delete_message(int(ADMIN_ID), int(message_id))
+        except Exception:
+            app.logger.debug("No se pudo limpiar una vista previa SFS anterior.")
+    _sfs_update(record.doc_id, {"admin_media_message_ids": []})
+
+
+def _sfs_send_admin_media_preview(record):
+    items = record.get("media_items") or []
+    if not items:
+        raise ValueError("El SFS no contiene archivos para mostrar.")
+    sent_media_messages = []
+    try:
+        _sfs_send_media_batches(
+            int(ADMIN_ID),
+            items,
+            first_caption=_sfs_admin_header(record),
+            protect_content=True,
+            sent_messages=sent_media_messages,
+        )
+    except Exception:
+        for sent in sent_media_messages:
+            try:
+                bot.delete_message(int(ADMIN_ID), sent.message_id)
+            except Exception:
+                app.logger.debug("No se pudo retirar una vista previa SFS parcial.")
+        raise
+    media_message_ids = [sent.message_id for sent in sent_media_messages]
+    _sfs_update(record.doc_id, {
+        "admin_chat_id": str(ADMIN_ID),
+        "admin_media_message_ids": media_message_ids,
+    })
+    return media_message_ids
+
+
+def _sfs_send_admin_preview(
+    doc_id, dest_key=None, page=0, origin="card", message=None
+):
     record = _sfs_get(doc_id)
     if not record or record.get("status") != "pending_review":
         return False
-    items = record.get("media_items") or []
-    if not items or len(items) > SFS_MAX_MEDIA:
-        return False
-    description = str(record.get("description") or "")
-    markup = _sfs_markup_admin(record)
-    header = _sfs_admin_header(record)
-    admin_message_id = None
+    resolved_dest_key = _sfs_resolve_admin_dest_key(record, dest_key)
     media_message_ids = []
-    if len(items) > 1:
-        album = []
-        for index, item in enumerate(items):
-            media_type = item.get("media_type")
-            media_id = item.get("media_id")
-            caption = header if index == 0 else None
-            if media_type == "photo":
-                album.append(types.InputMediaPhoto(media_id, caption=caption))
-            elif media_type == "video":
-                album.append(types.InputMediaVideo(media_id, caption=caption))
-            else:
-                raise ValueError("El SFS contiene un tipo de archivo no permitido.")
-        sent_album = bot.send_media_group(
-            int(ADMIN_ID), album, protect_content=True
+    try:
+        media_message_ids = _sfs_send_admin_media_preview(record)
+        description = str(record.get("description") or "Sin descripción")
+        detail = f"{_sfs_admin_header(record)}\n\n{description}"
+        markup = _sfs_markup_admin(
+            record, resolved_dest_key, page=page, origin=origin
         )
-        media_message_ids = [item.message_id for item in sent_album]
-        detail = f"{header}\n\n{description or 'Sin descripción'}"
-        detail_message = bot.send_message(
-            int(ADMIN_ID),
-            detail,
-            reply_markup=markup,
-            parse_mode=None,
-            protect_content=True,
-        )
-        admin_message_id = detail_message.message_id
-    else:
-        item = items[0]
-        use_caption = len(header) + len(description) + 2 <= 950
-        caption = f"{header}\n\n{description}" if use_caption else header
-        kwargs = {
-            "chat_id": int(ADMIN_ID),
-            "photo" if item["media_type"] == "photo" else "video": item["media_id"],
-            "caption": caption,
-            "parse_mode": None,
-            "protect_content": True,
-        }
-        if use_caption:
-            kwargs["reply_markup"] = markup
-        sent = (
-            bot.send_photo(**kwargs)
-            if item["media_type"] == "photo"
-            else bot.send_video(**kwargs)
-        )
-        media_message_ids = [sent.message_id]
-        admin_message_id = sent.message_id
-        if not use_caption:
+        if message:
+            try:
+                detail_message = editar_o_enviar_panel(
+                    int(ADMIN_ID),
+                    detail,
+                    markup,
+                    message=message,
+                    protect_content=True,
+                    forzar_texto=True,
+                )
+            except Exception:
+                detail_message = bot.send_message(
+                    int(ADMIN_ID),
+                    detail,
+                    reply_markup=markup,
+                    parse_mode=None,
+                    protect_content=True,
+                )
+        else:
             detail_message = bot.send_message(
                 int(ADMIN_ID),
-                f"{header}\n\n{description or 'Sin descripción'}",
+                detail,
                 reply_markup=markup,
                 parse_mode=None,
                 protect_content=True,
             )
-            admin_message_id = detail_message.message_id
-    _sfs_update(doc_id, {
-        "admin_chat_id": str(ADMIN_ID),
-        "admin_message_id": admin_message_id,
-        "admin_media_message_ids": media_message_ids,
-        "admin_notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    return True
+        _sfs_update(record.doc_id, {
+            "admin_chat_id": str(ADMIN_ID),
+            "admin_message_id": detail_message.message_id,
+            "admin_media_message_ids": media_message_ids,
+            "admin_notified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "admin_preview_error": None,
+        })
+        return True
+    except Exception:
+        for message_id in media_message_ids:
+            try:
+                bot.delete_message(int(ADMIN_ID), message_id)
+            except Exception:
+                app.logger.debug("No se pudo retirar una vista previa SFS incompleta.")
+        raise
+
+
+def _sfs_send_admin_review_notification(
+    doc_id, dest_key=None, page=0, origin="card", message=None
+):
+    record = _sfs_get(doc_id)
+    if not record or record.get("status") != "pending_review":
+        return False
+    resolved_dest_key = _sfs_resolve_admin_dest_key(record, dest_key)
+    try:
+        return _sfs_send_admin_preview(
+            doc_id,
+            dest_key=resolved_dest_key,
+            page=page,
+            origin=origin,
+            message=message,
+        )
+    except Exception as error:
+        app.logger.warning(
+            "No se pudo cargar la vista previa SFS al administrador (error=%s).",
+            type(error).__name__,
+        )
+        try:
+            detail = (
+                f"⚠️ La solicitud SFS #{record.doc_id} sigue pendiente, "
+                "pero Telegram no permitió cargar toda la vista previa.\n"
+                "Puedes volver a intentarlo con «Vista previa» o revisarla "
+                "desde la lista del grupo.\n\n"
+                f"{_sfs_admin_header(record)}\n\n"
+                f"{str(record.get('description') or 'Sin descripción')}"
+            )
+            markup = _sfs_markup_admin(
+                record, resolved_dest_key, page=page, origin=origin
+            )
+            if message:
+                panel = editar_o_enviar_panel(
+                    int(ADMIN_ID),
+                    detail,
+                    markup,
+                    message=message,
+                    protect_content=True,
+                    forzar_texto=True,
+                )
+            else:
+                panel = bot.send_message(
+                    int(ADMIN_ID),
+                    detail,
+                    reply_markup=markup,
+                    parse_mode=None,
+                    protect_content=True,
+                )
+            _sfs_update(record.doc_id, {
+                "admin_chat_id": str(ADMIN_ID),
+                "admin_message_id": panel.message_id,
+                "admin_preview_error": type(error).__name__,
+            })
+        except Exception:
+            app.logger.exception(
+                "No se pudo enviar la tarjeta de respaldo del SFS al administrador."
+            )
+        return False
 
 
 def _sfs_publish_to_group(record):
@@ -18824,7 +20342,7 @@ def _sfs_publish_to_group(record):
     if not description or len(description) > SFS_MAX_DESCRIPTION_CHARS:
         raise ValueError("La descripción está vacía o excede el límite permitido.")
     items = record.get("media_items") or []
-    if not items or len(items) > SFS_MAX_MEDIA:
+    if not items:
         raise ValueError("El SFS no contiene multimedia válida.")
     markup = _markup_botones_publicacion(record.get("buttons") or [])
     sent_messages = []
@@ -18858,18 +20376,13 @@ def _sfs_publish_to_group(record):
                 # The caption itself is the complete public SFS when no links exist.
                 pass
         else:
-            album = []
-            for index, item in enumerate(items):
-                caption = "📢 SFS aprobado" if index == 0 else None
-                if item.get("media_type") == "photo":
-                    album.append(types.InputMediaPhoto(item["media_id"], caption=caption))
-                elif item.get("media_type") == "video":
-                    album.append(types.InputMediaVideo(item["media_id"], caption=caption))
-                else:
-                    raise ValueError("El SFS contiene un tipo de archivo no permitido.")
-            sent_messages.extend(bot.send_media_group(
-                group_id, album, protect_content=True
-            ))
+            _sfs_send_media_batches(
+                group_id,
+                items,
+                first_caption="📢 SFS aprobado",
+                protect_content=True,
+                sent_messages=sent_messages,
+            )
             sent_messages.append(bot.send_message(
                 group_id,
                 description,
@@ -18889,7 +20402,21 @@ def _sfs_publish_to_group(record):
     return sent_messages
 
 
-def _sfs_set_preview_status(call, text):
+def _sfs_back_markup(record, dest_key=None, page=0):
+    dest_key = _sfs_resolve_admin_dest_key(record, dest_key)
+    if not dest_key:
+        return None
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "🔙 Volver a la lista",
+        callback_data=_sfs_admin_callback_data(
+            "back", record.doc_id, dest_key, page, "card"
+        ),
+    ))
+    return markup
+
+
+def _sfs_set_preview_status(call, text, reply_markup=None):
     try:
         if call.message.content_type == "text":
             bot.edit_message_text(
@@ -18897,7 +20424,7 @@ def _sfs_set_preview_status(call, text):
                 call.message.chat.id,
                 call.message.message_id,
                 parse_mode=None,
-                reply_markup=None,
+                reply_markup=reply_markup,
             )
         else:
             bot.edit_message_caption(
@@ -18905,7 +20432,7 @@ def _sfs_set_preview_status(call, text):
                 call.message.chat.id,
                 call.message.message_id,
                 parse_mode=None,
-                reply_markup=None,
+                reply_markup=reply_markup,
             )
     except Exception:
         app.logger.debug("No se pudo actualizar la vista previa SFS.")
@@ -18913,8 +20440,11 @@ def _sfs_set_preview_status(call, text):
 
 def _procesar_callback_sfs(call):
     try:
-        _, accion, doc_id = call.data.split("|", 2)
-        doc_id = int(doc_id)
+        partes = str(call.data).split("|")
+        if len(partes) < 3 or partes[0] != "sfs":
+            raise ValueError("callback")
+        accion = partes[1]
+        doc_id = int(partes[2])
     except (TypeError, ValueError):
         bot.answer_callback_query(call.id, "La solicitud SFS no es válida.")
         return
@@ -18991,35 +20521,87 @@ def _procesar_callback_sfs(call):
             "✅ Tu SFS quedó pendiente de revisión. Solo se publicará en el grupo "
             "si el administrador lo aprueba.",
         )
-        try:
-            _sfs_send_admin_preview(doc_id)
-        except Exception as error:
-            app.logger.warning(
-                "No se pudo enviar la vista previa SFS al administrador (error=%s).",
-                type(error).__name__,
-            )
+        _sfs_send_admin_review_notification(doc_id)
         return
 
     if not es_admin_privado(call):
         bot.answer_callback_query(call.id, "Solo el administrador puede revisar SFS.")
         return
+
+    raw_dest_key = partes[3] if len(partes) > 3 else None
+    try:
+        page = max(0, int(partes[4])) if len(partes) > 4 else 0
+    except (TypeError, ValueError):
+        page = 0
+    origin = partes[5] if len(partes) > 5 else "card"
+    if origin not in ("card", "list"):
+        origin = "card"
+    if raw_dest_key and raw_dest_key != "-":
+        dest_key = _sfs_resolve_admin_dest_key(record, raw_dest_key)
+        if not dest_key:
+            bot.answer_callback_query(
+                call.id, "El destino de esta solicitud ya no está disponible.",
+                show_alert=True,
+            )
+            return
+    else:
+        dest_key = _sfs_resolve_admin_dest_key(record)
+
+    if accion == "back":
+        _sfs_delete_admin_preview_media(record)
+        if not dest_key:
+            bot.answer_callback_query(
+                call.id, "No encontré la lista del grupo de esta solicitud.",
+                show_alert=True,
+            )
+            return
+        bot.answer_callback_query(call.id)
+        mostrar_seccion_control_grupo(
+            int(ADMIN_ID), dest_key, "sfs", page, message=call.message
+        )
+        return
+
+    if accion == "preview":
+        if record.get("status") != "pending_review":
+            bot.answer_callback_query(call.id, "Este SFS ya fue procesado.")
+            return
+        _sfs_delete_admin_preview_media(record)
+        try:
+            _sfs_send_admin_media_preview(record)
+            bot.answer_callback_query(call.id, "Vista previa enviada.")
+        except Exception as error:
+            app.logger.warning(
+                "No se pudo volver a cargar la vista previa SFS (error=%s).",
+                type(error).__name__,
+            )
+            bot.answer_callback_query(
+                call.id,
+                "No pude cargar la vista previa; la solicitud sigue pendiente.",
+                show_alert=True,
+            )
+        return
+
     if accion == "review":
         if record.get("status") != "pending_review":
             bot.answer_callback_query(call.id, "Este SFS ya fue procesado.")
             return
-        try:
-            _sfs_send_admin_preview(doc_id)
-            bot.answer_callback_query(call.id, "Vista previa enviada al chat privado.")
-        except Exception as error:
-            app.logger.warning(
-                "No se pudo reconstruir la vista previa SFS (error=%s).",
-                type(error).__name__,
-            )
+        ok = _sfs_send_admin_review_notification(
+            doc_id,
+            dest_key=dest_key,
+            page=page,
+            origin=origin,
+            message=call.message if origin == "list" else None,
+        )
+        if ok:
+            bot.answer_callback_query(call.id, "Vista previa lista para revisar.")
+        else:
             bot.answer_callback_query(
-                call.id, "No pude abrir la vista previa; la solicitud sigue guardada.",
+                call.id,
+                "La solicitud sigue pendiente; envié una tarjeta de respaldo.",
                 show_alert=True,
             )
         return
+
     if accion not in ("approve", "reject"):
         bot.answer_callback_query(call.id, "Acción SFS desconocida.")
         return
@@ -19047,7 +20629,17 @@ def _procesar_callback_sfs(call):
         except Exception:
             app.logger.info("No se pudo notificar al usuario del rechazo SFS.")
         bot.answer_callback_query(call.id, "SFS rechazado.")
-        _sfs_set_preview_status(call, f"❌ SFS #{doc_id} rechazado.")
+        _sfs_delete_admin_preview_media(record)
+        if origin == "list" and dest_key:
+            mostrar_seccion_control_grupo(
+                int(ADMIN_ID), dest_key, "sfs", page, message=call.message
+            )
+        else:
+            _sfs_set_preview_status(
+                call,
+                f"❌ SFS #{doc_id} rechazado.",
+                _sfs_back_markup(record, dest_key, page),
+            )
         return
 
     with SFS_LOCK:
@@ -19106,7 +20698,17 @@ def _procesar_callback_sfs(call):
     except Exception:
         app.logger.info("No se pudo notificar al usuario de la aprobación SFS.")
     bot.answer_callback_query(call.id, "SFS aprobado y publicado.")
-    _sfs_set_preview_status(call, f"✅ SFS #{doc_id} aprobado y publicado.")
+    _sfs_delete_admin_preview_media(record)
+    if origin == "list" and dest_key:
+        mostrar_seccion_control_grupo(
+            int(ADMIN_ID), dest_key, "sfs", page, message=call.message
+        )
+    else:
+        _sfs_set_preview_status(
+            call,
+            f"✅ SFS #{doc_id} aprobado y publicado.",
+            _sfs_back_markup(record, dest_key, page),
+        )
 
 
 def _sfs_private_message_matches(message):
